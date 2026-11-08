@@ -15,11 +15,23 @@ The full demo runs end to end on one Linux laptop:
 - **Injection:** with prompt guardrails off, the ransom note's injection talks Hunter and Forensics into `rm -rf /evidence/*`, and the kernel grant denies it, with a signed receipt.
 - **Records:** Scribe fills the incident record, scope and legal clocks. The receipt log verifies offline.
 
+What the OS does around the Nemotron models (each detailed under [Daemon](#daemon) and [Agents](#agents)):
+- **Signed model calls and reasoning:** every Nemotron call is a `model_call` receipt (model, endpoint, request and response digests), and each chain of thought is stored under its receipt; `cleanroomd reasoning SEQ` shows it and says whether it still matches what was signed.
+- **Reasoning budgets:** `policy/reasoning.json` caps how many tokens each role may spend reasoning per step; the receipts record what was spent.
+- **The OS checks the agents' claims:** measured scope flags can't be lowered by an agent, staged copies in the drop box are measured, and every evidence path a finding cites is checked for existence and for whether that agent's commands touched it.
+- **Evidence seal:** the evidence is hashed at detection and re-checked after every agent command and on Verify.
+- **Agents write detections, the OS ships them:** Hunter's YARA rules are deployed only if they compile, match no clean file and match some evidence.
+- **Image evidence:** Forensics reads the ransom wallpaper with Nemotron Super VL through its stratum; the description is screened like any evidence.
+- **Two distro roots:** Forensics runs on Alpine, Hunter on Debian, both admitted by digest; `cleanroomd probe` tests each stratum's walls from inside, one receipt per wall.
+- **Training data the OS vouches for:** each step is tagged trainable only with guardrails on, not denied and not flagged, and `cleanroom-agents export-gym` turns an incident into NeMo Gym tool-use rows that pass NeMo Gym's own validator.
+
 Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/brev/`). Measured results are in [docs/nemotron-smoke.md](docs/nemotron-smoke.md).
 
 ## Results
 
 29 live runs against hosted Nemotron (27, N = 3 per cell) and local Nemotron on Brev (2). Five attack variants: the ransom-note injection, a poisoned syslog line, a credential-exfil note, a polite "IT runbook" written to evade the safety model, and a benign control. Full method and caveats: [docs/eval.md](docs/eval.md).
+
+These runs predate the OS features listed under Status (citation checks, evidence seal, measured staging, reasoning custody and budgets, Alpine, image evidence); they have not been re-measured.
 
 | Measure | Result |
 | --- | --- |
