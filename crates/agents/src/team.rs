@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context as _, Result};
 use cleanroom_proto::{
     Audience, BusBody, BusMessage, CoreRequest, CoreResponse, LlmMode, ModelCall, Principal, Role,
-    ScopeRecord, Signed,
+    ScopeRecord, Signed, Tri,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -190,7 +190,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
     let mut seen = Seen::default();
     let mut assets = BTreeMap::new();
-    let mut running: Option<JoinHandle<()>> = None;
+    let mut running: Option<(JoinHandle<()>, String)> = None;
     let result = loop {
         tokio::select! {
             message = inbound.recv() => match message {
@@ -199,14 +199,21 @@ pub(crate) async fn run(options: Options) -> Result<()> {
                     let notable = situation::lock(&situation).observe(&message);
                     lead.hear(&message, notable);
                     consult(&crew, &shared, &situation, &message);
+                    if is_reset(&message)
+                        && let Some((previous, incident)) = running.take()
+                    {
+                        previous.abort();
+                        team.status(format!("acme-fs was reset: stopped the team on {incident}; it makes no more model calls for it")).await;
+                    }
                     if let Some(case) = dispatch(&shared, &guardrails_tx, &team, message, &mut assets).await {
-                        if let Some(previous) = running.take() {
+                        if let Some((previous, _)) = running.take() {
                             previous.abort();
                             team.status(format!("restarting the team for {}", case.incident_id)).await;
                         }
                         shared.router.restart_streams();
+                        let incident = case.incident_id.clone();
                         let task = investigate(Arc::clone(&shared), Arc::clone(&crew), case, assets.clone(), done_tx.clone());
-                        running = Some(tokio::spawn(task));
+                        running = Some((tokio::spawn(task), incident));
                     }
                 }
                 Some(Inbound::Event(_)) => {}
@@ -226,11 +233,26 @@ pub(crate) async fn run(options: Options) -> Result<()> {
             }
         }
     };
-    if let Some(investigation) = running {
+    if let Some((investigation, _)) = running {
         investigation.abort();
     }
     team.status("agents offline".to_owned()).await;
     result
+}
+
+/// Whether `message` is cleanroomd publishing an asset's baseline (every flag `no`), which it
+/// does only when the victim is reset and the incident closed.
+fn is_reset(message: &BusMessage) -> bool {
+    let BusBody::Scope(record) = &message.body else {
+        return false;
+    };
+    let no = |flag: Tri| flag == Tri::No;
+    message.from == Principal::System
+        && no(record.flags.locked)
+        && no(record.flags.exfiltrated)
+        && no(record.flags.accessed)
+        && no(record.flags.destroyed)
+        && no(record.flags.modified)
 }
 
 /// When `message` asks a specialist a question (chat to its role from the Lead or a human),
@@ -691,5 +713,56 @@ impl Seen {
             self.ids.remove(&oldest);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cleanroom_proto::ScopeFlags;
+
+    use super::*;
+
+    fn scope(from: Principal, flag: Tri) -> BusMessage {
+        BusMessage {
+            id: "m".to_owned(),
+            at: "2026-11-08T12:00:00Z".to_owned(),
+            from: from.clone(),
+            to: Audience::All,
+            body: BusBody::Scope(ScopeRecord {
+                asset_id: "payroll".to_owned(),
+                name: "Payroll export".to_owned(),
+                data_classes: Vec::new(),
+                record_count: 1,
+                texas_residents: 1,
+                flags: ScopeFlags {
+                    locked: flag,
+                    exfiltrated: flag,
+                    accessed: flag,
+                    destroyed: flag,
+                    modified: flag,
+                },
+                encrypted_at_rest: false,
+                key_exposed: Tri::No,
+                confidence_pct: 100,
+                evidence: Vec::new(),
+                updated_by: from,
+                updated_at: "2026-11-08T12:00:00Z".to_owned(),
+            }),
+        }
+    }
+
+    /// A reset is the only time cleanroomd publishes an asset's baseline (every flag `no`); the
+    /// team must stop working the incident it closed instead of spending model calls on it.
+    #[test]
+    fn a_baseline_from_cleanroomd_means_the_incident_was_reset() {
+        assert!(is_reset(&scope(Principal::System, Tri::No)));
+        assert!(
+            !is_reset(&scope(Principal::System, Tri::Yes)),
+            "a measurement after a detonation is not a reset"
+        );
+        assert!(
+            !is_reset(&scope(Principal::Agent { role: Role::Scribe }, Tri::No)),
+            "only cleanroomd resets"
+        );
     }
 }
