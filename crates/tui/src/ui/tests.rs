@@ -398,7 +398,7 @@ fn every_tab_tells_its_part_of_the_incident_at_projector_size() {
     renders(
         Tab::Scope,
         size,
-        &["Clinic patient intake", "LOCKED", "Texans", "confidence"],
+        &["Clinic patient intake", "RECORDS", "Texans", "confidence"],
     );
     renders(
         Tab::Record,

@@ -281,6 +281,13 @@ pub enum Action {
         name: String,
         digest: Digest,
     },
+    /// An agent's evidence pager moved a context span between tiers (opt-in `--memory-tiers`).
+    MemoryMove {
+        span: String,
+        /// Digest of the span's exact bytes.
+        digest: Digest,
+        to: Tier,
+    },
 }
 
 /// An investigator submitting a YARA rule it wrote. cleanroomd admits it into `/rules` only if it
@@ -584,6 +591,69 @@ pub enum BusBody {
     AgentControl {
         guardrails: bool,
     },
+    /// One agent's working context by span, from its evidence pager (opt-in `--memory-tiers`).
+    /// Published whenever a span enters or changes tier; cleanroomd receipts every `moved`.
+    Memory(MemoryMap),
+}
+
+/// An agent's working context, span by span, as its evidence pager holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryMap {
+    /// Whose context; must be the publisher's own role.
+    pub role: Role,
+    /// Every span in context order.
+    pub spans: Vec<MemorySpan>,
+    /// The tier move that caused this publish, if any (`None` for a span that just entered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<TierMove>,
+}
+
+/// One span of an agent's context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySpan {
+    /// Stable handle the agent uses with `page_in` / `page_out`, for example `ev-3`.
+    pub id: String,
+    pub source: SpanSource,
+    pub tier: Tier,
+    /// Tokens the span costs in context now (the handle's size when compressed).
+    pub tokens: u32,
+    /// Tokens of the exact bytes.
+    pub exact_tokens: u32,
+    /// Digest of the exact bytes.
+    pub digest: Digest,
+    /// One short line: what the span is (a path, a tool call, "commander question").
+    pub label: String,
+}
+
+/// Who wrote a context span: it decides the default tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanSource {
+    /// The commander's words and the system prompt.
+    Commander,
+    /// The agent's own reasoning and tool calls.
+    Agent,
+    /// Output of a trusted tool (hashes, listings, YARA match names, cleanroomd records).
+    Tool,
+    /// Attacker-controlled bytes: file contents, log lines, command output.
+    Evidence,
+}
+
+/// Whether a span sits in context verbatim or as a handle (digest, size, one-line summary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Exact,
+    Compressed,
+}
+
+/// One move between tiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierMove {
+    pub span_id: String,
+    pub to: Tier,
+    /// Why, in the agent's words (the `page_in` / `page_out` reason argument).
+    pub reason: String,
 }
 
 /// Where model responses come from. `replay` must be visible on screen.

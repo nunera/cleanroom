@@ -16,8 +16,11 @@ mod cli;
 mod clocks;
 mod denials;
 mod keystore;
+mod memory;
+mod motion;
 mod net;
 mod next;
+mod pulse;
 mod replay;
 pub mod state;
 mod team;
@@ -164,6 +167,7 @@ fn start(args: Args) -> Result<(), StartError> {
 async fn console(args: Args) -> Result<(), StartError> {
     let state = State::new(TimeZone::system());
     let colors = Colors::from_env();
+    let motion = colors == Colors::Full && !args.no_motion;
     let (inbound, frames) = mpsc::unbounded_channel();
     let app = if let Some(path) = &args.replay {
         let recording = replay::load(path)?;
@@ -172,7 +176,9 @@ async fn console(args: Args) -> Result<(), StartError> {
             .find_map(replay::stamp)
             .unwrap_or_else(Timestamp::now);
         tokio::spawn(replay::play(recording, args.speed, inbound));
-        let view = View::replay(args.speed).with_colors(colors);
+        let view = View::replay(args.speed)
+            .with_colors(colors)
+            .with_motion(motion);
         App::replay(state, view, start, args.speed)
     } else {
         let key = keystore::load_or_create(&keystore::commander_key_path()?)?;
@@ -191,7 +197,9 @@ async fn console(args: Args) -> Result<(), StartError> {
         let outbound = net::connect(&socket, &app::hello(&key), recorder, inbound)
             .await
             .map_err(|source| StartError::Connect { socket, source })?;
-        let view = View::live(args.scenarios).with_colors(colors);
+        let view = View::live(args.scenarios)
+            .with_colors(colors)
+            .with_motion(motion);
         App::live(state, view, Session::new(key, outbound), args.tamper_root)
     };
     let mut terminal = ratatui::try_init().map_err(StartError::Terminal)?;

@@ -35,6 +35,10 @@ pub(crate) struct Args {
     /// Scenario offered by `d`; repeat the flag to offer several.
     #[arg(long = "scenario", value_name = "NAME", default_value = "ransomware")]
     pub(crate) scenarios: Vec<String>,
+
+    /// Draw without animation (motion is also off under `NO_COLOR`).
+    #[arg(long)]
+    pub(crate) no_motion: bool,
 }
 
 /// A playback speed between 0.01× and 1000×.

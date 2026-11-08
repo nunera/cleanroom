@@ -23,7 +23,9 @@ use crate::clocks::{self, Clock};
 use crate::denials::{Denial, Kind};
 use crate::state::{Activity, State, Tone};
 use crate::team::SPECIALISTS;
-use crate::theme::{ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, RAISED_HI, RED, TEXT, glyph, tint};
+use crate::theme::{
+    ACCENT, AMBER, BRIGHT, DIM, INK, LINE, MUTED, RAISED, RAISED_HI, RED, TEXT, glyph, tint,
+};
 
 /// Draw the screen into `area`, everything between the header and the key bar.
 pub(super) fn render(
@@ -232,8 +234,16 @@ fn render_scope(frame: &mut Frame<'_>, area: Rect, state: &State) {
     ];
     widths.extend([Constraint::Length(flag_width); 5]);
     widths.push(Constraint::Length(5));
-    let table = Table::new(state.scope.iter().map(scope_row), widths)
-        .header(Row::new(header).style(Style::new().fg(DIM).bold()))
+    let rows = state.scope.iter().enumerate().map(|(index, asset)| {
+        let row = scope_row(asset);
+        if index % 2 == 0 {
+            row.style(Style::new().bg(RAISED))
+        } else {
+            row
+        }
+    });
+    let table = Table::new(rows, widths)
+        .header(Row::new(header).style(Style::new().fg(INK).bg(ACCENT).bold()))
         .column_spacing(1)
         .block(block);
     frame.render_widget(table, area);

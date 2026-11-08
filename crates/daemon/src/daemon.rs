@@ -508,7 +508,8 @@ impl Daemon {
             | Action::Detonate { .. }
             | Action::EvidenceSeal { .. }
             | Action::ModelCall { .. }
-            | Action::YaraRule { .. } => String::new(),
+            | Action::YaraRule { .. }
+            | Action::MemoryMove { .. } => String::new(),
         };
         let seq = self.receipt(actor, action, receipt_outcome)?;
         if let ExecOutcome::Denied { reason } = &outcome {
@@ -1241,7 +1242,8 @@ impl Daemon {
         }
     }
 
-    /// The incident-record receipt for a `scope` or `incident` publish.
+    /// The receipt for a publish that changes a record or a context tier: `scope`, `incident`,
+    /// or a `memory` map that moved a span.
     fn record_update(&self, body: &BusBody) -> Option<Action> {
         match body {
             BusBody::Incident(record) => Some(Action::RecordUpdate {
@@ -1252,6 +1254,15 @@ impl Daemon {
                 incident_id: self.bus.incident_id().unwrap_or_else(|| "none".to_owned()),
                 field: format!("scope:{}", record.asset_id),
             }),
+            BusBody::Memory(map) => {
+                let moved = map.moved.as_ref()?;
+                let span = map.spans.iter().find(|span| span.id == moved.span_id)?;
+                Some(Action::MemoryMove {
+                    span: moved.span_id.clone(),
+                    digest: span.digest.clone(),
+                    to: moved.to,
+                })
+            }
             BusBody::Chat { .. }
             | BusBody::Finding { .. }
             | BusBody::Proposal { .. }
@@ -1324,11 +1335,15 @@ fn may_publish(principal: &Principal, body: &BusBody) -> Result<(), &'static str
         BusBody::Proposal { .. } if !agent(Role::Containment) => {
             Err("only containment proposes actions")
         }
+        BusBody::Memory(map) if !agent(map.role) => {
+            Err("an agent publishes only its own memory map")
+        }
         BusBody::Investigate { .. }
         | BusBody::AgentControl { .. }
         | BusBody::Scope(_)
         | BusBody::Incident(_)
         | BusBody::Proposal { .. }
+        | BusBody::Memory(_)
         | BusBody::Chat { .. }
         | BusBody::Finding { .. }
         | BusBody::Trace { .. }

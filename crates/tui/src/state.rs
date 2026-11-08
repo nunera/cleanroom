@@ -16,6 +16,8 @@ use serde_json::Value;
 
 use crate::access::{Enrollment, Roster, Standing, role_word};
 use crate::denials::{self, Denial, Kind, Reported, Traced, split_receipt};
+use crate::memory::MemoryBoard;
+use crate::pulse::{Beat, Pulse};
 use crate::team::{self, Team};
 
 /// Agent-pane lines kept in memory.
@@ -169,6 +171,8 @@ pub(crate) struct Said {
     pub(crate) to: Audience,
     /// Message text.
     pub(crate) text: String,
+    /// When it reached this console, for the fade-in.
+    pub(crate) arrived: Timestamp,
 }
 
 /// A key system event in the conversation.
@@ -335,6 +339,10 @@ pub struct State {
     pub(crate) team: Team,
     /// Members enrolled or revoked this session.
     pub(crate) roster: Roster,
+    /// Every agent's working context, for the MEMORY tab.
+    pub(crate) memory: MemoryBoard,
+    /// Steps, denials and flags over time, for the charts.
+    pub(crate) pulse: Pulse,
     /// Pending tool requests and proposals.
     pub(crate) queue: Vec<QueueItem>,
     /// Subjects already decided, so a late request doesn't re-enter the queue.
@@ -371,6 +379,8 @@ impl State {
             denials: denials::Log::default(),
             team: Team::default(),
             roster: Roster::default(),
+            memory: MemoryBoard::default(),
+            pulse: Pulse::default(),
             queue: Vec::new(),
             decided: HashSet::new(),
             guardrails: true,
@@ -533,6 +543,7 @@ impl State {
                 let entry = trace_entry(step, &tool, &args, &result_preview, outcome.as_ref());
                 if let Who::Agent(role) = origin.who {
                     self.team.step(role, &tool, entry.text.clone(), now);
+                    self.pulse.beat(now, Beat::Step(role));
                     if let Some(ExecOutcome::Denied { reason }) = outcome {
                         let traced = Traced {
                             role,
@@ -579,7 +590,12 @@ impl State {
                 model,
                 safe,
                 categories,
-            } => self.log(&origin, safety_entry(&artifact, &model, safe, &categories)),
+            } => {
+                if !safe {
+                    self.pulse.beat(now, Beat::Flag);
+                }
+                self.log(&origin, safety_entry(&artifact, &model, safe, &categories));
+            }
             BusBody::Route { route, reason } => {
                 if let Who::Agent(role) = origin.who {
                     self.team.route(role, route);
@@ -599,6 +615,7 @@ impl State {
                 let text = format!("{incident_id}: {brief}");
                 self.log(&origin, Entry::new("INVESTIGATE", Tone::Plain, text));
                 self.investigating = Some(incident_id);
+                self.pulse.start(now);
             }
             BusBody::AgentControl { guardrails } => {
                 self.guardrails = guardrails;
@@ -607,6 +624,7 @@ impl State {
                 self.mark(&origin, tone, format!("guardrails {}", entry.text));
                 self.log(&origin, entry);
             }
+            BusBody::Memory(map) => self.memory.observe(&now, &map),
         }
     }
 
@@ -635,6 +653,7 @@ impl State {
                 from: who,
                 to,
                 text,
+                arrived: now,
             }),
             TALK_LIMIT,
         );
@@ -696,6 +715,7 @@ impl State {
             if let Some(role) = role {
                 self.team.blocked(role, now);
             }
+            self.pulse.beat(now, Beat::Denial);
             self.mark(origin, Tone::Bad, text);
         }
     }
@@ -848,6 +868,8 @@ impl State {
         self.talk.clear();
         self.denials.clear();
         self.team.clear();
+        self.memory.clear();
+        self.pulse.clear();
         self.queue.clear();
         self.decided.clear();
         self.counters = None;

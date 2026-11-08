@@ -302,7 +302,7 @@ impl Situation {
             | BusBody::ToolRequest(_)
             | BusBody::ToolDecision { .. }
             | BusBody::Status { .. } => self.incident.as_mut()?.oversight(from, &message.body),
-            BusBody::Chat { .. } | BusBody::Route { .. } => None,
+            BusBody::Chat { .. } | BusBody::Route { .. } | BusBody::Memory(_) => None,
         }
     }
 
@@ -599,7 +599,8 @@ impl Incident {
             | BusBody::Incident(_)
             | BusBody::Status { .. }
             | BusBody::Investigate { .. }
-            | BusBody::AgentControl { .. } => None,
+            | BusBody::AgentControl { .. }
+            | BusBody::Memory(_) => None,
         }
     }
 
@@ -732,7 +733,8 @@ impl Incident {
             | BusBody::Scope(_)
             | BusBody::Incident(_)
             | BusBody::Investigate { .. }
-            | BusBody::AgentControl { .. } => None,
+            | BusBody::AgentControl { .. }
+            | BusBody::Memory(_) => None,
         }
     }
 

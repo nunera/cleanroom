@@ -4,12 +4,14 @@
 #   agents  cleanroom-agents run (the Nemotron team)
 #   tui     the command center .deb, launched from the admitted Debian root (scripts/launch-tui.sh)
 #
-#   scripts/demo.sh [--local] [--replay] [--guardrails on|off]
+#   scripts/demo.sh [--local] [--replay] [--guardrails on|off] [--memory-tiers]
 #
-#   --local       load ~/.config/cleanroom/local.env for the agents (local Nemotron on Brev;
-#                 start deploy/brev/tunnel.sh first)
-#   --replay      CLEANROOM_LLM_CACHE=replay: replay recorded model responses, no model network
-#   --guardrails  agent prompt guardrails at start (default on); g in the TUI toggles them live
+#   --local         load ~/.config/cleanroom/local.env for the agents (local Nemotron on Brev;
+#                   start deploy/brev/tunnel.sh first)
+#   --replay        CLEANROOM_LLM_CACHE=replay: replay recorded model responses, no model network
+#   --guardrails    agent prompt guardrails at start (default on); g in the TUI toggles them live
+#   --memory-tiers  evidence pager: large evidence enters agent context as a handle, paged in
+#                   on demand (docs/memory-tiers.md)
 set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -24,13 +26,15 @@ local_env=${XDG_CONFIG_HOME:-$HOME/.config}/cleanroom/local.env
 use_local=0
 replay=0
 guardrails=on
+memory_tiers=
 
 while (($#)); do
   case $1 in
     --local) use_local=1 ;;
     --replay) replay=1 ;;
     --guardrails) guardrails=${2:?--guardrails needs on or off}; shift ;;
-    -h | --help) sed -n '2,12s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    --memory-tiers) memory_tiers=" --memory-tiers" ;;
+    -h | --help) sed -n '2,14s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) echo "demo: unknown flag $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -54,7 +58,7 @@ nix shell --inputs-from . \
     cargo deb -p cleanroom-tui --target x86_64-unknown-linux-musl'
 
 # The agents' window loads its model settings itself, so secrets never pass through tmux.
-agents="exec target/release/cleanroom-agents run --guardrails $guardrails"
+agents="exec target/release/cleanroom-agents run --guardrails $guardrails$memory_tiers"
 ((replay == 0)) || agents="export CLEANROOM_LLM_CACHE=replay; $agents"
 ((use_local == 0)) || agents="set -a; . $(printf %q "$local_env"); set +a; $agents"
 

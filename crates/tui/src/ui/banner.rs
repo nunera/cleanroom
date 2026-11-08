@@ -7,6 +7,7 @@
 //! ink as the foreground, so the pictures read as silhouettes, and the row's gradient color as the
 //! background.
 
+use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -14,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::state::{State, compromised};
-use crate::theme::INK;
+use crate::theme::{INK, RED};
 
 /// Banner height in rows.
 pub(super) const HEIGHT: u16 = 6;
@@ -139,9 +140,18 @@ const SCENE: [(Picture, (usize, usize)); 6] = [
 /// The ground along the bottom row, repeated.
 const HORIZON: [char; 12] = ['▁', '▁', '▂', '▁', '▁', '▁', '▃', '▂', '▁', '▁', '▂', '▁'];
 
-/// Draw the banner for `sky` into `area` (six rows).
-pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky) {
+/// Draw the banner for `sky` into `area` (six rows). With a `clock` it moves: the drones drift on
+/// patrol, the radar sweeps, and on a breach the beacon on the mast blinks red.
+pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky, clock: Option<Timestamp>) {
     let width = usize::from(area.width);
+    let millis = clock.map_or(0, |now| now.as_millisecond().rem_euclid(1 << 40));
+    let drift = |period: i64, span: i64| {
+        if clock.is_none() {
+            return 0;
+        }
+        let step = (millis / period) % (2 * span);
+        usize::try_from(if step < span { step } else { 2 * span - step }).unwrap_or(0)
+    };
     let mut grid: Vec<Vec<char>> = (0..HEIGHT).map(|_| vec![' '; width]).collect();
     if let Some(ground) = grid.last_mut() {
         for (x, cell) in ground.iter_mut().enumerate() {
@@ -151,8 +161,26 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky) {
                 .unwrap_or('▁');
         }
     }
-    for (picture, (numerator, denominator)) in SCENE {
-        paste(&mut grid, picture, width * numerator / denominator);
+    let mut mast = 0;
+    for (index, (picture, (numerator, denominator))) in SCENE.into_iter().enumerate() {
+        let left = width * numerator / denominator;
+        let left = match index {
+            3 => left + drift(420, 6),
+            4 => left + drift(700, 4),
+            5 => {
+                mast = left;
+                left
+            }
+            _ => left,
+        };
+        paste(&mut grid, picture, left);
+    }
+    if clock.is_some() {
+        let beam = ['─', '╲', '│', '╱'];
+        let frame_index = usize::try_from((millis / 250) % 4).unwrap_or(0);
+        if let Some(cell) = grid.first_mut().and_then(|row| row.get_mut(mast + 10)) {
+            *cell = beam.get(frame_index).copied().unwrap_or('─');
+        }
     }
     let lines: Vec<Line<'static>> = grid
         .into_iter()
@@ -162,6 +190,15 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+    let breach = matches!(sky, Sky::Breach | Sky::BreachWaiting);
+    if breach && clock.is_some() && (millis / 500) % 2 == 0 {
+        let x = area
+            .x
+            .saturating_add(u16::try_from(mast + 4).unwrap_or(u16::MAX));
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, area.y)) {
+            cell.set_symbol("●").set_fg(RED);
+        }
+    }
 }
 
 /// Paste the non-space characters of `picture` with its top-left corner at column `left`, cropped

@@ -417,7 +417,8 @@ fn awaits_commander(event: &Signed<BusMessage>) -> Option<String> {
         | BusBody::Scope(_)
         | BusBody::Incident(_)
         | BusBody::Investigate { .. }
-        | BusBody::AgentControl { .. } => None,
+        | BusBody::AgentControl { .. }
+        | BusBody::Memory(_) => None,
     }
 }
 

@@ -70,6 +70,33 @@ pub(crate) enum Message {
     },
 }
 
+impl Message {
+    /// The text this message puts into context: its content, and for a model turn each tool
+    /// call's name and arguments. The evidence pager sizes and digests spans with it.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::System { content } | Self::User { content } | Self::Tool { content, .. } => {
+                content.clone()
+            }
+            Self::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let mut text = content.clone().unwrap_or_default();
+                for call in tool_calls {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&call.function.name);
+                    text.push(' ');
+                    text.push_str(&call.function.arguments);
+                }
+                text
+            }
+        }
+    }
+}
+
 /// A tool call as kept in the conversation history.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolCall {
@@ -936,6 +963,8 @@ mod tests {
             keys_dir: PathBuf::from("/nonexistent/cleanroom-keys"),
             dataset_dir: PathBuf::from("/nonexistent/cleanroom-dataset"),
             nixpkgs: "github:NixOS/nixpkgs/rev".to_owned(),
+            memory_tiers: false,
+            memory_log: PathBuf::from("/nonexistent/cleanroom-memory-tiers.ndjson"),
         }
     }
 

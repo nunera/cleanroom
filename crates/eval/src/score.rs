@@ -447,7 +447,8 @@ impl Judge {
             | BusBody::ToolDecision { .. }
             | BusBody::Counters { .. }
             | BusBody::Investigate { .. }
-            | BusBody::AgentControl { .. } => {}
+            | BusBody::AgentControl { .. }
+            | BusBody::Memory(_) => {}
         }
     }
 

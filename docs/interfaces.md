@@ -31,7 +31,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 
 Every allowed or denied action appends a `Receipt` to a hash-chained log. `prev` is the digest of the previous signed receipt; the first entry uses `sha256:` followed by 64 zeros. `verify_log` walks the chain offline and reports the first break.
 
-Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`, `evidence_seal`, `model_call`, `yara_rule`.
+Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`, `evidence_seal`, `model_call`, `yara_rule`, `memory_move` (a pager tier move: span id, digest of the span's exact bytes, new tier).
 
 ## Daemon operations (`request.op`)
 
@@ -52,7 +52,7 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 
 ## Bus messages (`body.type`)
 
-`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step; `outcome` is set when the step ran a command, and `denied` means the grant blocked it), `refusal` (an agent declined an instruction found in untrusted data: blocked by the model), `counters` (running totals: blocked by model, blocked by OS, safety flags, guardrails on/off, LLM mode `live`/`record`/`replay`), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status` (free text for humans), `investigate` (starts the agent team on an incident; the daemon publishes it after a detonation, or the TUI does), `agent_control` (commander toggles `guardrails`; off swaps the hardened agent prompt for a naive one so the demo can show the kernel grant blocking what the model was talked into).
+`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step; `outcome` is set when the step ran a command, and `denied` means the grant blocked it), `refusal` (an agent declined an instruction found in untrusted data: blocked by the model), `counters` (running totals: blocked by model, blocked by OS, safety flags, guardrails on/off, LLM mode `live`/`record`/`replay`), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status` (free text for humans), `investigate` (starts the agent team on an incident; the daemon publishes it after a detonation, or the TUI does), `agent_control` (commander toggles `guardrails`; off swaps the hardened agent prompt for a naive one so the demo can show the kernel grant blocking what the model was talked into), `memory` (one agent's working context span by span, from its evidence pager; opt-in, below).
 
 **Tool requests:** agents send only the `request_tool` op. The daemon publishes the `tool_request` event and, when decided, the `tool_decision` event.
 
@@ -62,6 +62,8 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 - **Lead → specialist:** `chat` from `Agent{lead}` to `role: <hunter|forensics|scribe|containment>`, starting with the question.
 - **Specialist → Lead:** `chat` from `Agent{<role>}` to `role: lead`. A human may also message a specialist directly (`to: role: <role>`); the reply then goes to `humans`.
 - The command center renders these as a conversation and lights the Lead↔specialist link while a delegation is open.
+
+**Memory tiers (opt-in, `cleanroom-agents run --memory-tiers` or `CLEANROOM_MEMORY_TIERS=1`).** An agent's evidence pager publishes `memory`, a `MemoryMap` of its working context: `role` (must be the publisher's own), `spans` in context order, and `moved`. Each span has an `id` the agent uses with `page_in` / `page_out` (`cmd-N` system prompt, task and runner reminders; `ag-N` the agent's own turns; `tool-N` trusted tool output; `ev-N` evidence), a `source` (`commander`, `agent`, `tool`, `evidence`), a `tier` (`exact` or `compressed`), `tokens` (what the span costs in context now, estimated as characters / 4), `exact_tokens`, the `digest` of the exact bytes and a one-line `label`. `exact` means verbatim bytes, not necessarily all of them: after a ranged `page_in` only that line window is in context, so `tokens` is below `exact_tokens`. A full page-in costs slightly more than `exact_tokens` (its one-line header). An agent publishes a map at most once per model step when spans entered (`moved` absent), and one per tier move with `moved: {span_id, to, reason}`. cleanroomd receipts every map with `moved` (`memory_move`; `span_id` must be one of `spans`), keeps the latest map per role for clients that connect later, and clears them on reset. Policy and dataset: [memory-tiers.md](memory-tiers.md).
 
 The TUI renders state from these events alone; it never reads the agents' files.
 

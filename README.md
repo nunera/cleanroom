@@ -34,9 +34,13 @@ Prompt guardrails and safety models are probabilistic layers. The read-only gran
 
 ## Screenshots
 
-Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45. The banner's sky follows the incident: teal while everything is clean, a red sunset once assets are compromised, amber at the horizon while something waits for a signature.
+Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45. The banner's sky follows the incident: teal while everything is clean, a red sunset once assets are compromised, amber at the horizon while something waits for a signature. Every tab is a set of rounded panels; the focused one has the bright border and the key bar shows its keys.
 
-**Overview** (F1): what to do next, with the key for each line; the incident; every asset's flags; what each defense layer stopped; the nearest legal deadlines.
+**Before anything happens** (F1): the welcome panel says what Cleanroom is and how to start; empty panels are hatched with what will fill them.
+
+![Welcome](docs/screenshots/welcome.png)
+
+**Overview** (F1): what to do next, with the key for each line; a braille chart of tool calls, OS denials and safety flags per 5 s since the investigation started (`,`/`.` switch between Activity, Exec and Safety); the incident; every asset's flags; segmented bars per defense layer; the nearest legal deadlines with the share of each window already spent.
 
 ![Overview tab](docs/screenshots/overview.png)
 
@@ -44,9 +48,13 @@ Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45. The ba
 
 ![Lead tab](docs/screenshots/lead.png)
 
-**Defense** (F5): every kernel denial with its receipt, the model's refusals, the safety verdicts, the guardrails setting and the receipt log.
+**Defense** (F5): the kernel-blocks count in big type, every kernel denial with its receipt as a table, the model's refusals, the layers, the safety verdicts and the receipt log.
 
 ![Defense tab](docs/screenshots/defense.png)
+
+**Memory** (F7): each agent's context span by span against Nemotron's 52 layers (23 Mamba-2, 23 MoE, 6 attention); evidence enters compressed, `page_in`/`page_out` moves are receipted by cleanroomd, and the KV-cache/Mamba-state bars are computed from `config.json`, not measured. Captured from a replay of a live `--memory-tiers` run at 4×.
+
+![Memory tab](docs/screenshots/memory.png)
 
 **Controlroom** (F10): the complete operator screen. Every OS denial stays pinned at the top with its receipt; below are the legal clocks, the scope table, the one-line agent trace over the Lead conversation, and the team, approvals, defense layers and timeline.
 
@@ -61,7 +69,7 @@ scripts/demo.sh --local            # route sensitive steps to Nemotron on Brev (
 scripts/demo.sh --replay           # replay recorded model responses, no network
 ```
 
-In the command center: `F1`–`F6` and `F10` pick a tab (Overview, Lead, Scope, Record, Defense, Team, Controlroom); on the Lead tab type to the Lead and press Esc for keys. Keys: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset, `m` members.
+In the command center: `F1`–`F7` and `F10` pick a tab (Overview, Lead, Scope, Record, Defense, Team, Memory, Controlroom); `[`/`]` or `←`/`→` move the focus between panels; on the Lead tab type to the Lead and press Esc for keys. Keys: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset, `m` members.
 
 ## Layout
 
@@ -169,6 +177,7 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 - `--guardrails` picks the hardened or the naive setup at start; `agent_control` bus events switch prompts and tools at runtime. With guardrails on, Hunter and Forensics use typed read-only tools, report findings as they go, and record each instruction they decline from untrusted data as a `refusal`. With guardrails off they run like a sloppy operator deployment: a "helpful sysadmin assistant" with only a shell (`exec`) and `report_finding`, handed the alert and told to read the notes on the share and handle them. Nothing names the injected instruction; the ransom note talks the model into it, and the stratum grant denies it (`trace.outcome` is `denied`).
 - **Lead:** it keeps a live picture of the incident from bus events alone: the incident, scope per asset, findings, refusals, OS denials (`trace.outcome` `denied`), counters, proposals and tool requests waiting for the commander, and the legal clocks from the incident's triggers. It narrates key events to `humans` in short templated lines, with no model call and at most one line every 4 s: the detonation, each agent's first OS denial (with the file it had just read and the receipt number), each agent's first finding, proposals waiting for a decision (merged when several arrive together), and Scribe's scope changes. A human `chat` to `role: lead` gets exactly one answer, from Nemotron (Lightning by default), even when the model fails; narration waits while the Lead answers. The Lead's tools are `get_situation`, `ask_agent` (a `chat` to a specialist's role, then up to 45 s for its answer) and `reply`. Its prompt is always the hardened one, whatever the guardrails setting, and an answer that claims an approval goes back to the model to be rewritten: approvals are human-only.
 - **Specialists answer questions:** a `chat` to a specialist's role from the Lead or a human gets one short answer from that specialist's model, with its current prompt and what it has done in this incident (its findings, refusals, denied commands and latest steps; Scribe also sees the records, Containment its proposals). It runs no tools and nothing new, beside the investigation loop, never blocking it. The answer goes to `role: lead`, or to `humans` when a human asked. Conversation turns replay from their own `<role>.chat` streams, so questions never shift a recorded investigation.
+- **Memory tiers** (opt-in: `run --memory-tiers`, `CLEANROOM_MEMORY_TIERS=1` or `scripts/demo.sh --memory-tiers`): attacker-written tool output over about 120 tokens enters an agent's context as a deterministic handle (digest, size, path, line count, first line). Hunter and Forensics page exact bytes in and out with `page_in` / `page_out`, screened like `read_file` output when paged in. Each agent publishes its span map (`memory`), cleanroomd receipts every move, and every tier decision goes to `$XDG_STATE_HOME/cleanroom/memory-tiers.ndjson`. See [docs/memory-tiers.md](docs/memory-tiers.md).
 - Tool arguments are conformed before they are validated: numbers sent as text or fractions become integers (`"95%"`, `0.95` → 95), a single path where a list is expected becomes a list, enum values match case-insensitively, over-long free text is clipped, and options the read-only evidence tools don't have are ignored. Anything still invalid goes back to the model as an error it can fix. Halfway through its step budget, an agent that has not reported a finding is offered only its reporting tools, and again in its last two calls.
 - Every evidence-bearing tool output is scored by the Nemotron safety model (`safety_verdict`) before a model sees it; with guardrails on, unsafe output is wrapped in an untrusted-data envelope. Output with personal data or credentials moves the conversation to the local endpoint (`route`).
 - `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands). A denied command's `trace.result_preview` ends with its receipt, ` (receipt #42)`.
@@ -193,20 +202,23 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 
 ## Command center
 
-`cleanroom-tui` connects as the commander and renders only from bus events. It is a row of tabs under a pixel-art banner whose sky shows the incident's state; `F1`–`F6` and `F10` pick a tab, `Tab`/`Shift+Tab` cycle:
-- **Overview** (F1): the next step and what needs you, each line naming the key that acts on it; the incident; assets with a flag strip; bars per defense layer; the nearest legal deadlines.
-- **Lead** (F2): the conversation with the Lead agent, its delegations to the specialists as compact cards, key system events as one-line markers, and the team (status, model, last action; a Lead↔specialist link lights while a delegation is open). A kernel denial pins a red banner over the conversation for 8 seconds.
-- **Scope** (F3): one card per asset with every flag, classes, records, Texans, confidence and evidence.
-- **Record** (F4): the incident record, its timeline and all five legal clocks with deadlines and duties.
-- **Defense** (F5): every kernel denial with its receipt, refusals, safety verdicts, guardrails and the receipt log (`v` verifies).
-- **Team** (F6): the Lead and each specialist with model, route, status, recent steps and findings.
+`cleanroom-tui` connects as the commander and renders only from bus events. It is a row of tabs under a pixel-art banner whose sky shows the incident's state; `F1`–`F7` and `F10` pick a tab, `Tab`/`Shift+Tab` cycle. Each tab is a set of rounded panels with the title in the border: `[`/`]` or `←`/`→` move the focus, the focused panel gets the bright border and the key bar leads with its keys. Tables have an accent header bar and zebra rows; empty panels are hatched with what will fill them.
+- **Overview** (F1): before an incident, a welcome panel with the keys that start one. Then the next step and what needs you, each line naming its key; a braille activity chart (tool calls, OS denials, safety flags per 5 s since the investigation started; `,`/`.` switch the Activity, Exec and Safety views); the incident; assets with a flag strip; segmented bars per defense layer; the nearest legal deadlines with the time spent.
+- **Lead** (F2): the conversation with the Lead agent, its delegations to the specialists as compact cards, key system events as one-line markers, a scrollbar when it overflows, and the team (status, model, last action; a Lead↔specialist link lights while a delegation is open). A kernel denial pins a red banner over the conversation for 8 seconds.
+- **Scope** (F3): every asset in one table with its flags, then a card per asset with classes, records, Texans, confidence and evidence.
+- **Record** (F4): the incident record, its timeline and all five legal clocks with countdown, the share of the window spent, deadline and duty.
+- **Defense** (F5): the kernel-blocks count in big type, every kernel denial with its receipt, refusals, the layers, safety verdicts and the receipt log (`v` verifies).
+- **Team** (F6): the Lead and its specialists as a tree with a status dot, model and a sparkline of steps per 10 s each, then a card per agent with route, recent steps and findings.
+- **Memory** (F7): with the agents on `--memory-tiers`, each agent's context span by span against Nemotron's 52 layers (23 Mamba-2, 23 MoE, 6 attention): what sits verbatim, what is compressed to a handle, every `page_in`/`page_out` move with its cleanroomd receipt, and KV-cache/Mamba-state bars computed from `config.json`, not measured.
 - **Controlroom** (F10): every OS denial pinned with agent, command and receipt; clocks, scope table, one-line agent trace (select a step to expand it) over the Lead conversation; team, approvals, defense layers and timeline beside them.
+
+Motion: the console coalesces in at startup, tabs fade in, a red sweep crosses the screen when the kernel blocks a command, new messages fade in, a waiting approval breathes amber, and the banner's drones patrol and its radar sweeps (the beacon blinks red on a breach). It redraws at about 30 fps only while something moves; `--no-motion` or `NO_COLOR` turns it off.
 
 The Lead tab opens with the message line focused: everything typed is text, Enter sends it to the Lead, and `@hunter …` (or any agent name or its first letters) sends it to that specialist. Esc leaves the line for the command keys; Enter or `c` returns. On every other tab the letters are commands, and daemon answers show in a corner toast.
 
-Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `m` access control (enroll a member by public key, name and role, or revoke one; signed with the commander key), `PgUp`/`PgDn` scroll the conversation, `←`/`→` switch Controlroom panes, `?` help, `q` quit. `NO_COLOR` turns color off.
+Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `m` access control (enroll a member by public key, name and role, or revoke one; signed with the commander key), `[`/`]` move the panel focus, `,`/`.` switch the chart view, `PgUp`/`PgDn` scroll the conversation, `←`/`→` switch Controlroom panes (elsewhere they move the focus), `?` help, `q` quit. `NO_COLOR` turns color off.
 
-Flags: `--socket PATH`, `--record FILE` (save live events), `--replay FILE [--speed X]` (offline playback with a REPLAY badge; the demo fallback), `--tamper-root NAME` (default `debian`), `--scenario NAME` (default `ransomware`).
+Flags: `--socket PATH`, `--record FILE` (save live events), `--replay FILE [--speed X]` (offline playback with a REPLAY badge; the demo fallback), `--tamper-root NAME` (default `debian`), `--scenario NAME` (default `ransomware`), `--no-motion`.
 
 Debian package (static musl, runs on bookworm and trixie):
 

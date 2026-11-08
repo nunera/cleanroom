@@ -65,16 +65,21 @@ pub(crate) enum Provenance {
 /// The shape of one step.
 pub(crate) const fn shape(tool: Tool, output_chars: usize) -> Shape {
     match tool {
-        Tool::ReadFile | Tool::GrepLogs | Tool::Exec if output_chars >= LONG_CONTEXT_CHARS => {
+        Tool::ReadFile | Tool::GrepLogs | Tool::Exec | Tool::PageIn
+            if output_chars >= LONG_CONTEXT_CHARS =>
+        {
             Shape::LongContext
         }
-        Tool::ReadFile | Tool::GrepLogs | Tool::Exec | Tool::HashFile | Tool::YaraScan => {
-            Shape::NeedleLookup
-        }
+        Tool::ReadFile
+        | Tool::GrepLogs
+        | Tool::Exec
+        | Tool::HashFile
+        | Tool::YaraScan
+        | Tool::PageIn => Shape::NeedleLookup,
         Tool::ListFiles => Shape::Listing,
         Tool::RequestAdmission => Shape::ToolRequest,
         Tool::ReportFinding | Tool::UpdateScope | Tool::UpdateIncident => Shape::RecordWriting,
-        Tool::ProposeAction => Shape::Planning,
+        Tool::ProposeAction | Tool::PageOut => Shape::Planning,
         Tool::ReportRefusal => Shape::Refusal,
         Tool::GetSituation => Shape::Briefing,
         Tool::AskAgent | Tool::Reply => Shape::Conversation,
@@ -96,7 +101,8 @@ pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
         | Tool::ListFiles
         | Tool::HashFile
         | Tool::YaraScan
-        | Tool::Exec => Provenance::AttackerWritable,
+        | Tool::Exec
+        | Tool::PageIn => Provenance::AttackerWritable,
         Tool::RequestAdmission
         | Tool::ReportFinding
         | Tool::ReportRefusal
@@ -106,7 +112,8 @@ pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
         | Tool::GetSituation
         | Tool::AskAgent
         | Tool::Reply
-        | Tool::SubmitRule => Provenance::AgentClaim,
+        | Tool::SubmitRule
+        | Tool::PageOut => Provenance::AgentClaim,
     }
 }
 

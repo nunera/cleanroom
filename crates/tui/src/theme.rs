@@ -11,7 +11,9 @@ use std::env;
 
 use cleanroom_proto::Role;
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style, Stylize as _};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Padding};
 
 /// Background of every screen.
 pub(crate) const INK: Color = Color::Rgb(10, 14, 19);
@@ -124,4 +126,89 @@ fn fade(color: Color) -> Color {
         mix(green, ink_green),
         mix(blue, ink_blue),
     )
+}
+
+/// `from` moved `amount`/256 of the way to `to` (RGB only; other colors stay `from`).
+pub(crate) fn blend(from: Color, to: Color, amount: u16) -> Color {
+    let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (from, to) else {
+        return from;
+    };
+    let amount = amount.min(256);
+    let step = |a: u8, b: u8| {
+        let value = (u16::from(a) * (256 - amount) + u16::from(b) * amount) / 256;
+        u8::try_from(value).unwrap_or(u8::MAX)
+    };
+    Color::Rgb(step(r1, r2), step(g1, g2), step(b1, b2))
+}
+
+/// The palette as a value, for renderers that take it as a parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Theme {
+    /// Background.
+    pub(crate) ink: Color,
+    /// Raised surfaces.
+    pub(crate) raised: Color,
+    /// Selected rows and keycaps.
+    pub(crate) raised_hi: Color,
+    /// Borders and rules.
+    pub(crate) line: Color,
+    /// Quiet text.
+    pub(crate) dim: Color,
+    /// Secondary text.
+    pub(crate) muted: Color,
+    /// Body text.
+    pub(crate) text: Color,
+    /// Headings and names.
+    pub(crate) bright: Color,
+    /// The accent.
+    pub(crate) accent: Color,
+    /// The accent as a surface.
+    pub(crate) accent_bg: Color,
+    /// Breach or block.
+    pub(crate) red: Color,
+    /// Breach or block, as a surface.
+    pub(crate) red_bg: Color,
+    /// Unknown or waiting.
+    pub(crate) amber: Color,
+    /// Unknown or waiting, as a surface.
+    pub(crate) amber_bg: Color,
+}
+
+impl Theme {
+    /// Cleanroom's palette.
+    pub(crate) const CLEANROOM: Self = Self {
+        ink: INK,
+        raised: RAISED,
+        raised_hi: RAISED_HI,
+        line: LINE,
+        dim: DIM,
+        muted: MUTED,
+        text: TEXT,
+        bright: BRIGHT,
+        accent: ACCENT,
+        accent_bg: ACCENT_BG,
+        red: RED,
+        red_bg: RED_BG,
+        amber: AMBER,
+        amber_bg: AMBER_BG,
+    };
+
+    /// A rounded panel with `title` inset in its top border. The focused panel's border and title
+    /// are the bright accent; the others stay quiet.
+    pub(crate) fn panel(&self, title: &str, focused: bool) -> Block<'static> {
+        let (border, title_color) = if focused {
+            (self.accent, self.accent)
+        } else {
+            (self.line, self.muted)
+        };
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(border))
+            .title(Line::from(vec![
+                Span::raw(" "),
+                Span::raw(title.to_owned()).fg(title_color).bold(),
+                Span::raw(" "),
+            ]))
+            .padding(Padding::horizontal(1))
+    }
 }

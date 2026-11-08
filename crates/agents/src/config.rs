@@ -111,6 +111,10 @@ pub(crate) struct Settings {
     pub(crate) dataset_dir: PathBuf,
     /// Pinned flake reference prefix for tool requests.
     pub(crate) nixpkgs: String,
+    /// `CLEANROOM_MEMORY_TIERS=1`: run the evidence pager (also `run --memory-tiers`).
+    pub(crate) memory_tiers: bool,
+    /// Where the pager's tier decisions go: `$XDG_STATE_HOME/cleanroom/memory-tiers.ndjson`.
+    pub(crate) memory_log: PathBuf,
 }
 
 impl Settings {
@@ -171,6 +175,14 @@ impl Settings {
             keys_dir: xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/keys"),
             dataset_dir: xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/dataset"),
             nixpkgs: env.model("CLEANROOM_NIXPKGS", DEFAULT_NIXPKGS),
+            memory_tiers: env.get("CLEANROOM_MEMORY_TIERS").is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            }),
+            memory_log: xdg_dir("XDG_STATE_HOME", ".local/state")?
+                .join("cleanroom/memory-tiers.ndjson"),
         })
     }
 }

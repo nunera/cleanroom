@@ -1,13 +1,14 @@
 //! Rendering: draws a [`State`] and a [`View`] into one ratatui frame.
 //!
 //! The Cleanroom app is a row of tabs under a pixel-art banner whose sky shows the incident's
-//! state: Overview, Lead, Scope, Record, Defense and Team, plus the Controlroom, the dense operator
-//! screen with every OS denial pinned. Text sits next to every color, so nothing depends on color
-//! alone.
+//! state: Overview, Lead, Scope, Record, Defense, Team and Memory, plus the Controlroom, the dense
+//! operator screen with every OS denial pinned. Text sits next to every color, so nothing depends
+//! on color alone.
 
 mod banner;
 mod controlroom;
 mod lead;
+mod memory;
 mod overlays;
 mod tabs;
 
@@ -30,7 +31,7 @@ use crate::state::{State, Tone, Who, compromised};
 use crate::team;
 use crate::theme::{
     ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, Colors, DIM, INK, LINE, MUTED, RAISED, RAISED_HI,
-    RED, RED_BG, TEXT, glyph, strip, tint,
+    RED, RED_BG, TEXT, blend, glyph, strip, tint,
 };
 
 /// The thin rule under the tab bar.
@@ -70,19 +71,22 @@ pub(crate) enum Tab {
     Defense,
     /// F6: the agents.
     Team,
+    /// F7: each agent's working context, span by span.
+    Memory,
     /// F10: the dense operator screen.
     Controlroom,
 }
 
 impl Tab {
     /// Every tab, in tab-bar order.
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Overview,
         Self::Lead,
         Self::Scope,
         Self::Record,
         Self::Defense,
         Self::Team,
+        Self::Memory,
         Self::Controlroom,
     ];
 
@@ -95,6 +99,7 @@ impl Tab {
             4 => Some(Self::Record),
             5 => Some(Self::Defense),
             6 => Some(Self::Team),
+            7 => Some(Self::Memory),
             10 => Some(Self::Controlroom),
             _ => None,
         }
@@ -121,6 +126,7 @@ impl Tab {
             Self::Record => ("Record", "F4"),
             Self::Defense => ("Defense", "F5"),
             Self::Team => ("Team", "F6"),
+            Self::Memory => ("Memory", "F7"),
             Self::Controlroom => ("Controlroom", "F10"),
         }
     }
@@ -152,10 +158,36 @@ impl Tab {
                 "the crew",
                 "The Lead and the four specialists: model, live status, recent steps and findings.",
             ),
+            Self::Memory => (
+                "the stacks",
+                "Each agent's working context: what sits verbatim, what is paged out to a digest, and every move.",
+            ),
             Self::Controlroom => (
                 "the deck",
                 "Everything at once: pinned OS blocks, scope, trace, the Lead, the team and approvals.",
             ),
+        }
+    }
+}
+
+/// The views of the Overview's activity chart, its sub-tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChartView {
+    /// Tool calls, OS denials and safety flags.
+    All,
+    /// Tool calls and OS denials.
+    Exec,
+    /// Safety flags.
+    Safety,
+}
+
+impl ChartView {
+    /// The next view (`forward`) or the previous one, wrapping around.
+    pub(crate) const fn step(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::All, true) | (Self::Safety, false) => Self::Exec,
+            (Self::Exec, true) | (Self::All, false) => Self::Safety,
+            (Self::Safety, true) | (Self::Exec, false) => Self::All,
         }
     }
 }
@@ -176,6 +208,16 @@ pub(crate) enum Pane {
     Approvals,
     /// The agent trace.
     Trace,
+}
+
+impl Pane {
+    /// The other pane.
+    pub(crate) const fn other(self) -> Self {
+        match self {
+            Self::Approvals => Self::Trace,
+            Self::Trace => Self::Approvals,
+        }
+    }
 }
 
 /// A modal panel on top of the console.
@@ -273,6 +315,12 @@ pub struct View {
     pub(crate) toast: Cell<(u64, Option<Timestamp>)>,
     /// Whether color may be used.
     pub(crate) colors: Colors,
+    /// The focused panel on the current tab, counted left to right, top to bottom.
+    pub(crate) panel: usize,
+    /// The Overview chart's sub-tab.
+    pub(crate) chart: ChartView,
+    /// Whether things move: the banner, pulses and fades.
+    pub(crate) motion: bool,
 }
 
 impl View {
@@ -312,6 +360,9 @@ impl View {
             access: AccessForm::new(),
             toast: Cell::new((0, None)),
             colors: Colors::Full,
+            panel: 0,
+            chart: ChartView::All,
+            motion: false,
         }
     }
 
@@ -320,6 +371,24 @@ impl View {
     pub(crate) const fn with_colors(mut self, colors: Colors) -> Self {
         self.colors = colors;
         self
+    }
+
+    /// The same view, animated when `motion`.
+    #[must_use]
+    pub(crate) const fn with_motion(mut self, motion: bool) -> Self {
+        self.motion = motion;
+        self
+    }
+
+    /// Move the focus to the next panel (`forward`) or the previous one on the current tab.
+    pub(crate) fn move_focus(&mut self, state: &State, now: Timestamp, forward: bool) {
+        let count = tabs::panel_count(state, self, now).max(1);
+        let current = self.panel % count;
+        self.panel = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
     }
 
     /// False only when a live link has dropped.
@@ -332,9 +401,11 @@ impl View {
         state.admission.is_some() && state.admission_seq > self.admission_seen
     }
 
-    /// Show `tab`; the Lead tab opens with the message line focused, every other with keys.
+    /// Show `tab`, its first panel focused; the Lead tab opens with the message line focused,
+    /// every other with keys.
     pub(crate) const fn show(&mut self, tab: Tab) {
         self.tab = tab;
+        self.panel = 0;
         self.focus = match tab {
             Tab::Lead => Focus::Input,
             Tab::Overview
@@ -342,6 +413,7 @@ impl View {
             | Tab::Record
             | Tab::Defense
             | Tab::Team
+            | Tab::Memory
             | Tab::Controlroom => Focus::Keys,
         };
     }
@@ -366,11 +438,11 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
             pill,
         );
         frame.render_widget(
-            Paragraph::new(vitals_line(state, now, usize::from(chips.width))).bg(RAISED),
+            Paragraph::new(vitals_line(state, view, now, usize::from(chips.width))).bg(RAISED),
             chips,
         );
         controlroom::render(frame, body, state, view, now);
-        render_keys(frame, keys, view);
+        render_keys(frame, keys, state, view, now);
     } else {
         let banner_rows = if area.height >= 36 { banner::HEIGHT } else { 0 };
         let [sky, bar, subtitle, rule, body, keys] = Layout::vertical([
@@ -383,7 +455,12 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
         ])
         .areas(area);
         if banner_rows > 0 {
-            banner::render(frame, sky, banner::Sky::of(state));
+            banner::render(
+                frame,
+                sky,
+                banner::Sky::of(state),
+                view.motion.then_some(now),
+            );
         }
         render_tab_bar(frame, bar, view);
         render_subtitle(frame, subtitle, view.tab);
@@ -392,14 +469,16 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
             rule,
         );
         match view.tab {
-            Tab::Overview => tabs::overview(frame, body, state, view, now),
             Tab::Lead => lead::render(frame, body, state, view, now),
-            Tab::Scope => tabs::scope(frame, body, state),
-            Tab::Record => tabs::record(frame, body, state, now),
-            Tab::Defense => tabs::defense(frame, body, state),
-            Tab::Team | Tab::Controlroom => tabs::crew(frame, body, state, now),
+            Tab::Memory => memory::render(frame, body, state, view, now),
+            Tab::Overview
+            | Tab::Scope
+            | Tab::Record
+            | Tab::Defense
+            | Tab::Team
+            | Tab::Controlroom => tabs::render(frame, body, state, view, now),
         }
-        render_keys(frame, keys, view);
+        render_keys(frame, keys, state, view, now);
     }
     render_toast(frame, area, state, view, now);
     overlays::render(frame, area, state, view);
@@ -468,6 +547,20 @@ fn render_subtitle(frame: &mut Frame<'_>, area: Rect, tab: Tab) {
 /// Key and action pairs for the key bar.
 type Hints = &'static [(&'static str, &'static str)];
 
+/// Amber that breathes while motion is on, for a signature that is waiting.
+pub(super) fn pulse_amber(view: &View, now: Timestamp) -> Color {
+    if !view.motion {
+        return AMBER;
+    }
+    let phase = now.as_millisecond().rem_euclid(1600);
+    let depth = if phase < 800 { phase } else { 1600 - phase };
+    blend(
+        AMBER,
+        AMBER_BG,
+        u16::try_from(depth * 160 / 800).unwrap_or(0),
+    )
+}
+
 /// The keys for the current tab, focus and modal: the list, then the keys pinned to the right.
 const fn key_items(view: &View) -> (Hints, Hints) {
     match (view.overlay, view.tab, view.focus) {
@@ -505,7 +598,13 @@ const fn key_items(view: &View) -> (Hints, Hints) {
         ),
         (
             Overlay::None,
-            Tab::Overview | Tab::Lead | Tab::Scope | Tab::Record | Tab::Defense | Tab::Team,
+            Tab::Overview
+            | Tab::Lead
+            | Tab::Scope
+            | Tab::Record
+            | Tab::Defense
+            | Tab::Team
+            | Tab::Memory,
             Focus::Keys,
         ) => (
             &[
@@ -526,9 +625,23 @@ const fn key_items(view: &View) -> (Hints, Hints) {
     }
 }
 
-/// `key Action` pairs, the keys in the accent; what doesn't fit is left to `?`.
-fn render_keys(frame: &mut Frame<'_>, area: Rect, view: &View) {
+/// `key Action` pairs, the keys in the accent: the focused panel's keys first, then the tab's;
+/// what doesn't fit is left to `?`.
+fn render_keys(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
     let (items, pinned) = key_items(view);
+    let panel_keys: Hints = match (view.overlay, view.tab, view.focus) {
+        (
+            Overlay::None,
+            Tab::Overview | Tab::Scope | Tab::Record | Tab::Defense | Tab::Team,
+            Focus::Keys,
+        ) => tabs::focused_keys(state, view, now),
+        _ => &[],
+    };
+    let focus: Hints = if panel_keys.is_empty() {
+        &[]
+    } else {
+        &[("[ ]", "Focus")]
+    };
     let pair = |(key, action): &(&str, &str)| {
         [
             Span::raw(format!(" {key} ")).fg(ACCENT).bold(),
@@ -538,6 +651,15 @@ fn render_keys(frame: &mut Frame<'_>, area: Rect, view: &View) {
     let right: Vec<Span<'static>> = pinned.iter().flat_map(pair).collect();
     let right_width: usize = right.iter().map(Span::width).sum();
     let room = usize::from(area.width).saturating_sub(right_width + 1);
+    let items: Vec<&(&str, &str)> = panel_keys
+        .iter()
+        .chain(focus)
+        .chain(
+            items
+                .iter()
+                .filter(|(key, _)| !panel_keys.iter().any(|(taken, _)| taken == key)),
+        )
+        .collect();
     let mut left = Vec::new();
     let mut used = 0;
     for item in items {
@@ -643,7 +765,7 @@ struct Chip {
 /// Next deadline, assets compromised, kernel blocks, guardrails, approvals waiting and the
 /// agents' model mode, in `width` columns: short forms when the long ones don't fit, then the
 /// last chips dropped.
-fn vitals_line(state: &State, now: Timestamp, width: usize) -> Line<'static> {
+fn vitals_line(state: &State, view: &View, now: Timestamp, width: usize) -> Line<'static> {
     let mut chips = vec![next_deadline(state, now), assets_chip(state)];
     let blocks = state.blocks();
     let noun = if blocks == 1 { "block" } else { "blocks" };
@@ -667,7 +789,7 @@ fn vitals_line(state: &State, now: Timestamp, width: usize) -> Line<'static> {
         chips.push(Chip {
             label: ("APPROVALS", "SIGN"),
             value: (format!("{waiting} waiting"), format!("{waiting}")),
-            color: AMBER,
+            color: pulse_amber(view, now),
         });
     }
     if let Some(counters) = state.counters

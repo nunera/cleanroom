@@ -189,6 +189,8 @@ pub(crate) struct Replay {
     proposals: Vec<(String, Signed<BusMessage>)>,
     /// Latest `counters`.
     counters: Option<Signed<BusMessage>>,
+    /// Latest `memory` map per role, in first-seen order.
+    memory: Vec<(String, Signed<BusMessage>)>,
 }
 
 impl Replay {
@@ -216,6 +218,7 @@ impl Replay {
                 remove(&mut self.tool_requests, subject_id);
             }
             BusBody::Counters { .. } => self.counters = Some(message.clone()),
+            BusBody::Memory(map) => upsert(&mut self.memory, &format!("{:?}", map.role), message),
             BusBody::Chat { .. }
             | BusBody::Finding { .. }
             | BusBody::Trace { .. }
@@ -236,6 +239,7 @@ impl Replay {
             .chain(self.tool_requests.iter().map(|(_, message)| message))
             .chain(self.proposals.iter().map(|(_, message)| message))
             .chain(self.counters.iter())
+            .chain(self.memory.iter().map(|(_, message)| message))
     }
 
     /// Remove an open subject by id.
@@ -271,7 +275,8 @@ impl Replay {
             | BusBody::Scope(_)
             | BusBody::Status { .. }
             | BusBody::Investigate { .. }
-            | BusBody::AgentControl { .. } => None,
+            | BusBody::AgentControl { .. }
+            | BusBody::Memory(_) => None,
         }
     }
 
@@ -281,6 +286,7 @@ impl Replay {
         self.scopes.clear();
         self.tool_requests.clear();
         self.proposals.clear();
+        self.memory.clear();
     }
 }
 

@@ -153,9 +153,14 @@ fn modal(
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let keys = [
         (
-            "F1-F6 F10",
-            "Overview, Lead, Scope, Record, Defense, Team; F10 the Controlroom (Tab cycles)",
+            "F1-F7 F10",
+            "Overview, Lead, Scope, Record, Defense, Team, Memory; F10 the Controlroom (Tab cycles)",
         ),
+        (
+            "[ ]  ← →",
+            "Move the focus between panels; the key bar shows the focused panel's keys",
+        ),
+        (", .", "Switch the Overview chart: Activity, Exec, Safety"),
         (
             "Enter",
             "Lead tab: send to the Lead (@hunter, @forensics, @scribe, @containment asks one)",

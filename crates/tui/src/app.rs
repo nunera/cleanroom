@@ -18,10 +18,10 @@ use ed25519_dalek::SigningKey;
 use jiff::{SignedDuration, Timestamp};
 use ratatui::{DefaultTerminal, Frame as TerminalFrame};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt as _;
 
 use crate::access::{MEMBER_ROLES, Standing};
+use crate::motion::Motion;
 use crate::replay;
 use crate::state::{SentRequest, State, Tone};
 use crate::team;
@@ -29,6 +29,8 @@ use crate::ui::{self, Field, Focus, Link, Overlay, Pane, Tab, View};
 
 /// Redraw often enough that second-resolution countdowns tick smoothly.
 const TICK: Duration = Duration::from_millis(250);
+/// Redraw at about 30 fps while something moves.
+const FRAME: Duration = Duration::from_millis(33);
 /// Shown when a key would talk to cleanroomd during a replay.
 const REPLAY_ONLY: &str = "Replay: this console is playing a recording, so nothing was sent.";
 /// Conversation lines one PgUp/PgDn moves.
@@ -263,6 +265,8 @@ pub(crate) struct App {
     tamper_root: String,
     /// False once the commander quits.
     running: bool,
+    /// Effects over the frame; `None` when motion is off.
+    motion: Option<Motion>,
 }
 
 impl App {
@@ -274,6 +278,7 @@ impl App {
         tamper_root: String,
     ) -> Self {
         state.set_identity(session.key_id.clone());
+        let motion = view.motion.then(|| Motion::new(&view));
         Self {
             state,
             view,
@@ -281,11 +286,13 @@ impl App {
             timebase: Timebase::Live,
             tamper_root,
             running: true,
+            motion,
         }
     }
 
     /// A console playing a recording that starts at `start`, at `speed`.
     pub(crate) fn replay(state: State, view: View, start: Timestamp, speed: f64) -> Self {
+        let motion = view.motion.then(|| Motion::new(&view));
         Self {
             state,
             view,
@@ -297,12 +304,33 @@ impl App {
             },
             tamper_root: String::new(),
             running: true,
+            motion,
         }
     }
 
-    /// Draw the console.
-    fn draw(&self, frame: &mut TerminalFrame<'_>) {
+    /// Draw the console, then run the motion effects over the frame.
+    fn draw(&mut self, frame: &mut TerminalFrame<'_>) {
         ui::render(frame, &self.state, &self.view, self.timebase.now());
+        if let Some(motion) = &mut self.motion {
+            motion.observe(&self.state, &self.view);
+            let area = frame.area();
+            motion.process(frame.buffer_mut(), area);
+        }
+    }
+
+    /// How long to wait for the next frame: about 30 fps while something moves, else a tick.
+    fn pause(&self) -> Duration {
+        if self.motion.as_ref().is_some_and(Motion::busy) {
+            FRAME
+        } else {
+            TICK
+        }
+    }
+
+    /// Move the focus to the next panel (`forward`) or the previous one.
+    fn move_focus(&mut self, forward: bool) {
+        let now = self.timebase.now();
+        self.view.move_focus(&self.state, now, forward);
     }
 
     /// Handle a message from a background task.
@@ -562,18 +590,24 @@ impl App {
             Key::Char('m') => self.open_members(),
             Key::Char('c' | '/') => match self.view.tab {
                 Tab::Lead | Tab::Controlroom => self.view.focus = Focus::Input,
-                Tab::Overview | Tab::Scope | Tab::Record | Tab::Defense | Tab::Team => {
+                Tab::Overview
+                | Tab::Scope
+                | Tab::Record
+                | Tab::Defense
+                | Tab::Team
+                | Tab::Memory => {
                     self.view.show(Tab::Lead);
                 }
             },
             Key::Up | Key::Char('k') => self.select(true),
             Key::Down | Key::Char('j') => self.select(false),
             Key::Left | Key::Right if self.view.tab == Tab::Controlroom => {
-                self.view.pane = match self.view.pane {
-                    Pane::Approvals => Pane::Trace,
-                    Pane::Trace => Pane::Approvals,
-                };
+                self.view.pane = self.view.pane.other();
             }
+            Key::Left | Key::Char('[') => self.move_focus(false),
+            Key::Right | Key::Char(']') => self.move_focus(true),
+            Key::Char(',') => self.view.chart = self.view.chart.step(false),
+            Key::Char('.') => self.view.chart = self.view.chart.step(true),
             Key::Enter => match (self.view.tab, self.view.pane) {
                 (Tab::Lead, _) => self.view.focus = Focus::Input,
                 (Tab::Controlroom, Pane::Trace) => {
@@ -588,14 +622,13 @@ impl App {
                     | Tab::Scope
                     | Tab::Record
                     | Tab::Defense
-                    | Tab::Team,
+                    | Tab::Team
+                    | Tab::Memory,
                     _,
                 ) => {}
             },
             Key::Esc => self.view.trace = None,
             Key::Char(_)
-            | Key::Left
-            | Key::Right
             | Key::Backspace
             | Key::Tab
             | Key::BackTab
@@ -1111,11 +1144,10 @@ pub(crate) async fn run(
     mut inbound: UnboundedReceiver<Inbound>,
 ) -> io::Result<()> {
     let mut keys = EventStream::new();
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut inbound_open = true;
     while app.running {
         terminal.draw(|frame| app.draw(frame))?;
+        let pause = tokio::time::sleep(app.pause());
         tokio::select! {
             event = keys.next() => match event {
                 Some(Ok(event)) => app.on_terminal(&event),
@@ -1131,7 +1163,7 @@ pub(crate) async fn run(
                 }
                 None => inbound_open = false,
             },
-            _ = tick.tick() => {}
+            () = pause => {}
         }
     }
     Ok(())

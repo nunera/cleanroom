@@ -1,78 +1,234 @@
 //! The Cleanroom tabs that read the incident: Overview, Scope, Record, Defense and Team.
 //!
-//! Each tab lays out `✦ Title` panels in two columns. Rows are short label and value pairs, counts
-//! become block bars, and `→ Scope F3` links name the key that goes there. Everything comes from
-//! the bus state; an empty panel says what will fill it.
+//! Every tab is a set of rounded panels with the title inset in the border. One panel has focus
+//! (`[`/`]` or ←/→ move it): its border turns the bright accent and the key bar shows its keys.
+//! Tables get a full-width accent header bar and zebra rows, counts become segmented bars, the
+//! Overview charts tool calls, OS denials and safety flags over time, and an empty panel is
+//! hatched with what will fill it. Everything comes from the bus state.
 
 use cleanroom_proto::{Role, ScopeRecord, Tri};
 use jiff::Timestamp;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize as _};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Axis, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table};
+use tui_big_text::{BigText, PixelSize};
 
 use super::controlroom::class_label;
 use super::lead::status_spans;
 use super::{
-    View, clock_text, due_label, fit, flag_look, grouped, pad, role_label, running_clocks,
-    severity_word, short_model, urgency_color, wrap,
+    ChartView, View, clock_text, due_label, fit, flag_look, grouped, pad, role_label,
+    running_clocks, severity_word, short_model, urgency_color, wrap,
 };
-use crate::clocks;
-use crate::denials::Kind;
+use crate::clocks::{self, ClockState, Regime};
 use crate::next::{self, NextAction};
 use crate::state::{
     Activity, Admission, Ask, LogStatus, State, Who, compromised, status_word, yes_flags,
 };
-use crate::team::{self, SPECIALISTS};
-use crate::theme::{ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, RED, TEXT, glyph, tint};
+use crate::team::{self, SPECIALISTS, Status};
+use crate::theme::{
+    ACCENT, ACCENT_BG, AMBER, BRIGHT, DIM, INK, LINE, MUTED, RAISED, RED, TEXT, Theme, glyph, tint,
+};
 
-/// A panel: its title and its lines.
-type Panel = (String, Vec<Line<'static>>);
+/// Key and action pairs for the key bar.
+pub(super) type Keys = &'static [(&'static str, &'static str)];
 
-/// A `✦ Title` panel with a thin rounded border and room inside.
-fn card(title: &str) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(LINE))
-        .title(Line::from(vec![
-            Span::raw(" ✦ ").fg(ACCENT),
-            Span::raw(title.to_owned()).fg(ACCENT).bold(),
-            Span::raw(" "),
-        ]))
-        .padding(Padding::horizontal(1))
+/// What a panel holds.
+enum Body {
+    /// Lines of text.
+    Lines(Vec<Line<'static>>),
+    /// A zebra table: header, rows, column widths.
+    Table(Vec<&'static str>, Vec<Row<'static>>, Vec<Constraint>),
+    /// The activity chart with its sub-tabs.
+    Activity,
+    /// The welcome panel.
+    Welcome,
+    /// The kernel-blocks count in big type.
+    Hero,
+    /// Nothing yet: hatched, with what will fill it.
+    Hatched(&'static str),
 }
 
-/// Stack `panels` down `area`, each as tall as its lines.
-fn stack(frame: &mut Frame<'_>, area: Rect, panels: Vec<Panel>) {
-    let constraints: Vec<Constraint> = panels
-        .iter()
-        .map(|(_, lines)| {
-            Constraint::Length(
-                u16::try_from(lines.len())
-                    .unwrap_or(u16::MAX)
-                    .saturating_add(2),
-            )
-        })
-        .collect();
-    let areas = Layout::vertical(constraints).spacing(1).split(area);
-    for ((title, lines), cell) in panels.into_iter().zip(areas.iter()) {
-        frame.render_widget(Paragraph::new(lines).block(card(&title)), *cell);
+/// One panel: title, body, rows it wants (`None` to take what is left) and its keys.
+struct Panel {
+    /// Title in the border.
+    title: String,
+    /// Content.
+    body: Body,
+    /// Content rows, or `None` to fill.
+    rows: Option<u16>,
+    /// Keys the key bar shows while this panel has focus.
+    keys: Keys,
+}
+
+impl Panel {
+    /// A panel of text lines, as tall as its lines.
+    fn lines(title: &str, lines: Vec<Line<'static>>, keys: Keys) -> Self {
+        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        Self {
+            title: title.to_owned(),
+            body: Body::Lines(lines),
+            rows: Some(rows),
+            keys,
+        }
+    }
+
+    /// A panel that takes the rest of its column.
+    fn fill(title: &str, body: Body, keys: Keys) -> Self {
+        Self {
+            title: title.to_owned(),
+            body,
+            rows: None,
+            keys,
+        }
     }
 }
 
-/// Two columns of panels with a gutter, inside a margin.
-fn columns(frame: &mut Frame<'_>, area: Rect, left: Vec<Panel>, right: Vec<Panel>) {
-    let [_, first, _, second, _] = Layout::horizontal([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(2),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(area.inner(ratatui::layout::Margin::new(0, 1)));
-    stack(frame, first, left);
-    stack(frame, second, right);
+/// Where the panels of a tab go.
+struct Page {
+    /// Columns of panels, left to right.
+    columns: Vec<Vec<Panel>>,
+}
+
+impl Page {
+    /// Every panel's keys, in focus order (columns left to right, panels top to bottom).
+    fn keys(&self) -> Vec<Keys> {
+        self.columns
+            .iter()
+            .flat_map(|column| column.iter().map(|panel| panel.keys))
+            .collect()
+    }
+}
+
+/// The panels of `view.tab` for `state`.
+fn page(state: &State, view: &View, now: Timestamp) -> Page {
+    match view.tab {
+        super::Tab::Overview => overview_page(state, view, now),
+        super::Tab::Scope => scope_page(state),
+        super::Tab::Record => record_page(state, now),
+        super::Tab::Defense => defense_page(state),
+        super::Tab::Team | super::Tab::Lead | super::Tab::Memory | super::Tab::Controlroom => {
+            team_page(state, now)
+        }
+    }
+}
+
+/// How many panels `view.tab` has, so focus can wrap.
+pub(super) fn panel_count(state: &State, view: &View, now: Timestamp) -> usize {
+    page(state, view, now).keys().len()
+}
+
+/// The keys of the focused panel, for the key bar.
+pub(super) fn focused_keys(state: &State, view: &View, now: Timestamp) -> Keys {
+    let keys = page(state, view, now).keys();
+    let count = keys.len().max(1);
+    keys.get(view.panel % count).copied().unwrap_or(&[])
+}
+
+/// Draw `view.tab` into `area`.
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    view: &View,
+    now: Timestamp,
+) {
+    let page = page(state, view, now);
+    let count = page.keys().len().max(1);
+    let focused = view.panel % count;
+    let area = area.inner(Margin::new(1, 1));
+    let widths: Vec<Constraint> = page.columns.iter().map(|_| Constraint::Fill(1)).collect();
+    let cells = Layout::horizontal(widths).spacing(2).split(area);
+    let mut index = 0;
+    for (column, cell) in page.columns.into_iter().zip(cells.iter()) {
+        let heights: Vec<Constraint> = column
+            .iter()
+            .map(|panel| {
+                panel.rows.map_or(Constraint::Fill(1), |rows| {
+                    Constraint::Length(rows.saturating_add(2))
+                })
+            })
+            .collect();
+        let slots = Layout::vertical(heights).spacing(1).split(*cell);
+        for (panel, slot) in column.into_iter().zip(slots.iter()) {
+            draw_panel(frame, *slot, panel, index == focused, (state, view, now));
+            index += 1;
+        }
+    }
+}
+
+/// One panel: the rounded border with its inset title, then its body.
+fn draw_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    panel: Panel,
+    focused: bool,
+    (state, view, now): (&State, &View, Timestamp),
+) {
+    let block = Theme::CLEANROOM.panel(&panel.title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    match panel.body {
+        Body::Lines(lines) => frame.render_widget(Paragraph::new(lines), inner),
+        Body::Table(header, rows, widths) => {
+            frame.render_widget(zebra(header, rows, widths), inner);
+        }
+        Body::Activity => activity_chart(frame, inner, state, view, now),
+        Body::Welcome => welcome(frame, inner),
+        Body::Hero => hero(frame, inner, state),
+        Body::Hatched(text) => hatched(frame, inner, text),
+    }
+}
+
+/// A table with a full-width accent header bar and zebra rows.
+fn zebra(
+    header: Vec<&'static str>,
+    rows: Vec<Row<'static>>,
+    widths: Vec<Constraint>,
+) -> Table<'static> {
+    let rows = rows.into_iter().enumerate().map(|(index, row)| {
+        if index % 2 == 0 {
+            row.style(Style::new().bg(RAISED))
+        } else {
+            row
+        }
+    });
+    Table::new(rows, widths)
+        .header(
+            Row::new(header.into_iter().map(Cell::from))
+                .style(Style::new().fg(INK).bg(ACCENT).bold()),
+        )
+        .column_spacing(1)
+}
+
+/// Hatched fill with `text` in the middle: nothing to show yet.
+fn hatched(frame: &mut Frame<'_>, area: Rect, text: &str) {
+    let width = usize::from(area.width);
+    let label = format!(" {text} ");
+    let rows = usize::from(area.height);
+    let middle = rows / 2;
+    let lines: Vec<Line<'static>> = (0..rows)
+        .map(|row| {
+            let hatch: String = (0..width)
+                .map(|column| if (column + row) % 2 == 0 { '/' } else { ' ' })
+                .collect();
+            if row == middle && width > label.len() + 4 {
+                let side = (width - super::width_of(&label)) / 2;
+                let left: String = hatch.chars().take(side).collect();
+                let right: String = hatch.chars().skip(side + super::width_of(&label)).collect();
+                Line::from(vec![
+                    Span::raw(left).fg(LINE),
+                    Span::raw(label.clone()).fg(MUTED),
+                    Span::raw(right).fg(LINE),
+                ])
+            } else {
+                Line::from(Span::raw(hatch).fg(LINE))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// `→ Scope F3`: where a line leads.
@@ -87,8 +243,8 @@ fn row(label: &str, width: usize, value: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// A bar of `width` cells for `value` out of `max`: `█` filled in `color`, `░` empty.
-fn bar(value: u64, max: u64, width: usize, color: Color) -> [Span<'static>; 2] {
+/// A segmented bar of `width` cells for `value` out of `max`: `▰` in `color`, `▱` empty.
+fn segments(value: u64, max: u64, width: usize, color: Color) -> [Span<'static>; 2] {
     let max = max.max(1);
     let width_u64 = u64::try_from(width).unwrap_or(u64::MAX);
     let filled = if value == 0 {
@@ -97,9 +253,25 @@ fn bar(value: u64, max: u64, width: usize, color: Color) -> [Span<'static>; 2] {
         usize::try_from((value.min(max) * width_u64).div_ceil(max)).unwrap_or(width)
     };
     [
-        Span::raw("█".repeat(filled)).fg(color),
-        Span::raw("░".repeat(width.saturating_sub(filled))).fg(LINE),
+        Span::raw("▰".repeat(filled)).fg(color),
+        Span::raw("▱".repeat(width.saturating_sub(filled))).fg(LINE),
     ]
+}
+
+/// Steps per interval as a one-line sparkline.
+fn sparkline(bars: &[u64]) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let top = bars.iter().copied().max().unwrap_or(0).max(1);
+    bars.iter()
+        .map(|value| {
+            if *value == 0 {
+                '·'
+            } else {
+                let level = usize::try_from(value * 7 / top).unwrap_or(7);
+                LEVELS.get(level).copied().unwrap_or('█')
+            }
+        })
+        .collect()
 }
 
 /// A quiet line saying what will fill an empty panel.
@@ -109,29 +281,219 @@ fn empty(text: &str) -> Line<'static> {
 
 // ---------- F1 Overview ----------
 
-/// Overview, "the room": what to do now, the incident, the assets, the layers and the clocks.
-pub(super) fn overview(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &State,
-    view: &View,
-    now: Timestamp,
-) {
+/// Overview, "the room": the welcome before anything happens; afterwards what to do now, the
+/// activity chart, the incident, the assets, the layers and the clocks.
+fn overview_page(state: &State, view: &View, now: Timestamp) -> Page {
+    let quiet = state.incident.is_none() && state.pulse.is_empty();
+    if quiet {
+        return Page {
+            columns: vec![
+                vec![Panel::fill(
+                    "Welcome to Cleanroom",
+                    Body::Welcome,
+                    &[
+                        ("d", "Detonate"),
+                        ("t", "Tamper"),
+                        ("A", "Admit"),
+                        ("F2", "Lead"),
+                    ],
+                )],
+                vec![
+                    Panel::lines("Assets", asset_lines(state), &[("F3", "Open Scope")]),
+                    Panel::fill(
+                        "Activity",
+                        Body::Hatched("no activity yet · d detonates a scenario"),
+                        &[],
+                    ),
+                    Panel::lines(
+                        "Defense layers",
+                        layer_lines(state, true),
+                        &[("g", "Guardrails")],
+                    ),
+                ],
+            ],
+        };
+    }
     let mut now_panel = vec![next_line(state, view, now), Line::default()];
     now_panel.extend(now_lines(state, now));
-    let left = vec![
-        ("Now".to_owned(), now_panel),
-        ("Incident".to_owned(), incident_lines(state)),
-        ("Next deadlines".to_owned(), deadline_lines(state, now, 3)),
-    ];
-    let right = vec![
-        ("Assets".to_owned(), asset_lines(state)),
-        ("Defense layers".to_owned(), layer_lines(state)),
-    ];
-    columns(frame, area, left, right);
+    Page {
+        columns: vec![
+            vec![
+                Panel::lines(
+                    "Now",
+                    now_panel,
+                    &[("a/x", "Approve/Deny"), ("↑↓", "Select")],
+                ),
+                Panel::fill(
+                    "Activity",
+                    Body::Activity,
+                    &[(",/.", "Switch view"), ("F10", "Controlroom")],
+                ),
+            ],
+            vec![
+                Panel::lines("Incident", incident_lines(state), &[("F4", "Open Record")]),
+                Panel::lines("Assets", asset_lines(state), &[("F3", "Open Scope")]),
+                Panel::lines(
+                    "Defense layers",
+                    layer_lines(state, true),
+                    &[("F5", "Open Defense"), ("g", "Guardrails")],
+                ),
+                Panel::lines(
+                    "Next deadlines",
+                    deadline_lines(state, now, 3),
+                    &[("F4", "Open Record")],
+                ),
+            ],
+        ],
+    }
 }
 
-/// The single most pressing next step.
+/// What Cleanroom is and how to start, with the name in big type.
+fn welcome(frame: &mut Frame<'_>, area: Rect) {
+    let [art, _, text] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area.inner(Margin::new(1, 1)));
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(Style::new().fg(ACCENT))
+        .lines(vec![Line::from("CLEANROOM")])
+        .alignment(Alignment::Left)
+        .build();
+    frame.render_widget(big, art);
+    let key = |key: &str, what: &str| {
+        Line::from(vec![
+            Span::raw("  ● ").fg(ACCENT),
+            Span::raw(format!("{key:<4}")).fg(ACCENT).bold(),
+            Span::raw(what.to_owned()).fg(TEXT),
+        ])
+    };
+    let lines = vec![
+        Line::from("A responder OS for the moment an attacker owns your network.").fg(BRIGHT).bold(),
+        Line::from(
+            "Nemotron agents investigate inside sealed strata; the kernel, not the prompt, keeps evidence read-only.",
+        )
+        .fg(TEXT),
+        Line::from("Every command, denial and approval lands on a signed, hash-chained receipt log.").fg(MUTED),
+        Line::default(),
+        Line::from(Span::raw("Getting started").fg(ACCENT).bold().underlined()),
+        Line::default(),
+        key("t", "flip a byte in the Debian root; admission rejects it"),
+        key("A", "admit the clean root again"),
+        key("d", "detonate the ransomware scenario in the sacrificial stratum"),
+        key("F2", "talk to the Lead agent while the team investigates"),
+        key("?", "every key"),
+        Line::default(),
+        Line::from(vec![
+            Span::raw("▌ ").fg(ACCENT),
+            Span::raw("Hint: the focused panel has the bright border; [ ] or ←/→ move focus, and the bottom bar shows its keys.")
+                .fg(MUTED),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        text,
+    );
+}
+
+/// `Activity | Exec | Safety`, the chart's views, the current one lit.
+fn chart_tabs(current: ChartView) -> Line<'static> {
+    let mut tabs = vec![Span::raw(" ")];
+    for (index, (choice, name)) in [
+        (ChartView::All, "Activity"),
+        (ChartView::Exec, "Exec"),
+        (ChartView::Safety, "Safety"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            tabs.push(Span::raw("  |  ").fg(LINE));
+        }
+        if choice == current {
+            tabs.push(Span::styled(
+                format!(" {name} "),
+                Style::new().fg(BRIGHT).bg(ACCENT_BG).bold(),
+            ));
+        } else {
+            tabs.push(Span::raw(format!(" {name} ")).fg(DIM));
+        }
+    }
+    Line::from(tabs)
+}
+
+/// Tool calls, OS denials and safety flags per 5 s since the investigation started, with the
+/// `Activity | Exec | Safety` views as sub-tabs under it.
+fn activity_chart(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+    let [chart_area, tabs_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    frame.render_widget(Paragraph::new(chart_tabs(view.chart)).centered(), tabs_area);
+    if state.pulse.is_empty() {
+        hatched(frame, chart_area, "no activity yet");
+        return;
+    }
+    let [steps, denials, flags] = state.pulse.series(5, now);
+    let lanes: Vec<Lane<'_>> = match view.chart {
+        ChartView::All => vec![
+            ("tool calls", ACCENT, &steps),
+            ("OS denials", RED, &denials),
+            ("safety flags", AMBER, &flags),
+        ],
+        ChartView::Exec => vec![
+            ("tool calls", ACCENT, &steps),
+            ("OS denials", RED, &denials),
+        ],
+        ChartView::Safety => vec![("safety flags", AMBER, &flags)],
+    };
+    let x_max = steps.last().map_or(5.0, |(x, _)| *x).max(5.0);
+    let y_max = lanes
+        .iter()
+        .flat_map(|(_, _, points)| points.iter().map(|(_, y)| *y))
+        .fold(1.0_f64, f64::max)
+        .ceil()
+        .max(2.0);
+    let datasets: Vec<Dataset<'_>> = lanes
+        .iter()
+        .map(|(name, color, points)| {
+            Dataset::default()
+                .name(*name)
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(*color))
+                .data(points)
+        })
+        .collect();
+    let axis_style = Style::new().fg(DIM);
+    let chart = Chart::new(datasets)
+        .x_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([0.0, x_max])
+                .labels([
+                    "0s".to_owned(),
+                    format!("{:.0}s", x_max / 2.0),
+                    format!("{x_max:.0}s since start"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title(Span::raw("per 5 s").fg(DIM))
+                .style(axis_style)
+                .bounds([0.0, y_max])
+                .labels([
+                    "0".to_owned(),
+                    format!("{:.0}", y_max / 2.0),
+                    format!("{y_max:.0}"),
+                ]),
+        )
+        .legend_position(Some(ratatui::widgets::LegendPosition::TopRight))
+        .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
+    frame.render_widget(chart, chart_area);
+}
+
+/// The single most pressing next step; a signature waiting pulses.
 fn next_line(state: &State, view: &View, now: Timestamp) -> Line<'static> {
     let (text, color) = match next::next_action(state, view.connected(), now) {
         NextAction::Reconnect => (
@@ -148,7 +510,7 @@ fn next_line(state: &State, view: &View, now: Timestamp) -> Line<'static> {
         ),
         NextAction::Approvals { count } => (
             format!("{count} waiting for your signature: a approves, x denies."),
-            AMBER,
+            super::pulse_amber(view, now),
         ),
         NextAction::Clock {
             regime, remaining, ..
@@ -180,7 +542,7 @@ fn next_line(state: &State, view: &View, now: Timestamp) -> Line<'static> {
     ])
 }
 
-/// What needs the commander, most pressing first, each with the key that acts on it.
+/// What needs the commander, each with the key that acts on it.
 fn now_lines(state: &State, now: Timestamp) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(Admission::Rejected { root, .. }) = &state.admission {
@@ -226,30 +588,16 @@ fn now_lines(state: &State, now: Timestamp) -> Vec<Line<'static>> {
     }
     if let Some((clock, due)) = running_clocks(state).into_iter().next() {
         let left = clocks::short_remaining(due.duration_since(now));
-        let day = due_label(due, &state.display_tz, "%a %b %-d");
         lines.push(Line::from(vec![
             Span::raw(format!("{left} ")).fg(AMBER).bold(),
-            Span::raw(format!("to the {} ({day})", clock.regime.notice())).fg(TEXT),
+            Span::raw(format!("to the {}", clock.regime.notice())).fg(TEXT),
             link("Record F4"),
         ]));
     }
-    match &state.incident {
-        Some(incident) if state.investigating.as_ref() != Some(&incident.id) => {
-            lines.push(Line::from(vec![
-                Span::raw("agents not started on this incident").fg(AMBER),
-                link("i investigates"),
-            ]));
-        }
-        Some(_) => lines.push(Line::from(vec![
-            Span::raw("ask the Lead what to do first").fg(TEXT),
-            link("Lead F2"),
-        ])),
-        None => lines.push(Line::from(vec![
-            Span::raw("● ").fg(ACCENT),
-            Span::raw("All clear: every asset clean, no legal clock running.").fg(TEXT),
-            link("d detonates a scenario"),
-        ])),
-    }
+    lines.push(Line::from(vec![
+        Span::raw("ask the Lead what to do first").fg(TEXT),
+        link("Lead F2"),
+    ]));
     lines.push(log_line(state));
     lines
 }
@@ -277,9 +625,7 @@ fn log_line(state: &State) -> Line<'static> {
 /// The incident record's headline fields.
 fn incident_lines(state: &State) -> Vec<Line<'static>> {
     let Some(incident) = &state.incident else {
-        return vec![empty(
-            "No incident declared. A detonation or a human investigate opens one.",
-        )];
+        return vec![empty("No incident declared. A detonation or i opens one.")];
     };
     let status = status_word(incident.status).to_uppercase();
     let status_color = match incident.status {
@@ -292,15 +638,14 @@ fn incident_lines(state: &State) -> Vec<Line<'static>> {
     };
     let (severity, severity_color) = severity_word(incident.severity);
     vec![
-        row("id", 11, vec![Span::raw(incident.id.clone()).fg(MUTED)]),
         row(
             "title",
-            11,
-            vec![Span::raw(fit(&incident.title, 58)).fg(BRIGHT).bold()],
+            10,
+            vec![Span::raw(fit(&incident.title, 52)).fg(BRIGHT).bold()],
         ),
         row(
             "status",
-            11,
+            10,
             vec![
                 Span::raw(status).fg(status_color).bold(),
                 Span::raw("  severity ").fg(MUTED),
@@ -308,67 +653,80 @@ fn incident_lines(state: &State) -> Vec<Line<'static>> {
             ],
         ),
         row(
-            "category",
-            11,
-            vec![Span::raw(incident.category.clone()).fg(TEXT)],
-        ),
-        row(
             "detected",
-            11,
-            vec![Span::raw(state.time_label(&incident.detected_at)).fg(TEXT)],
+            10,
+            vec![
+                Span::raw(state.time_label(&incident.detected_at)).fg(TEXT),
+                Span::raw(format!("   {}", incident.id)).fg(DIM),
+            ],
         ),
         row(
             "systems",
-            11,
-            vec![Span::raw(incident.affected_systems.join(", ")).fg(TEXT)],
+            10,
+            vec![Span::raw(fit(&incident.affected_systems.join(", "), 52)).fg(TEXT)],
         ),
-        Line::from(link("Record F4")),
     ]
 }
 
-/// The nearest `count` running clocks.
+/// The nearest `count` running clocks, each with a bar of the time already spent.
 fn deadline_lines(state: &State, now: Timestamp, count: usize) -> Vec<Line<'static>> {
     let running = running_clocks(state);
     if running.is_empty() {
-        return vec![empty(
-            "No legal clock running. Each starts when the record sets its trigger.",
-        )];
+        return vec![empty("No legal clock running yet.")];
     }
-    let mut lines: Vec<Line<'static>> = running
+    running
         .into_iter()
         .take(count)
         .map(|(clock, due)| {
             let remaining = due.duration_since(now);
-            Line::from(vec![
-                Span::raw(pad(clock.regime.notice(), 28)).fg(TEXT),
-                Span::raw(format!("{:>10}", clocks::countdown(remaining)))
-                    .fg(super::urgency_color(clocks::urgency(remaining)))
+            let mut spans = vec![Span::raw(pad(clock.regime.notice(), 20)).fg(TEXT)];
+            spans.extend(elapsed_bar(state, clock.regime, due, now, 14));
+            spans.push(
+                Span::raw(format!(" {:>9}", clocks::countdown(remaining)))
+                    .fg(urgency_color(clocks::urgency(remaining)))
                     .bold(),
-                Span::raw(format!(
-                    "   {}",
-                    due_label(due, &state.display_tz, "%a %b %-d %H:%M")
-                ))
-                .fg(DIM),
-            ])
+            );
+            Line::from(spans)
         })
-        .collect();
-    lines.push(Line::from(link("Record F4")));
-    lines
+        .collect()
+}
+
+/// The share of a clock's window already spent, as `▰▰▰▱▱▱`.
+fn elapsed_bar(
+    state: &State,
+    regime: Regime,
+    due: Timestamp,
+    now: Timestamp,
+    width: usize,
+) -> [Span<'static>; 2] {
+    let triggers = state.triggers();
+    let trigger = match regime {
+        Regime::Gdpr => triggers.aware_at,
+        Regime::Hipaa => triggers.discovered_at,
+        Regime::TexasIndividuals | Regime::TexasAg => triggers.breach_determined_at,
+        Regime::Sec => triggers.materiality_determined_at,
+    };
+    let start = trigger.and_then(|text| text.parse::<Timestamp>().ok());
+    let (spent, total) = start.map_or((0, 1), |start| {
+        let total = due.duration_since(start).as_secs().max(1);
+        let spent = now.duration_since(start).as_secs().clamp(0, total);
+        (spent, total)
+    });
+    let remaining = due.duration_since(now);
+    segments(
+        u64::try_from(spent).unwrap_or(0),
+        u64::try_from(total).unwrap_or(1),
+        width,
+        urgency_color(clocks::urgency(remaining)),
+    )
 }
 
 /// One row per asset: name, a flag strip, what happened and how many records.
 fn asset_lines(state: &State) -> Vec<Line<'static>> {
     if state.scope.is_empty() {
-        return vec![empty(
-            "No assets reported yet; cleanroomd publishes the asset table.",
-        )];
+        return vec![empty("No assets reported yet.")];
     }
-    let mut lines: Vec<Line<'static>> = state.scope.iter().map(asset_line).collect();
-    lines.push(Line::from(vec![
-        Span::raw("strip: locked exfil accessed destroyed modified").fg(DIM),
-        link("Scope F3"),
-    ]));
-    lines
+    state.scope.iter().map(asset_line).collect()
 }
 
 /// `Payroll export        ███ ▒▒▒ ███ ░░░ ███  LOCKED +2   1,240`.
@@ -383,37 +741,35 @@ fn asset_line(asset: &ScopeRecord) -> Line<'static> {
         flags.modified,
     ] {
         let (cells, color) = match value {
-            Tri::Yes => ("███", RED),
-            Tri::Unknown => ("▒▒▒", AMBER),
-            Tri::No => ("░░░", ACCENT),
+            Tri::Yes => ("██", RED),
+            Tri::Unknown => ("▒▒", AMBER),
+            Tri::No => ("░░", ACCENT),
         };
         spans.push(Span::raw(cells).fg(color));
         spans.push(Span::raw(" "));
     }
     let hit = yes_flags(flags);
+    let any_unknown = [
+        flags.locked,
+        flags.exfiltrated,
+        flags.accessed,
+        flags.destroyed,
+        flags.modified,
+    ]
+    .contains(&Tri::Unknown);
     let (word, color) = match hit.as_slice() {
-        [] if [
-            flags.locked,
-            flags.exfiltrated,
-            flags.accessed,
-            flags.destroyed,
-            flags.modified,
-        ]
-        .contains(&Tri::Unknown) =>
-        {
-            ("unknown".to_owned(), AMBER)
-        }
+        [] if any_unknown => ("unknown".to_owned(), AMBER),
         [] => ("clean".to_owned(), ACCENT),
         [only] => ((*only).to_owned(), RED),
         [first, rest @ ..] => (format!("{first} +{}", rest.len()), RED),
     };
-    spans.push(Span::raw(pad(&word, 14)).fg(color).bold());
+    spans.push(Span::raw(pad(&word, 13)).fg(color).bold());
     spans.push(Span::raw(format!("{:>6}", grouped(asset.record_count))).fg(MUTED));
     Line::from(spans)
 }
 
-/// A bar per defense layer and the guardrails setting.
-fn layer_lines(state: &State) -> Vec<Line<'static>> {
+/// A segmented bar per defense layer and the guardrails setting.
+fn layer_lines(state: &State, linked: bool) -> Vec<Line<'static>> {
     let counters = state.counters;
     let safety = counters.map_or(0, |counters| u64::from(counters.safety_flags));
     let model = counters.map_or(0, |counters| u64::from(counters.blocked_by_model));
@@ -421,104 +777,128 @@ fn layer_lines(state: &State) -> Vec<Line<'static>> {
     let max = safety.max(model).max(kernel).max(5);
     let layer = |label: &str, value: u64, color: Color| {
         let mut spans = vec![Span::raw(pad(label, 16)).fg(MUTED)];
-        spans.extend(bar(value, max, 20, color));
+        spans.extend(segments(value, max, 20, color));
         spans.push(Span::raw(format!(" {value:>3}")).fg(color).bold());
         Line::from(spans)
     };
     let guardrails = if state.guardrails {
         Span::raw("ON  hardened prompts").fg(ACCENT).bold()
     } else {
-        Span::raw("OFF  naive prompts; only the kernel grant stands")
+        Span::raw("OFF  only the kernel grant stands")
             .fg(AMBER)
             .bold()
     };
-    vec![
+    let mut lines = vec![
         layer("safety flagged", safety, AMBER),
         layer("model refused", model, ACCENT),
         layer("kernel blocked", kernel, RED),
-        Line::default(),
         row("guardrails", 16, vec![guardrails]),
-        Line::from(link("Defense F5")),
-    ]
+    ];
+    if linked {
+        lines.push(Line::from(link("Defense F5")));
+    }
+    lines
 }
 
 // ---------- F3 Scope ----------
 
-/// Scope, "the vault": one card per asset with every flag and the evidence behind it.
-pub(super) fn scope(frame: &mut Frame<'_>, area: Rect, state: &State) {
+/// Scope, "the vault": every asset in one table, then a card each with the evidence.
+fn scope_page(state: &State) -> Page {
     if state.scope.is_empty() {
-        columns(
-            frame,
-            area,
-            vec![("Scope".to_owned(), vec![empty("No assets reported yet.")])],
-            Vec::new(),
-        );
-        return;
+        return Page {
+            columns: vec![vec![Panel::fill(
+                "Scope",
+                Body::Hatched("no assets reported yet"),
+                &[],
+            )]],
+        };
     }
-    let mut left = Vec::new();
+    let table = scope_table(state);
+    let mut left = vec![table];
     let mut right = Vec::new();
     for (index, asset) in state.scope.iter().enumerate() {
-        let panel = (asset.name.clone(), scope_card(state, asset));
+        let panel = Panel::lines(
+            &asset.name,
+            scope_card(state, asset),
+            &[("F10", "Controlroom")],
+        );
         if index % 2 == 0 {
-            left.push(panel);
-        } else {
             right.push(panel);
+        } else {
+            left.push(panel);
         }
     }
-    columns(frame, area, left, right);
+    Page {
+        columns: vec![left, right],
+    }
 }
 
-/// Every field of one asset's scope record.
-fn scope_card(state: &State, asset: &ScopeRecord) -> Vec<Line<'static>> {
-    let flags = asset.flags;
-    let mut badges = Vec::new();
-    for (name, value) in [
-        ("LOCKED", flags.locked),
-        ("EXFIL", flags.exfiltrated),
-        ("ACCESSED", flags.accessed),
-        ("DESTROYED", flags.destroyed),
-        ("MODIFIED", flags.modified),
-    ] {
-        let (word, style) = flag_look(value);
-        badges.push(Span::raw(format!("{name} ")).fg(MUTED));
-        badges.push(Span::styled(format!(" {word} "), style));
-        badges.push(Span::raw("  "));
+/// Every asset as a zebra row with its flags.
+fn scope_table(state: &State) -> Panel {
+    let rows: Vec<Row<'static>> = state
+        .scope
+        .iter()
+        .map(|asset| {
+            let flags = asset.flags;
+            let mut cells = vec![
+                Cell::from(fit(&asset.name, 20)).style(Style::new().fg(BRIGHT).bold()),
+                Cell::from(Line::from(grouped(asset.record_count)).right_aligned()),
+            ];
+            cells.extend(
+                [
+                    flags.locked,
+                    flags.exfiltrated,
+                    flags.accessed,
+                    flags.destroyed,
+                    flags.modified,
+                ]
+                .map(|value| {
+                    let (word, style) = flag_look(value);
+                    Cell::from(Line::from(word).centered()).style(style)
+                }),
+            );
+            cells.push(Cell::from(
+                Line::from(format!("{}%", asset.confidence_pct)).right_aligned(),
+            ));
+            Row::new(cells)
+        })
+        .collect();
+    let height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    let mut widths = vec![Constraint::Fill(1), Constraint::Length(7)];
+    widths.extend([Constraint::Length(5); 5]);
+    widths.push(Constraint::Length(5));
+    Panel {
+        title: "Assets".to_owned(),
+        body: Body::Table(
+            vec![
+                "ASSET", "RECORDS", " LCK", " EXF", " ACC", " DST", " MOD", " CONF",
+            ],
+            rows,
+            widths,
+        ),
+        rows: Some(height),
+        keys: &[("F10", "Controlroom")],
     }
+}
+
+/// Every field of one asset's scope record but the flags.
+fn scope_card(state: &State, asset: &ScopeRecord) -> Vec<Line<'static>> {
     let classes: Vec<&str> = asset
         .data_classes
         .iter()
         .map(|class| class_label(*class))
         .collect();
-    let mut confidence = bar(u64::from(asset.confidence_pct), 100, 20, ACCENT).to_vec();
+    let mut confidence = segments(u64::from(asset.confidence_pct), 100, 20, ACCENT).to_vec();
     confidence.push(Span::raw(format!(" {}%", asset.confidence_pct)).fg(TEXT));
     let key = match asset.key_exposed {
         Tri::Yes => Span::raw("key exposed").fg(RED).bold(),
         Tri::No => Span::raw("key not exposed").fg(ACCENT),
         Tri::Unknown => Span::raw("key exposure unknown").fg(AMBER),
     };
-    let at_rest = if asset.encrypted_at_rest {
-        "encrypted at rest · "
-    } else {
-        "not encrypted at rest · "
-    };
-    let mut lines = vec![
-        Line::from(badges),
-        Line::default(),
-        row("classes", 12, vec![Span::raw(classes.join(", ")).fg(TEXT)]),
-        row(
-            "records",
-            12,
-            vec![
-                Span::raw(grouped(asset.record_count)).fg(BRIGHT).bold(),
-                Span::raw("   Texans ").fg(MUTED),
-                Span::raw(grouped(asset.texas_residents)).fg(BRIGHT).bold(),
-            ],
-        ),
-        row("confidence", 12, confidence),
-        row("storage", 12, vec![Span::raw(at_rest).fg(TEXT), key]),
-    ];
     let evidence = if asset.evidence.is_empty() {
-        vec![Span::raw("none cited yet").fg(DIM)]
+        "none cited yet".to_owned()
     } else {
         let more = asset.evidence.len().saturating_sub(2);
         let shown = asset
@@ -528,46 +908,65 @@ fn scope_card(state: &State, asset: &ScopeRecord) -> Vec<Line<'static>> {
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
-        let text = if more > 0 {
+        if more > 0 {
             format!("{shown} +{more}")
         } else {
             shown
-        };
-        vec![Span::raw(fit(&text, 60)).fg(TEXT)]
+        }
     };
-    lines.push(row("evidence", 12, evidence));
     let who = crate::state::who_title(&state.who(&asset.updated_by));
-    lines.push(row(
-        "updated",
-        12,
-        vec![Span::raw(format!("{} by {who}", state.time_label(&asset.updated_at))).fg(DIM)],
-    ));
-    lines
+    vec![
+        row("classes", 11, vec![Span::raw(classes.join(", ")).fg(TEXT)]),
+        row(
+            "records",
+            11,
+            vec![
+                Span::raw(grouped(asset.record_count)).fg(BRIGHT).bold(),
+                Span::raw("   Texans ").fg(MUTED),
+                Span::raw(grouped(asset.texas_residents)).fg(BRIGHT).bold(),
+            ],
+        ),
+        row("confidence", 11, confidence),
+        row("key", 11, vec![key]),
+        row("evidence", 11, vec![Span::raw(fit(&evidence, 52)).fg(TEXT)]),
+        row(
+            "updated",
+            11,
+            vec![Span::raw(format!("{} by {who}", state.time_label(&asset.updated_at))).fg(DIM)],
+        ),
+    ]
 }
 
 // ---------- F4 Record ----------
 
 /// Record, "the ledger": the incident record, its timeline and every legal clock.
-pub(super) fn record(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
+fn record_page(state: &State, now: Timestamp) -> Page {
     let mut fields = incident_lines(state);
-    fields.pop();
-    if let Some(incident) = &state.incident
-        && !incident.summary.is_empty()
-    {
-        fields.push(Line::default());
-        fields.extend(
-            wrap(&incident.summary, 70)
-                .into_iter()
-                .take(4)
-                .map(|line| Line::from(line).fg(TEXT)),
-        );
+    if let Some(incident) = &state.incident {
+        fields.push(row(
+            "category",
+            10,
+            vec![Span::raw(incident.category.clone()).fg(TEXT)],
+        ));
+        if !incident.summary.is_empty() {
+            fields.push(Line::default());
+            fields.extend(
+                wrap(&incident.summary, 70)
+                    .into_iter()
+                    .take(4)
+                    .map(|line| Line::from(line).fg(TEXT)),
+            );
+        }
     }
-    let left = vec![
-        ("Incident record".to_owned(), fields),
-        ("Timeline".to_owned(), timeline_lines(state)),
-    ];
-    let right = vec![("Legal clocks".to_owned(), clock_cards(state, now))];
-    columns(frame, area, left, right);
+    Page {
+        columns: vec![
+            vec![
+                Panel::lines("Incident record", fields, &[("i", "Investigate")]),
+                Panel::fill("Timeline", Body::Lines(timeline_lines(state)), &[]),
+            ],
+            vec![Panel::lines("Legal clocks", clock_cards(state, now), &[])],
+        ],
+    }
 }
 
 /// The record's timeline, newest last.
@@ -582,21 +981,20 @@ fn timeline_lines(state: &State) -> Vec<Line<'static>> {
     }
     entries
         .iter()
-        .rev()
-        .take(12)
-        .rev()
+        .skip(entries.len().saturating_sub(14))
         .map(|entry| {
             let who = state.who(&entry.by);
             Line::from(vec![
                 Span::raw(format!("{} ", state.time_label(&entry.at))).fg(DIM),
-                Span::raw(pad(&super::who_label(&who), 12)).fg(super::who_color(&who)),
-                Span::raw(fit(&entry.text, 64)).fg(TEXT),
+                Span::raw(pad(&super::who_label(&who), 11)).fg(super::who_color(&who)),
+                Span::raw(fit(&entry.text, 60)).fg(TEXT),
             ])
         })
         .collect()
 }
 
-/// All five clocks: countdown, deadline and duty, or why they don't run.
+/// All five clocks: the time spent as a bar, the countdown and the deadline, or why they don't
+/// run.
 fn clock_cards(state: &State, now: Timestamp) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for clock in clocks::clocks(&state.triggers(), &state.scope) {
@@ -606,6 +1004,20 @@ fn clock_cards(state: &State, now: Timestamp) -> Vec<Line<'static>> {
             Span::raw(pad(&main, 14)).fg(color).bold(),
             Span::raw(detail).fg(DIM),
         ]));
+        let mut bar = vec![Span::raw("  ")];
+        if let ClockState::Running { due } = clock.state {
+            bar.extend(elapsed_bar(state, clock.regime, due, now, 30));
+            bar.push(
+                Span::raw(format!(
+                    "  {}",
+                    due_label(due, &state.display_tz, "%a %b %-d")
+                ))
+                .fg(DIM),
+            );
+        } else {
+            bar.push(Span::raw("▱".repeat(30)).fg(LINE));
+        }
+        lines.push(Line::from(bar));
         lines.push(Line::from(format!("  {}", clock.regime.duty())).fg(MUTED));
         lines.push(Line::default());
     }
@@ -615,143 +1027,293 @@ fn clock_cards(state: &State, now: Timestamp) -> Vec<Line<'static>> {
 
 // ---------- F5 Defense ----------
 
-/// Defense, "the walls": every kernel denial, refusal and safety verdict, and the receipt log.
-pub(super) fn defense(frame: &mut Frame<'_>, area: Rect, state: &State) {
-    let left = vec![
-        ("Kernel denials".to_owned(), denial_lines(state)),
-        (
-            "Refused by the model".to_owned(),
-            tagged(state, "REFUSED", 6),
-        ),
-    ];
+/// Defense, "the walls": the kernel-blocks count, every denial with its receipt, refusals, the
+/// layers, the safety verdicts and the receipt log.
+fn defense_page(state: &State) -> Page {
     let mut log = vec![log_line(state)];
     log.push(Line::from("Every exec, denial and approval is a signed, chained receipt.").fg(DIM));
-    let right = vec![
-        ("Layers".to_owned(), layer_lines(state)),
-        ("Safety verdicts".to_owned(), tagged(state, "SAFETY", 8)),
-        ("Receipt log".to_owned(), log),
-    ];
-    columns(frame, area, left, right);
+    Page {
+        columns: vec![
+            vec![
+                Panel {
+                    title: "Kernel blocks".to_owned(),
+                    body: Body::Hero,
+                    rows: Some(6),
+                    keys: &[],
+                },
+                denial_table(state),
+                Panel::fill(
+                    "Refused by the model",
+                    if tagged_rows(state, "REFUSED").is_empty() {
+                        Body::Hatched("no refusals yet")
+                    } else {
+                        Body::Lines(tagged_rows(state, "REFUSED"))
+                    },
+                    &[("g", "Guardrails")],
+                ),
+            ],
+            vec![
+                Panel::lines("Layers", layer_lines(state, false), &[("g", "Guardrails")]),
+                verdict_table(state),
+                Panel::fill(
+                    "Receipt log",
+                    Body::Lines(log),
+                    &[("v", "Verify the chain")],
+                ),
+            ],
+        ],
+    }
 }
 
-/// One line per denial, receipt first.
-fn denial_lines(state: &State) -> Vec<Line<'static>> {
+/// The kernel-blocks count in big type, with what it means.
+fn hero(frame: &mut Frame<'_>, area: Rect, state: &State) {
+    let [number, caption] =
+        Layout::horizontal([Constraint::Length(20), Constraint::Fill(1)]).areas(area);
+    let blocks = state.blocks();
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(Style::new().fg(if blocks > 0 { RED } else { ACCENT }))
+        .lines(vec![Line::from(blocks.to_string())])
+        .build();
+    frame.render_widget(big, number.inner(Margin::new(1, 1)));
+    let lines = vec![
+        Line::default(),
+        Line::from(if blocks == 1 {
+            "command the kernel refused"
+        } else {
+            "commands the kernel refused"
+        })
+        .fg(BRIGHT)
+        .bold(),
+        Line::from("evidence is mounted read-only in every stratum;").fg(MUTED),
+        Line::from("each refusal is on the signed receipt log").fg(MUTED),
+    ];
+    frame.render_widget(Paragraph::new(lines), caption);
+}
+
+/// Every denial as a zebra row, receipt first.
+fn denial_table(state: &State) -> Panel {
     let denials = state.denials.all();
     if denials.is_empty() {
-        return vec![empty(
-            "None yet. Every agent command runs under its stratum's grant.",
-        )];
+        return Panel {
+            title: "Kernel denials".to_owned(),
+            body: Body::Hatched("no denials yet"),
+            rows: Some(3),
+            keys: &[],
+        };
     }
-    denials
+    let rows: Vec<Row<'static>> = denials
         .iter()
-        .rev()
-        .take(12)
-        .rev()
+        .skip(denials.len().saturating_sub(10))
         .map(|denial| {
             let receipt = denial
                 .receipt
-                .map_or_else(|| "  #?".to_owned(), |seq| format!("#{seq:<3}"));
-            let who = denial.role.map_or_else(
-                || pad(&denial.who.to_uppercase(), 13),
-                |role| pad(&format!("{} {}", glyph(role), role_label(role)), 13),
+                .map_or_else(|| "#?".to_owned(), |seq| format!("#{seq}"));
+            let (who, color) = denial.role.map_or_else(
+                || (denial.who.to_uppercase(), MUTED),
+                |role| (format!("{} {}", glyph(role), role_label(role)), tint(role)),
             );
-            let what = match denial.kind {
-                Kind::Exec => format!("exec {}", denial.command),
-                Kind::Record => denial.command.clone(),
-            };
-            Line::from(vec![
-                Span::raw(format!("{receipt} ")).fg(MUTED).bold(),
-                Span::raw(format!("{} ", denial.at)).fg(DIM),
-                Span::raw(who).fg(denial.role.map_or(MUTED, tint)),
-                Span::raw(pad(&fit(&what, 34), 35)).fg(BRIGHT).bold(),
-                Span::raw(denial.short_reason()).fg(RED).bold(),
+            let what = denial.command.clone();
+            Row::new(vec![
+                Cell::from(receipt).style(Style::new().fg(MUTED).bold()),
+                Cell::from(denial.at.clone()).style(Style::new().fg(DIM)),
+                Cell::from(who).style(Style::new().fg(color)),
+                Cell::from(what).style(Style::new().fg(BRIGHT).bold()),
+                Cell::from(denial.short_reason()).style(Style::new().fg(RED).bold()),
             ])
         })
-        .collect()
+        .collect();
+    let height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    Panel {
+        title: "Kernel denials".to_owned(),
+        body: Body::Table(
+            vec!["RCPT", "TIME", "AGENT", "COMMAND", "WHY"],
+            rows,
+            vec![
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(13),
+                Constraint::Fill(1),
+                Constraint::Length(10),
+            ],
+        ),
+        rows: Some(height),
+        keys: &[("F10", "Controlroom")],
+    }
 }
 
-/// The newest `count` agent-pane lines tagged `tag`.
-fn tagged(state: &State, tag: &str, count: usize) -> Vec<Line<'static>> {
+/// The safety model's verdicts as zebra rows.
+fn verdict_table(state: &State) -> Panel {
+    let verdicts: Vec<&Activity> = state
+        .activity
+        .iter()
+        .filter(|activity| activity.tag == "SAFETY")
+        .collect();
+    if verdicts.is_empty() {
+        return Panel {
+            title: "Safety verdicts".to_owned(),
+            body: Body::Hatched("no verdicts yet"),
+            rows: Some(3),
+            keys: &[],
+        };
+    }
+    let rows: Vec<Row<'static>> = verdicts
+        .iter()
+        .skip(verdicts.len().saturating_sub(8))
+        .map(|activity| {
+            let unsafe_verdict = activity.text.starts_with("UNSAFE");
+            let (verdict, rest) = activity
+                .text
+                .split_once(' ')
+                .unwrap_or(("", &activity.text));
+            Row::new(vec![
+                Cell::from(activity.at.clone()).style(Style::new().fg(DIM)),
+                Cell::from(verdict.to_owned()).style(
+                    Style::new()
+                        .fg(if unsafe_verdict { RED } else { ACCENT })
+                        .bold(),
+                ),
+                Cell::from(rest.to_owned()).style(Style::new().fg(TEXT)),
+            ])
+        })
+        .collect();
+    let height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    Panel {
+        title: "Safety verdicts".to_owned(),
+        body: Body::Table(
+            vec!["TIME", "VERDICT", "ARTIFACT"],
+            rows,
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+            ],
+        ),
+        rows: Some(height),
+        keys: &[],
+    }
+}
+
+/// The newest agent-pane lines tagged `tag`.
+fn tagged_rows(state: &State, tag: &str) -> Vec<Line<'static>> {
     let matching: Vec<&Activity> = state
         .activity
         .iter()
         .filter(|activity| activity.tag == tag)
         .collect();
-    if matching.is_empty() {
-        return vec![empty("None yet.")];
-    }
     matching
         .iter()
-        .skip(matching.len().saturating_sub(count))
-        .map(|activity| activity_line(activity))
+        .skip(matching.len().saturating_sub(6))
+        .map(|activity| {
+            let (who, color) = match &activity.who {
+                Who::Agent(role) => (
+                    format!("{} {}", glyph(*role), role_label(*role)),
+                    tint(*role),
+                ),
+                other @ (Who::System | Who::Me | Who::Human(_)) => (super::who_label(other), MUTED),
+            };
+            Line::from(vec![
+                Span::raw(format!("{} ", activity.at)).fg(DIM),
+                Span::raw(pad(&who, 14)).fg(color),
+                Span::raw(fit(&activity.text, 48)).fg(TEXT),
+            ])
+        })
         .collect()
-}
-
-/// `01:20:31 ▲ HUNTER  text`.
-fn activity_line(activity: &Activity) -> Line<'static> {
-    let (who, color) = match &activity.who {
-        Who::Agent(role) => (
-            format!("{} {}", glyph(*role), role_label(*role)),
-            tint(*role),
-        ),
-        other @ (Who::System | Who::Me | Who::Human(_)) => (super::who_label(other), MUTED),
-    };
-    let text_color = super::tone_color(activity.tone);
-    Line::from(vec![
-        Span::raw(format!("{} ", activity.at)).fg(DIM),
-        Span::raw(pad(&who, 14)).fg(color),
-        Span::raw(fit(&activity.text, 48)).fg(if text_color == DIM { MUTED } else { TEXT }),
-    ])
 }
 
 // ---------- F6 Team ----------
 
-/// Team, "the crew": the Lead and each specialist with model, status, recent steps and findings.
-pub(super) fn crew(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
-    let mut left = vec![member_panel(state, Role::Lead, now)];
-    let mut right = Vec::new();
-    for (index, role) in SPECIALISTS.into_iter().enumerate() {
-        if index % 2 == 0 {
-            right.push(member_panel(state, role, now));
-        } else {
-            left.push(member_panel(state, role, now));
-        }
+/// Team, "the crew": the Lead and its specialists as a tree with live status and activity, then a
+/// card per agent with model, recent steps and findings.
+fn team_page(state: &State, now: Timestamp) -> Page {
+    let card = |role: Role| {
+        Panel::lines(
+            &format!("{} {}", glyph(role), team::title(role)),
+            member_lines(state, role, now),
+            &[("F2", "Ask the Lead")],
+        )
+    };
+    Page {
+        columns: vec![
+            vec![
+                Panel::lines("Crew", crew_tree(state, now), &[("F2", "Ask the Lead")]),
+                card(Role::Lead),
+                card(Role::Forensics),
+            ],
+            vec![
+                card(Role::Hunter),
+                card(Role::Scribe),
+                card(Role::Containment),
+            ],
+        ],
     }
-    columns(frame, area, left, right);
 }
 
-/// One agent's card.
-fn member_panel(state: &State, role: Role, now: Timestamp) -> Panel {
+/// The Lead and the specialists under it, with tree guides, a status dot each, the model and
+/// steps per 10 s over the last two minutes.
+fn crew_tree(state: &State, now: Timestamp) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, role) in std::iter::once(Role::Lead).chain(SPECIALISTS).enumerate() {
+        let status = state.team.status(role, state.waiting_on(role), now);
+        let dot = match status {
+            Status::Blocked => RED,
+            Status::Waiting => AMBER,
+            Status::Idle => DIM,
+            Status::Thinking | Status::Asking(_) | Status::Running(_) | Status::Refused => ACCENT,
+        };
+        let guide = match index {
+            0 => "",
+            4 => "└─ ",
+            _ => "├─ ",
+        };
+        let desk = state.team.desk(role);
+        let model = desk.model.as_deref().map(short_model).unwrap_or_default();
+        let bars = state.pulse.sparkline(role, 10, 12, now);
+        lines.push(Line::from(vec![
+            Span::raw(format!(" {guide}")).fg(LINE),
+            Span::raw("● ").fg(dot),
+            Span::raw(pad(team::title(role), 12)).fg(tint(role)).bold(),
+            Span::raw(pad(&model, 14)).fg(DIM),
+            Span::raw(sparkline(&bars)).fg(ACCENT),
+        ]));
+        let mut status_line = vec![
+            Span::raw(if index == 0 || index == 4 {
+                "      "
+            } else {
+                " │    "
+            })
+            .fg(LINE),
+        ];
+        status_line.extend(status_spans(&status, now));
+        lines.push(Line::from(status_line));
+    }
+    lines
+}
+
+/// One agent's card: model, route, last action, recent steps and findings.
+fn member_lines(state: &State, role: Role, now: Timestamp) -> Vec<Line<'static>> {
     let desk = state.team.desk(role);
     let status = state.team.status(role, state.waiting_on(role), now);
-    let model = desk.model.as_deref().map_or_else(
-        || Span::raw("not announced on the bus yet").fg(DIM),
-        |model| Span::raw(format!("{}  ({model})", short_model(model))).fg(TEXT),
-    );
     let route = match desk.route {
-        Some(cleanroom_proto::ModelRoute::Local) => "local model",
-        Some(cleanroom_proto::ModelRoute::Hosted) => "hosted model",
-        None => "—",
+        Some(cleanroom_proto::ModelRoute::Local) => " · local",
+        Some(cleanroom_proto::ModelRoute::Hosted) => " · hosted",
+        None => "",
     };
-    let link = match role {
-        Role::Lead => "talks to you and asks the specialists".to_owned(),
-        Role::Hunter | Role::Forensics | Role::Scribe | Role::Containment => {
-            if state.team.link(role, now) {
-                "the Lead is waiting on its answer".to_owned()
-            } else {
-                "reports to the Lead".to_owned()
-            }
-        }
-    };
+    let model = desk.model.as_deref().map_or_else(
+        || Span::raw("not announced yet").fg(DIM),
+        |model| Span::raw(format!("{}{route}", short_model(model))).fg(TEXT),
+    );
     let mut lines = vec![
-        row("status", 10, status_spans(&status, now)),
-        row("model", 10, vec![model]),
-        row("route", 10, vec![Span::raw(route).fg(TEXT)]),
-        row("link", 10, vec![Span::raw(link).fg(MUTED)]),
+        row("status", 8, status_spans(&status, now)),
+        row("model", 8, vec![model]),
         row(
             "last",
-            10,
-            vec![Span::raw(fit(desk.last.as_deref().unwrap_or("nothing yet"), 64)).fg(TEXT)],
+            8,
+            vec![Span::raw(fit(desk.last.as_deref().unwrap_or("nothing yet"), 62)).fg(TEXT)],
         ),
     ];
     let mine = |activity: &&Activity| activity.who == Who::Agent(role);
@@ -761,10 +1323,10 @@ fn member_panel(state: &State, role: Role, now: Timestamp) -> Panel {
         .filter(mine)
         .filter(|activity| matches!(activity.tag, "TRACE" | "ANSWER" | "BLOCKED BY OS"))
         .collect();
-    for activity in steps.iter().rev().take(3).rev() {
+    for activity in steps.iter().skip(steps.len().saturating_sub(3)) {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::raw(fit(&activity.text, 70)).fg(super::tone_color(activity.tone)),
+            Span::raw(fit(&activity.text, 66)).fg(super::tone_color(activity.tone)),
         ]));
     }
     let findings: Vec<&Activity> = state
@@ -773,26 +1335,28 @@ fn member_panel(state: &State, role: Role, now: Timestamp) -> Panel {
         .filter(mine)
         .filter(|activity| activity.tag == "FINDING")
         .collect();
-    for finding in findings.iter().rev().take(2).rev() {
+    for finding in findings.iter().skip(findings.len().saturating_sub(2)) {
         lines.push(Line::from(vec![
             Span::raw("⚑ ").fg(AMBER),
-            Span::raw(fit(&finding.text, 70)).fg(TEXT),
+            Span::raw(fit(&finding.text, 66)).fg(TEXT),
         ]));
     }
-    (format!("{} {}", glyph(role), team::title(role)), lines)
+    lines
 }
+
+/// One chart line: legend name, color and points.
+type Lane<'points> = (&'static str, Color, &'points Vec<(f64, f64)>);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn bars_round_partial_cells_up_and_never_overflow() {
-        let width = |spans: &[Span<'static>; 2]| spans.iter().map(Span::width).sum::<usize>();
+    fn segmented_bars_round_partial_cells_up_and_never_overflow() {
         let filled = |spans: &[Span<'static>; 2]| spans.first().map_or(0, Span::width);
-        assert_eq!(filled(&bar(1, 100, 20, RED)), 1, "any count shows");
-        assert_eq!(filled(&bar(0, 100, 20, RED)), 0);
-        assert_eq!(filled(&bar(300, 100, 20, RED)), 20, "clamped");
-        assert_eq!(width(&bar(7, 9, 20, RED)), 20);
+        assert_eq!(filled(&segments(1, 100, 20, RED)), 1, "any count shows");
+        assert_eq!(filled(&segments(0, 100, 20, RED)), 0);
+        assert_eq!(filled(&segments(300, 100, 20, RED)), 20, "clamped");
+        assert_eq!(sparkline(&[0, 1, 7]), "·▂█");
     }
 }

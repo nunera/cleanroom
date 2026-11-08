@@ -19,6 +19,7 @@ tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt"
 tokio-stream = "0.1.19"
 tui-big-text = "0.8.10"
 unicode-width = "0.2.3"
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std"] }
 
 # Debian package. The roots are bookworm (glibc 2.36) and trixie (2.41), so the binary is a
 # static-pie musl build with no shared-library dependencies (`$auto` then resolves to none).

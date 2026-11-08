@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cleanroom_proto::{
     Audience, BusBody, CoreRequest, CoreResponse, ExecOutcome, ExecRequest, ExecResult, LlmMode,
-    ModelRoute, Role, RuleSubmission, ToolDecision, ToolRequest, ToolSource,
+    ModelRoute, Role, RuleSubmission, SpanSource, TierMove, ToolDecision, ToolRequest, ToolSource,
 };
 use serde_json::{Map, Value};
 use tokio::sync::broadcast::error::RecvError;
@@ -23,14 +23,15 @@ use crate::cache::Hit;
 use crate::daemon::{Connection, now};
 use crate::dataset::{self, Dataset, Tag};
 use crate::llm::{Message, Origin, Reply, Router};
+use crate::pager::{self, MemoryLog, Pager};
 use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::{self, Counters};
 use crate::sensitivity::{self, Detector};
 use crate::text::{cite_receipt, clip, preview};
 use crate::tools::{
-    self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, ProposalArgs, RefusalArgs,
-    Rejection, RuleArgs, ScopeUpdate, Tool, ToolAsk, ToolSpec,
+    self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, PageInArgs, PageOutArgs,
+    ProposalArgs, RefusalArgs, Rejection, RuleArgs, ScopeUpdate, Tool, ToolAsk, ToolSpec,
 };
 
 /// Characters of tool output a model sees at most.
@@ -128,6 +129,8 @@ pub(crate) struct Shared {
     pub(crate) nixpkgs: String,
     /// Training-ready tags, one JSON line per step.
     pub(crate) dataset: Dataset,
+    /// The evidence pager's decision log; `Some` turns the pager on (`--memory-tiers`).
+    pub(crate) memory: Option<MemoryLog>,
 }
 
 impl Shared {
@@ -241,6 +244,20 @@ struct Thread {
     guardrails: bool,
     /// Personal data or credentials entered this conversation.
     sensitive: bool,
+    /// The evidence pager, with `--memory-tiers`. A tool result's span is registered at
+    /// `messages.len()` while the call runs: the result is the next message pushed.
+    pager: Option<Pager>,
+}
+
+impl Thread {
+    /// Add `message`; with the pager on, as an exact span of `source`.
+    fn push(&mut self, message: Message, source: SpanSource, label: &str) {
+        let slot = self.messages.len();
+        if let Some(pager) = self.pager.as_mut() {
+            pager.enter(slot, source, label, &message.text());
+        }
+        self.messages.push(message);
+    }
 }
 
 /// What the trace pane shows for one step.
@@ -282,6 +299,20 @@ impl Shown {
     }
 }
 
+/// Where a finished call's text comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Text {
+    /// Written by the runner, or a denial: trusted.
+    Runner,
+    /// Command output: screened before a model sees it.
+    Output,
+    /// A `page_in` result, already screened and held by the pager.
+    Paged {
+        /// The safety model flagged it (or could not score it).
+        flagged: bool,
+    },
+}
+
 /// A finished tool call: what the model reads back and what the trace shows.
 #[derive(Debug)]
 struct Done {
@@ -289,8 +320,8 @@ struct Done {
     text: String,
     /// Trace content.
     shown: Shown,
-    /// The text carries evidence and must be screened before a model sees it.
-    untrusted: bool,
+    /// Where the text comes from.
+    from: Text,
     /// The cleanroomd receipt of the command, when the step ran one.
     receipt: Option<u64>,
 }
@@ -301,7 +332,7 @@ impl Done {
         Self {
             shown: Shown::text(&text),
             text,
-            untrusted: false,
+            from: Text::Runner,
             receipt: None,
         }
     }
@@ -312,10 +343,19 @@ impl Done {
         Self {
             shown: Shown::text(&text),
             text,
-            untrusted: false,
+            from: Text::Runner,
             receipt: None,
         }
     }
+}
+
+/// How a tool result enters the context.
+#[derive(Debug)]
+enum Entry {
+    /// A new exact span of this source, labelled.
+    Span(SpanSource, String),
+    /// The pager already holds it: evidence it registered, or a `page_in` result.
+    Held,
 }
 
 /// One role's model loop, speaking through its own connection.
@@ -349,8 +389,20 @@ struct Budget {
 impl Agent {
     /// An agent for `role`.
     pub(crate) fn new(role: Role, conn: Arc<Connection>, shared: Arc<Shared>) -> Self {
-        let hardened = roles::tool_specs(role, true);
-        let naive = roles::tool_specs(role, false);
+        let paging = shared.memory.is_some();
+        let specs = |guardrails| {
+            let mut specs = roles::tool_specs(role, guardrails);
+            if paging {
+                specs.extend(
+                    roles::pager_tools(role)
+                        .iter()
+                        .map(|tool| ToolSpec::new(*tool)),
+                );
+            }
+            specs
+        };
+        let hardened = specs(true);
+        let naive = specs(false);
         Self {
             role,
             conn,
@@ -360,6 +412,15 @@ impl Agent {
             hardened,
             naive,
         }
+    }
+
+    /// The system prompt under `guardrails`, with the pager's rules when memory tiers are on.
+    fn system_prompt(&self, guardrails: bool) -> String {
+        let mut prompt = roles::system_prompt(self.role, guardrails);
+        if self.shared.memory.is_some() {
+            prompt.push_str(roles::pager_rules(self.role, guardrails));
+        }
+        prompt
     }
 
     /// Tools offered under the given guardrails setting.
@@ -390,19 +451,27 @@ impl Agent {
             ),
             guardrails,
             sensitive: false,
+            pager: self.shared.memory.as_ref().map(|_| Pager::new(self.role)),
         };
         self.check_sensitive(desk, &mut thread, &task).await;
-        thread.messages.push(Message::System {
-            content: roles::system_prompt(self.role, guardrails),
-        });
-        thread.messages.push(Message::User { content: task });
+        let system = Message::System {
+            content: self.system_prompt(guardrails),
+        };
+        thread.push(system, SpanSource::Commander, "system prompt");
+        thread.push(
+            Message::User { content: task },
+            SpanSource::Commander,
+            "task",
+        );
         for remaining in (1..=self.shared.max_steps).rev() {
             self.follow_guardrails(&mut thread).await;
             let budget = self.budget(desk, &thread, remaining);
             let offered = self.offered(thread.guardrails, &budget);
             if let Some(nudge) = budget.nudge {
-                thread.messages.push(Message::User { content: nudge });
+                let nudge = Message::User { content: nudge };
+                thread.push(nudge, SpanSource::Commander, "runner reminder");
             }
+            self.publish_memory(desk, &mut thread, None).await;
             desk.steps += 1;
             let route = self.route(desk, &thread).await;
             let reply = match self
@@ -428,6 +497,7 @@ impl Agent {
             }
             self.run_calls(desk, &mut thread, reply, offered).await;
         }
+        self.publish_memory(desk, &mut thread, None).await;
         self.status(format!(
             "{} reached the step cap ({}) and stopped",
             self.name(),
@@ -474,10 +544,12 @@ impl Agent {
             return;
         }
         thread.guardrails = guardrails;
+        let content = self.system_prompt(guardrails);
+        if let Some(pager) = thread.pager.as_mut() {
+            pager.refresh(0, &content);
+        }
         if let Some(system) = thread.messages.first_mut() {
-            *system = Message::System {
-                content: roles::system_prompt(self.role, guardrails),
-            };
+            *system = Message::System { content };
         }
         let prompt = if guardrails { "hardened" } else { "naive" };
         self.status(format!("{} switched to the {prompt} prompt", self.name()))
@@ -553,24 +625,38 @@ impl Agent {
         offered: &[ToolSpec],
     ) {
         let (history, outcomes) = tools::prepare_reply(offered, &reply.tool_calls);
-        thread.messages.push(Message::Assistant {
+        let names: Vec<&str> = reply
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect();
+        let turn = Message::Assistant {
             content: reply.content,
             tool_calls: history,
-        });
+        };
+        thread.push(
+            turn,
+            SpanSource::Agent,
+            &format!("calls {}", names.join(", ")),
+        );
         let model = reply.model;
         let request = reply.request;
         for (call, outcome) in reply.tool_calls.into_iter().zip(outcomes) {
-            let content = self
+            let (content, entry) = self
                 .run_call(desk, thread, (&model, &request), &call.name, outcome)
                 .await;
-            thread.messages.push(Message::Tool {
+            let result = Message::Tool {
                 tool_call_id: call.id,
                 content,
-            });
+            };
+            match entry {
+                Entry::Span(source, label) => thread.push(result, source, &label),
+                Entry::Held => thread.messages.push(result),
+            }
         }
     }
 
-    /// Run one checked call; returns what the model reads back.
+    /// Run one checked call; returns what the model reads back and how it enters the context.
     async fn run_call(
         &self,
         desk: &mut Desk,
@@ -578,13 +664,17 @@ impl Agent {
         (model, request): (&str, &str),
         name: &str,
         outcome: Result<Call, Rejection>,
-    ) -> String {
+    ) -> (String, Entry) {
         let Call { tool, args, action } = match outcome {
             Ok(call) => call,
             Err(Rejection { args, reason }) => {
                 self.trace(desk.steps, name, args, Shown::text(&reason))
                     .await;
-                return format!("error: {reason}. Fix the call and try again.");
+                let text = format!("error: {reason}. Fix the call and try again.");
+                return (
+                    text,
+                    Entry::Span(SpanSource::Tool, format!("{name}: rejected")),
+                );
             }
         };
         let mut subject = None;
@@ -605,36 +695,145 @@ impl Agent {
             Action::Scope(update) => self.scope(desk, update).await,
             Action::Incident(update) => self.incident(desk, update).await,
             Action::Rule(rule) => self.submit_rule(rule).await,
+            Action::PageIn(page) => {
+                page.id.clone_into(&mut read);
+                self.page_in(desk, thread, page).await
+            }
+            Action::PageOut(page) => {
+                page.id.clone_into(&mut read);
+                self.page_out(desk, thread, page).await
+            }
             // Field agents are never offered the Lead's tools, so `check` rejects these first.
             Action::Situation | Action::Ask(_) | Action::Reply(_) => {
                 Done::error("only the Lead talks with the commander and the specialists")
             }
         };
-        let denied = matches!(done.shown.outcome, Some(ExecOutcome::Denied { .. }));
-        let receipt = done.receipt;
-        let output_chars = done.text.chars().count();
-        self.trace(desk.steps, tool.name(), args, done.shown).await;
-        let (text, flagged) = match subject {
-            Some((subject, scored)) if done.untrusted => {
-                self.screen(desk, thread, &subject, scored, done.text).await
-            }
-            Some(_) | None => (done.text, false),
+        let Done {
+            text,
+            shown,
+            from,
+            receipt,
+        } = done;
+        let denied = matches!(shown.outcome, Some(ExecOutcome::Denied { .. }));
+        let output_chars = text.chars().count();
+        let label = subject
+            .as_ref()
+            .map_or_else(|| tool.name().to_owned(), |(subject, _)| subject.clone());
+        self.trace(desk.steps, tool.name(), args, shown).await;
+        let (text, flagged, held) = self.admit(desk, thread, subject, (text, from)).await;
+        let step = Step {
+            model,
+            request,
+            tool,
+            subject: &read,
+            output_chars,
+            receipt,
+            denied,
+            flagged,
         };
-        self.tag(
-            desk,
-            thread,
-            Step {
-                model,
-                request,
-                tool,
-                subject: &read,
-                output_chars,
-                receipt,
-                denied,
-                flagged,
-            },
-        );
-        text
+        self.tag(desk, thread, step);
+        let entry = if held {
+            Entry::Held
+        } else {
+            Entry::Span(SpanSource::Tool, label)
+        };
+        (text, entry)
+    }
+
+    /// What the model reads back for a finished call, whether the safety model flagged it, and
+    /// whether the pager already holds it. Output an attacker can write is evidence: with the
+    /// pager on and over the threshold it becomes a handle, screened only when paged in;
+    /// otherwise it is screened now. Listings, digests and runner text are trusted tool output.
+    async fn admit(
+        &self,
+        desk: &mut Desk,
+        thread: &mut Thread,
+        subject: Option<(String, bool)>,
+        (text, from): (String, Text),
+    ) -> (String, bool, bool) {
+        let slot = thread.messages.len();
+        match (subject, from) {
+            (_, Text::Paged { flagged }) => (text, flagged, true),
+            (Some((subject, true)), Text::Output) => {
+                if let Some(pager) = thread.pager.as_mut() {
+                    if pager::compresses(&text) {
+                        let (handle, _) = pager.compress(slot, &subject, text);
+                        self.check_sensitive(desk, thread, &handle).await;
+                        return (handle, false, true);
+                    }
+                    pager.enter(slot, SpanSource::Evidence, &subject, &text);
+                }
+                let (text, flagged) = self.screen(desk, thread, &subject, true, text).await;
+                (text, flagged, true)
+            }
+            (Some((subject, false)), Text::Output) => {
+                let (text, flagged) = self.screen(desk, thread, &subject, false, text).await;
+                (text, flagged, false)
+            }
+            (None, Text::Output) | (_, Text::Runner) => (text, false, false),
+        }
+    }
+
+    /// `page_in`: an evidence span's exact bytes (or a line range) go back into context,
+    /// screened like `read_file` output; the move is published and receipted.
+    async fn page_in(&self, desk: &mut Desk, thread: &mut Thread, page: PageInArgs) -> Done {
+        let slot = thread.messages.len();
+        let Some(pager) = thread.pager.as_mut() else {
+            return Done::error("memory tiers are off");
+        };
+        let lines = (page.start_line, page.end_line);
+        let span = match pager.page_in(&page.id, lines, slot, &page.reason) {
+            Ok(span) => span,
+            Err(reason) => return Done::error(&reason),
+        };
+        let subject = format!("page_in {} {}", page.id, span.label);
+        let (text, flagged) = self.screen(desk, thread, &subject, true, span.text).await;
+        self.publish_memory(desk, thread, Some(span.moved)).await;
+        Done {
+            shown: Shown::text(&format!("{} paged in: {}", page.id, page.reason)),
+            text,
+            from: Text::Paged { flagged },
+            receipt: None,
+        }
+    }
+
+    /// `page_out`: an exact evidence span collapses back to its handle; the move is published
+    /// and receipted.
+    async fn page_out(&self, desk: &Desk, thread: &mut Thread, page: PageOutArgs) -> Done {
+        let PageOutArgs { id, reason } = page;
+        let Some(pager) = thread.pager.as_mut() else {
+            return Done::error("memory tiers are off");
+        };
+        let out = match pager.page_out(&id, &reason) {
+            Ok(out) => out,
+            Err(problem) => return Done::error(&problem),
+        };
+        if let Some(Message::Tool { content, .. }) = thread.messages.get_mut(out.slot) {
+            *content = out.handle;
+        }
+        self.publish_memory(desk, thread, Some(out.moved)).await;
+        Done::ok(format!(
+            "{id} is back to its handle; page_in it again if you need the bytes"
+        ))
+    }
+
+    /// Publish the pager's map when spans entered since the last one, or a span moved
+    /// (`moved`, which cleanroomd receipts), and append the tier decisions to the log.
+    async fn publish_memory(&self, desk: &Desk, thread: &mut Thread, moved: Option<TierMove>) {
+        let Some(pager) = thread.pager.as_mut() else {
+            return;
+        };
+        if let Some(log) = &self.shared.memory {
+            for decision in pager.drain() {
+                if let Err(error) = log.append(&desk.case.incident_id, self.role, &decision) {
+                    tracing::warn!(role = self.name(), "cannot log a tier decision: {error:#}");
+                }
+            }
+        }
+        if pager.take_entered() || moved.is_some() {
+            let map = pager.map(moved);
+            self.publish(BusBody::Memory(map)).await;
+        }
     }
 
     /// Append one training-ready tag for a finished step; a write failure is only logged.
@@ -721,7 +920,7 @@ impl Agent {
                 preview: shown,
                 outcome: Some(result.outcome),
             },
-            untrusted: !denied,
+            from: if denied { Text::Runner } else { Text::Output },
             receipt: Some(result.receipt_seq),
         }
     }

@@ -25,6 +25,7 @@ mod keys;
 mod lead;
 mod llm;
 mod narration;
+mod pager;
 mod records;
 mod repair;
 mod roles;
@@ -95,6 +96,11 @@ struct RunArgs {
     /// Exit after the first investigation finishes.
     #[arg(long)]
     once: bool,
+    /// Evidence pager: large attacker-written output enters an agent's context as a handle and
+    /// is paged in on demand; tier maps go on the bus (`memory`) and to
+    /// `$XDG_STATE_HOME/cleanroom/memory-tiers.ndjson`. `CLEANROOM_MEMORY_TIERS=1` also enables it.
+    #[arg(long)]
+    memory_tiers: bool,
 }
 
 /// `on` / `off`.
@@ -124,6 +130,7 @@ async fn main() -> ExitCode {
         max_steps: args.max_steps,
         socket: args.socket,
         once: args.once,
+        memory_tiers: args.memory_tiers,
     };
     match team::run(options).await {
         Ok(()) => ExitCode::SUCCESS,

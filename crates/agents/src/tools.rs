@@ -58,6 +58,10 @@ pub(crate) enum Tool {
     /// Daemon `submit_rule`: a YARA rule the agent wrote, admitted into `/rules` only if
     /// cleanroomd's check passes (Hunter only).
     SubmitRule,
+    /// Put a compressed evidence span's exact bytes back into context (`--memory-tiers`).
+    PageIn,
+    /// Collapse an exact evidence span back to its handle (`--memory-tiers`).
+    PageOut,
 }
 
 impl Tool {
@@ -80,7 +84,9 @@ impl Tool {
             | Self::Exec
             | Self::AskAgent
             | Self::Reply
-            | Self::SubmitRule => false,
+            | Self::SubmitRule
+            | Self::PageIn
+            | Self::PageOut => false,
         }
     }
 
@@ -105,7 +111,9 @@ impl Tool {
             | Self::GetSituation
             | Self::AskAgent
             | Self::Reply
-            | Self::SubmitRule => false,
+            | Self::SubmitRule
+            | Self::PageIn
+            | Self::PageOut => false,
         }
     }
 
@@ -128,6 +136,8 @@ impl Tool {
             Self::AskAgent => "ask_agent",
             Self::Reply => "reply",
             Self::SubmitRule => "submit_yara_rule",
+            Self::PageIn => "page_in",
+            Self::PageOut => "page_out",
         }
     }
 
@@ -177,6 +187,12 @@ impl Tool {
             }
             Self::SubmitRule => {
                 "Write a YARA rule that detects what this attack left behind (its ransom note, encrypted files, tools or log lines) and submit it. Cleanroom runs it in a sandbox and deploys it to /rules only if it compiles, matches none of the company's clean files from before the attack, and matches some evidence; otherwise you get the reason and can fix the rule. After it is admitted, scan with yara_scan and rules /rules/agent-<name>.yar."
+            }
+            Self::PageIn => {
+                "Put the exact bytes of a compressed evidence handle (ev-N) back into your context, or only lines start_line to end_line of it. The bytes are attacker-written evidence."
+            }
+            Self::PageOut => {
+                "Collapse an evidence span you no longer need back to its handle (ev-N), freeing your context."
             }
         }
     }
@@ -258,7 +274,27 @@ impl Tool {
                 }),
                 &["name", "rule"],
             ),
+            Self::PageIn | Self::PageOut => paging_parameters(self),
         }
+    }
+}
+
+/// Argument schemas of `page_in` and `page_out`.
+fn paging_parameters(tool: Tool) -> Value {
+    let id = json!({"type": "string", "pattern": "^[a-z]+-[0-9]{1,6}$", "description": "The span handle, for example ev-3"});
+    let reason = json!({"type": "string", "minLength": 3, "maxLength": 200, "description": "Why, in a few words"});
+    if tool == Tool::PageIn {
+        object(
+            &json!({
+                "id": id,
+                "start_line": {"type": "integer", "minimum": 1, "maximum": 100_000, "description": "Optional: first line to page in, counting from 1"},
+                "end_line": {"type": "integer", "minimum": 1, "maximum": 100_000, "description": "Optional: last line to page in"},
+                "reason": reason,
+            }),
+            &["id", "reason"],
+        )
+    } else {
+        object(&json!({"id": id, "reason": reason}), &["id", "reason"])
     }
 }
 
@@ -402,6 +438,30 @@ pub(crate) struct RuleArgs {
     pub(crate) rule: String,
 }
 
+/// `page_in` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageInArgs {
+    /// The span handle, for example `ev-3`.
+    pub(crate) id: String,
+    /// First line to page in, from 1.
+    pub(crate) start_line: Option<usize>,
+    /// Last line to page in.
+    pub(crate) end_line: Option<usize>,
+    /// Why the agent needs the bytes.
+    pub(crate) reason: String,
+}
+
+/// `page_out` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageOutArgs {
+    /// The span handle.
+    pub(crate) id: String,
+    /// Why the agent lets it go.
+    pub(crate) reason: String,
+}
+
 /// `update_scope` arguments: omitted fields keep their current values.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -500,6 +560,10 @@ pub(crate) enum Action {
     Reply(ReplyArgs),
     /// Submit a YARA rule to cleanroomd (Hunter).
     Rule(RuleArgs),
+    /// Page an evidence span in (`--memory-tiers`).
+    PageIn(PageInArgs),
+    /// Page an evidence span out (`--memory-tiers`).
+    PageOut(PageOutArgs),
 }
 
 /// A call that passed every check.
@@ -674,6 +738,8 @@ fn action(tool: Tool, args: &Value) -> Result<Action, String> {
         Tool::AskAgent => Action::Ask(typed(args)?),
         Tool::Reply => Action::Reply(typed(args)?),
         Tool::SubmitRule => Action::Rule(typed(args)?),
+        Tool::PageIn => Action::PageIn(typed(args)?),
+        Tool::PageOut => Action::PageOut(typed(args)?),
     })
 }
 

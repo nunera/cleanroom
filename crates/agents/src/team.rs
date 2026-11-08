@@ -29,6 +29,7 @@ use crate::daemon::{Connection, Inbound};
 use crate::dataset::Dataset;
 use crate::lead::Lead;
 use crate::llm::{CallRecord, Router};
+use crate::pager::MemoryLog;
 use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::Counters;
@@ -50,6 +51,10 @@ const SEEN_CAPACITY: usize = 4_096;
 
 /// `cleanroom-agents run` options.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI switches, one field each; `allow`, not `expect`: pedantic lints only run under the strict profile"
+)]
 pub(crate) struct Options {
     /// Initial guardrails setting.
     pub(crate) guardrails: bool,
@@ -59,6 +64,8 @@ pub(crate) struct Options {
     pub(crate) socket: Option<PathBuf>,
     /// Exit after the first investigation.
     pub(crate) once: bool,
+    /// Run the evidence pager (`--memory-tiers`); `CLEANROOM_MEMORY_TIERS=1` also turns it on.
+    pub(crate) memory_tiers: bool,
 }
 
 /// One connection per role.
@@ -176,6 +183,8 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         max_steps: options.max_steps,
         dataset: Dataset::new(settings.dataset_dir),
         nixpkgs: settings.nixpkgs,
+        memory: (options.memory_tiers || settings.memory_tiers)
+            .then(|| MemoryLog::new(settings.memory_log)),
     });
     let team = crew.agent(Role::Scribe, &shared);
     team.status(online_line(&shared, &socket)).await;
@@ -354,7 +363,8 @@ async fn dispatch(
         | BusBody::SafetyVerdict { .. }
         | BusBody::Route { .. }
         | BusBody::Incident(_)
-        | BusBody::Status { .. } => None,
+        | BusBody::Status { .. }
+        | BusBody::Memory(_) => None,
     }
 }
 
@@ -664,8 +674,13 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         (LlmMode::Record, Some(dir)) => format!("live, recording to {}", dir.display()),
         (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
+    let pager = if shared.memory.is_some() {
+        "; memory tiers on: evidence over 120 tokens enters as a handle, agents page_in and page_out"
+    } else {
+        ""
+    };
     format!(
-        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}; {}",
+        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}{pager}; {}",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),

@@ -9,7 +9,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{
+    Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use super::{
     Focus, View, fit, heading, on, pad, panel, role_label, role_name, short_model, spaces, spinner,
@@ -19,8 +21,12 @@ use crate::denials::{Denial, Kind};
 use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who};
 use crate::team::{self, SPECIALISTS, Status};
 use crate::theme::{
-    ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, glyph, tint,
+    ACCENT, AMBER, BRIGHT, DIM, INK, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, blend,
+    glyph, tint,
 };
+
+/// How long a new message takes to fade in.
+const FADE_IN_MS: i64 = 600;
 
 /// Widest a Lead or specialist message runs before wrapping, for a comfortable measure.
 const MEASURE: usize = 86;
@@ -109,7 +115,7 @@ pub(super) fn render_conversation(
     if let Some(denial) = banner {
         render_banner(frame, banner_area, denial);
     }
-    render_feed(frame, feed, state, view);
+    render_feed(frame, feed, state, view, now);
     if let Some(note) = &state.notice {
         let room = usize::from(notice.width).saturating_sub(2);
         let line = Line::from(vec![
@@ -171,8 +177,9 @@ fn render_banner(frame: &mut Frame<'_>, area: Rect, denial: &Denial) {
     frame.render_widget(Paragraph::new(second), second_area);
 }
 
-/// The messages and markers, newest at the bottom, scrolled back by `view.scroll` lines.
-fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View) {
+/// The messages and markers, newest at the bottom, scrolled back by `view.scroll` lines, with a
+/// scrollbar when they overflow. With motion on, a message that just arrived fades in.
+fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
     let rows = usize::from(area.height);
     if rows == 0 {
         return;
@@ -190,6 +197,47 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View) {
     let mut shown: Vec<Line<'static>> = vec![Line::default(); rows - (end - start)];
     shown.extend(lines.into_iter().skip(start).take(end - start));
     frame.render_widget(Paragraph::new(shown), area);
+    if limit > 0 {
+        let mut position = ScrollbarState::new(limit).position(limit - back);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(Style::new().fg(LINE))
+            .thumb_symbol("┃")
+            .thumb_style(Style::new().fg(ACCENT));
+        frame.render_stateful_widget(bar, area, &mut position);
+    }
+    if view.motion && back == 0 {
+        fade_in_newest(frame, area, state, now);
+    }
+}
+
+/// Fade the newest message in over its first moments: its rows start near the background.
+fn fade_in_newest(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
+    let Some(Talk::Said(said)) = state.talk.back() else {
+        return;
+    };
+    let age = now.duration_since(said.arrived).as_millis();
+    if !(0..i128::from(FADE_IN_MS)).contains(&age) {
+        return;
+    }
+    let mut own = Vec::new();
+    message_lines(said, usize::from(area.width), &mut own);
+    let height = u16::try_from(own.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let left = i128::from(FADE_IN_MS) - age;
+    let amount = u16::try_from(left * 256 / i128::from(FADE_IN_MS)).unwrap_or(0);
+    let buffer = frame.buffer_mut();
+    for y in area.bottom().saturating_sub(height)..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                let faded = blend(cell.fg, INK, amount);
+                cell.set_fg(faded);
+            }
+        }
+    }
 }
 
 /// What the conversation says before anything happened.
