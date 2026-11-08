@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::cache::Hit;
 use crate::daemon::{Connection, now};
+use crate::dataset::{self, Dataset, Tag};
 use crate::llm::{Message, Origin, Reply, Router};
 use crate::records::{Case, Records};
 use crate::roles;
@@ -123,6 +124,8 @@ pub(crate) struct Shared {
     pub(crate) max_steps: u32,
     /// Flake reference prefix for tool requests.
     pub(crate) nixpkgs: String,
+    /// Training-ready tags, one JSON line per step.
+    pub(crate) dataset: Dataset,
 }
 
 impl Shared {
@@ -247,6 +250,24 @@ struct Shown {
     outcome: Option<ExecOutcome>,
 }
 
+/// What `tag` needs to know about one finished step.
+struct Step<'a> {
+    /// The model that chose it.
+    model: &'a str,
+    /// The tool.
+    tool: Tool,
+    /// What it read or ran.
+    subject: &'a str,
+    /// Characters of output.
+    output_chars: usize,
+    /// The command's receipt.
+    receipt: Option<u64>,
+    /// Denied by the grant.
+    denied: bool,
+    /// Flagged by the safety model.
+    flagged: bool,
+}
+
 impl Shown {
     /// A step that ran no command.
     fn text(text: &str) -> Self {
@@ -266,6 +287,8 @@ struct Done {
     shown: Shown,
     /// The text carries evidence and must be screened before a model sees it.
     untrusted: bool,
+    /// The cleanroomd receipt of the command, when the step ran one.
+    receipt: Option<u64>,
 }
 
 impl Done {
@@ -275,6 +298,7 @@ impl Done {
             shown: Shown::text(&text),
             text,
             untrusted: false,
+            receipt: None,
         }
     }
 
@@ -285,6 +309,7 @@ impl Done {
             shown: Shown::text(&text),
             text,
             untrusted: false,
+            receipt: None,
         }
     }
 }
@@ -528,8 +553,11 @@ impl Agent {
             content: reply.content,
             tool_calls: history,
         });
+        let model = reply.model;
         for (call, outcome) in reply.tool_calls.into_iter().zip(outcomes) {
-            let content = self.run_call(desk, thread, &call.name, outcome).await;
+            let content = self
+                .run_call(desk, thread, &model, &call.name, outcome)
+                .await;
             thread.messages.push(Message::Tool {
                 tool_call_id: call.id,
                 content,
@@ -542,6 +570,7 @@ impl Agent {
         &self,
         desk: &mut Desk,
         thread: &mut Thread,
+        model: &str,
         name: &str,
         outcome: Result<Call, Rejection>,
     ) -> String {
@@ -554,8 +583,10 @@ impl Agent {
             }
         };
         let mut subject = None;
+        let mut read = String::new();
         let done = match action {
             Action::Exec(spec) => {
+                spec.subject().clone_into(&mut read);
                 subject = Some((
                     format!("{} {}", tool.name(), spec.subject()),
                     tool.screened(spec.subject()),
@@ -573,12 +604,61 @@ impl Agent {
                 Done::error("only the Lead talks with the commander and the specialists")
             }
         };
+        let denied = matches!(done.shown.outcome, Some(ExecOutcome::Denied { .. }));
+        let receipt = done.receipt;
+        let output_chars = done.text.chars().count();
         self.trace(desk.steps, tool.name(), args, done.shown).await;
-        match subject {
+        let (text, flagged) = match subject {
             Some((subject, scored)) if done.untrusted => {
                 self.screen(desk, thread, &subject, scored, done.text).await
             }
-            Some(_) | None => done.text,
+            Some(_) | None => (done.text, false),
+        };
+        self.tag(
+            desk,
+            thread,
+            Step {
+                model,
+                tool,
+                subject: &read,
+                output_chars,
+                receipt,
+                denied,
+                flagged,
+            },
+        );
+        text
+    }
+
+    /// Append one training-ready tag for a finished step; a write failure is only logged.
+    fn tag(&self, desk: &Desk, thread: &Thread, step: Step<'_>) {
+        let tag = Tag {
+            incident: desk.case.incident_id.clone(),
+            at: now(),
+            role: roles::name(self.role).to_owned(),
+            step: desk.steps,
+            model: step.model.to_owned(),
+            route: match desk.route {
+                Some(ModelRoute::Local) => "local",
+                Some(ModelRoute::Hosted) | None => "hosted",
+            }
+            .to_owned(),
+            tool: step.tool.name().to_owned(),
+            subject: step.subject.to_owned(),
+            shape: dataset::shape(step.tool, step.output_chars),
+            provenance: dataset::provenance(step.tool, step.subject),
+            output_chars: step.output_chars,
+            receipt: step.receipt,
+            denied: step.denied,
+            flagged: step.flagged,
+            guardrails: thread.guardrails,
+            trainable: dataset::trainable(thread.guardrails, step.denied, step.flagged),
+        };
+        if let Err(error) = self.shared.dataset.append(&tag) {
+            tracing::warn!(
+                role = roles::name(self.role),
+                "cannot write a training tag: {error:#}"
+            );
         }
     }
 
@@ -634,11 +714,13 @@ impl Agent {
                 outcome: Some(result.outcome),
             },
             untrusted: !denied,
+            receipt: Some(result.receipt_seq),
         }
     }
 
     /// Sensitivity routing for evidence-bearing output, then safety layer 1 when the output is
-    /// attacker-written text (`scored`).
+    /// attacker-written text (`scored`). Returns the text for the model and whether the safety
+    /// model flagged it (or could not score it).
     async fn screen(
         &self,
         desk: &mut Desk,
@@ -646,10 +728,10 @@ impl Agent {
         subject: &str,
         scored: bool,
         text: String,
-    ) -> String {
+    ) -> (String, bool) {
         self.check_sensitive(desk, thread, &text).await;
         if !scored {
-            return text;
+            return (text, false);
         }
         let route = if thread.sensitive && self.shared.router.local_model().is_some() {
             ModelRoute::Local
@@ -669,15 +751,16 @@ impl Agent {
                 })
                 .await;
                 if safe {
-                    return text;
+                    return (text, false);
                 }
                 self.shared.counters.flagged();
                 self.publish_counters().await;
-                if thread.guardrails {
+                let text = if thread.guardrails {
                     safety::envelope(&artifact, &rating, &text)
                 } else {
                     text
-                }
+                };
+                (text, true)
             }
             Err(error) => {
                 self.status(format!(
@@ -685,11 +768,12 @@ impl Agent {
                     self.name()
                 ))
                 .await;
-                if thread.guardrails {
+                let text = if thread.guardrails {
                     safety::envelope(&artifact, "unscored", &text)
                 } else {
                     text
-                }
+                };
+                (text, true)
             }
         }
     }

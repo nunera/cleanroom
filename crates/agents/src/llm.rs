@@ -757,6 +757,7 @@ mod tests {
             llm_mode,
             cache_dir: PathBuf::from("/nonexistent/cleanroom-llm-cache"),
             keys_dir: PathBuf::from("/nonexistent/cleanroom-keys"),
+            dataset_dir: PathBuf::from("/nonexistent/cleanroom-dataset"),
             nixpkgs: "github:NixOS/nixpkgs/rev".to_owned(),
         }
     }
