@@ -155,7 +155,8 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 - Every evidence-bearing tool output is scored by the Nemotron safety model (`safety_verdict`) before a model sees it; with guardrails on, unsafe output is wrapped in an untrusted-data envelope. Output with personal data or credentials moves the conversation to the local endpoint (`route`).
 - `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands).
 - Tool requests go through the daemon's `request_tool` operation only; the daemon publishes `tool_request` and `tool_decision`. YARA rules come from the read-only `/rules` mount.
-- Scribe starts from the scope records already on the bus (the daemon's baseline and measurement), so it updates those assets instead of inventing new ones: a new asset needs evidence. `update_scope` refuses to lower a flag cleanroomd measured `yes`, with the reason, so an injected "it was only a test" cannot clear the record.
+- Scribe starts from the scope records already on the bus (the daemon's baseline and measurement), so it updates those assets instead of inventing new ones: a new asset needs evidence. `update_scope` refuses to lower a flag cleanroomd measured `yes`, and refuses to clear `exfiltrated` (unknown or yes → no), which cleanroomd cannot measure; only a human may. cleanroomd enforces both on the bus. So an injected "it was only a test" cannot clear the record.
+- Legal clocks: GDPR awareness and HIPAA discovery are stamped with the incident's detection time (first knowledge), however late Scribe records them; a Texas breach determination is a decision, stamped when it is made.
 - Signing keys are created on first run in `$XDG_STATE_HOME/cleanroom/keys/<role>.key` (mode `0600`).
 
 | Variable | Meaning |
