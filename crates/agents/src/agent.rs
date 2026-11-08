@@ -256,6 +256,8 @@ struct Shown {
 struct Step<'a> {
     /// The model that chose it.
     model: &'a str,
+    /// `sha256:` of the request that chose it.
+    request: &'a str,
     /// The tool.
     tool: Tool,
     /// What it read or ran.
@@ -556,9 +558,10 @@ impl Agent {
             tool_calls: history,
         });
         let model = reply.model;
+        let request = reply.request;
         for (call, outcome) in reply.tool_calls.into_iter().zip(outcomes) {
             let content = self
-                .run_call(desk, thread, &model, &call.name, outcome)
+                .run_call(desk, thread, (&model, &request), &call.name, outcome)
                 .await;
             thread.messages.push(Message::Tool {
                 tool_call_id: call.id,
@@ -572,7 +575,7 @@ impl Agent {
         &self,
         desk: &mut Desk,
         thread: &mut Thread,
-        model: &str,
+        (model, request): (&str, &str),
         name: &str,
         outcome: Result<Call, Rejection>,
     ) -> String {
@@ -622,6 +625,7 @@ impl Agent {
             thread,
             Step {
                 model,
+                request,
                 tool,
                 subject: &read,
                 output_chars,
@@ -656,6 +660,7 @@ impl Agent {
             flagged: step.flagged,
             guardrails: thread.guardrails,
             trainable: dataset::trainable(thread.guardrails, step.denied, step.flagged),
+            request: step.request.to_owned(),
         };
         if let Err(error) = self.shared.dataset.append(&tag) {
             tracing::warn!(

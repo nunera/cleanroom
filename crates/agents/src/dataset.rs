@@ -151,6 +151,9 @@ pub(crate) struct Tag {
     pub(crate) guardrails: bool,
     /// Safe to train on.
     pub(crate) trainable: bool,
+    /// `sha256:` of the model request that chose this step (the record/replay cache key), so an
+    /// export can find the exact request and response.
+    pub(crate) request: String,
 }
 
 /// The dataset directory.
@@ -190,7 +193,7 @@ impl Dataset {
 }
 
 /// A file name for an incident id that came off the bus: letters, digits, `-` and `_` only.
-fn file_stem(incident: &str) -> String {
+pub(crate) fn file_stem(incident: &str) -> String {
     let stem: String = incident
         .chars()
         .map(|c| {
@@ -298,6 +301,7 @@ mod tests {
             flagged: true,
             guardrails: true,
             trainable: false,
+            request: "sha256:request".to_owned(),
         }
     }
 
