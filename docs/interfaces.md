@@ -31,7 +31,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 
 Every allowed or denied action appends a `Receipt` to a hash-chained log. `prev` is the digest of the previous signed receipt; the first entry uses `sha256:` followed by 64 zeros. `verify_log` walks the chain offline and reports the first break.
 
-Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`.
+Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`, `evidence_seal`, `model_call`.
 
 ## Daemon operations (`request.op`)
 
@@ -39,6 +39,7 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 | --- | --- | --- |
 | `exec` | Agent runner | `exec` with outcome `exited` / `timed_out` / `denied` + `receipt_seq` |
 | `request_tool` | Agent runner | `tool` with decision `auto_allowed` / `approved` / `denied` / `pending` |
+| `model_call` | Agent runner | Body is `ModelCall {from, purpose, model, endpoint, request, response, replayed, latency_ms}`: one model call (agent step, chat turn or safety verdict) with `sha256:` digests of the exact request and response bytes. Sent on the connection of the role named in `from`. Response `ok`; the daemon chains a `model_call` receipt as that agent |
 | `approve` | TUI (commander) | Body is `Signed<ApprovalDecision {subject_id, approved, at}>` under `cleanroom/v1/approval`. Response `ok`, then a `tool_decision` or `approval` bus event |
 | `enroll` | TUI (admin) | `ok` or `error` |
 | `revoke` | TUI (admin) | Body is `Signed<Revocation>` under `cleanroom/v1/revoke`. `ok`, or `error` when the signer is not an enrolled admin, the key is not enrolled, or it is the last admin. A later `enroll` of the same key reinstates it |

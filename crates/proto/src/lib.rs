@@ -192,6 +192,24 @@ pub struct ExecResult {
     pub receipt_seq: u64,
 }
 
+/// An agent runner reporting one model call, so cleanroomd can chain which model answered whom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCall {
+    pub from: Role,
+    /// `agent`, `chat` or `safety`.
+    pub purpose: String,
+    pub model: String,
+    /// The endpoint's base URL.
+    pub endpoint: String,
+    /// Digest of the request body sent.
+    pub request: Digest,
+    /// Digest of the response body received.
+    pub response: Digest,
+    /// The answer came from the replay store, not a live model.
+    pub replayed: bool,
+    pub latency_ms: u64,
+}
+
 // ---------- Receipts (hash-chained, signed action log) ----------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +252,16 @@ pub enum Action {
     EvidenceSeal {
         digest: Digest,
         files: u64,
+    },
+    /// An agent's model call, as its runner reported it: the receipt binds the model and
+    /// endpoint to digests of the exact request and response bytes.
+    ModelCall {
+        purpose: String,
+        model: String,
+        endpoint: String,
+        request: Digest,
+        response: Digest,
+        replayed: bool,
     },
 }
 
@@ -555,6 +583,8 @@ pub struct BusMessage {
 pub enum CoreRequest {
     Exec(ExecRequest),
     RequestTool(ToolRequest),
+    /// An agent runner reporting one model call for the receipt log.
+    ModelCall(ModelCall),
     /// Commander approves or denies a pending tool request or containment proposal.
     Approve(Signed<ApprovalDecision>),
     Enroll(Signed<Member>),

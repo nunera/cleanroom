@@ -244,6 +244,7 @@ const fn op_label(request: &CoreRequest) -> &'static str {
         CoreRequest::Tamper { .. } => "tamper",
         CoreRequest::Exec(_)
         | CoreRequest::RequestTool(_)
+        | CoreRequest::ModelCall(_)
         | CoreRequest::Approve(_)
         | CoreRequest::Enroll(_)
         | CoreRequest::Revoke(_)

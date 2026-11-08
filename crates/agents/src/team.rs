@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use cleanroom_proto::{
-    Audience, BusBody, BusMessage, LlmMode, Principal, Role, ScopeRecord, Signed,
+    Audience, BusBody, BusMessage, CoreRequest, CoreResponse, LlmMode, ModelCall, Principal, Role,
+    ScopeRecord, Signed,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -27,7 +28,7 @@ use crate::config::{self, Settings};
 use crate::daemon::{Connection, Inbound};
 use crate::dataset::Dataset;
 use crate::lead::Lead;
-use crate::llm::Router;
+use crate::llm::{CallRecord, Router};
 use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::Counters;
@@ -38,6 +39,8 @@ use crate::{keys, text};
 
 /// How long to wait for `cleanroomd` to come up.
 const CONNECT_PATIENCE: Duration = Duration::from_mins(2);
+/// How long cleanroomd may take to chain one model-call receipt.
+const MODEL_CALL_WAIT: Duration = Duration::from_secs(10);
 /// How long Scribe keeps listening for the commander's decisions on proposals.
 const DECISION_WINDOW: Duration = Duration::from_mins(10);
 /// Notes Scribe takes into one conversation at most.
@@ -118,6 +121,33 @@ impl Crew {
     }
 }
 
+/// Chain every model call into cleanroomd's receipt log, over the connection of the role the
+/// call was for (cleanroomd checks the caller is that agent). A report that fails is logged; the
+/// investigation goes on.
+async fn forward_calls(crew: Arc<Crew>, mut calls: mpsc::UnboundedReceiver<CallRecord>) {
+    while let Some(call) = calls.recv().await {
+        let request = CoreRequest::ModelCall(ModelCall {
+            from: call.role,
+            purpose: call.purpose.to_owned(),
+            model: call.model,
+            endpoint: call.endpoint,
+            request: call.request,
+            response: call.response,
+            replayed: call.replayed,
+            latency_ms: call.latency_ms,
+        });
+        match crew
+            .connection(call.role)
+            .request(request, MODEL_CALL_WAIT)
+            .await
+        {
+            Ok(CoreResponse::Ok) => {}
+            Ok(other) => tracing::warn!("cleanroomd did not record a model call: {other:?}"),
+            Err(error) => tracing::warn!("cannot report a model call: {error:#}"),
+        }
+    }
+}
+
 /// Connect and serve until interrupted (or after one investigation with `--once`).
 ///
 /// # Errors
@@ -128,10 +158,12 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         Some(socket) => socket,
         None => config::default_socket()?,
     };
-    let router = Router::new(&settings)?;
+    let (calls_tx, calls) = mpsc::unbounded_channel();
+    let router = Router::new(&settings)?.with_call_log(calls_tx);
     let (inbound_tx, mut inbound) = mpsc::channel(256);
     let crew = Arc::new(Crew::connect(&socket, &settings.keys_dir, &inbound_tx).await?);
     drop(inbound_tx);
+    tokio::spawn(forward_calls(Arc::clone(&crew), calls));
     let (guardrails_tx, guardrails) = watch::channel(options.guardrails);
     let shared = Arc::new(Shared {
         router,
