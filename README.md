@@ -86,6 +86,17 @@ nix develop
 cargo check
 ```
 
+Without a checkout, from any directory (the package carries `scenario/`, `roots/`, `plans/` and the static canary ransomware, and puts bubblewrap, skopeo and umoci on `cleanroomd`'s `PATH`):
+
+```sh
+nix run github:nunera/cleanroom                                   # cleanroomd: serve
+nix run github:nunera/cleanroom -- detonate                       # any cleanroomd subcommand
+nix run github:nunera/cleanroom -- plan validate plans/responder.json
+nix run github:nunera/cleanroom#agents -- run                     # the Nemotron team
+```
+
+`nix build .#cleanroom` runs the daemon, agents and proto tests as part of the build.
+
 ## Model access
 
 Nemotron credentials live outside the repo in `~/.config/cleanroom/nemotron.env` (mode `0600`):
