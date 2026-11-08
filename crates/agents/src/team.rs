@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::agent::{Agent, Control, Desk, Note, Shared, on_off};
 use crate::config::{self, Settings};
 use crate::daemon::{Connection, Inbound};
+use crate::dataset::Dataset;
 use crate::llm::Router;
 use crate::records::{Case, Records};
 use crate::roles;
@@ -124,6 +125,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         guardrails,
         control: broadcast::channel(64).0,
         max_steps: options.max_steps,
+        dataset: Dataset::new(settings.dataset_dir),
         nixpkgs: settings.nixpkgs,
     });
     let lead = crew.agent(Role::Scribe, &shared);

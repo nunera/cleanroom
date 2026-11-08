@@ -103,6 +103,8 @@ pub(crate) struct Settings {
     pub(crate) cache_dir: PathBuf,
     /// Signing keys directory.
     pub(crate) keys_dir: PathBuf,
+    /// Training-ready tags, `<incident>.jsonl` per incident.
+    pub(crate) dataset_dir: PathBuf,
     /// Pinned flake reference prefix for tool requests.
     pub(crate) nixpkgs: String,
 }
@@ -162,6 +164,7 @@ impl Settings {
             llm_mode,
             cache_dir,
             keys_dir: xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/keys"),
+            dataset_dir: xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/dataset"),
             nixpkgs: env.model("CLEANROOM_NIXPKGS", DEFAULT_NIXPKGS),
         })
     }
