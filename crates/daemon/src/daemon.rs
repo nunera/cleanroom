@@ -827,8 +827,9 @@ impl Daemon {
     /// Fails if the share cannot be read.
     async fn declare(&self, receipt: u64) -> Result<String> {
         let share = self.layout.share();
+        let drop_box = self.layout.dropbox();
         let baseline = self.scenario.baseline();
-        let integrity = spawn_blocking(move || scenario::check(&share, &baseline))
+        let integrity = spawn_blocking(move || scenario::check(&share, &drop_box, &baseline))
             .await
             .context("the integrity check panicked")??;
         let at = now();
