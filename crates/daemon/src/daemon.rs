@@ -21,6 +21,7 @@ use tokio::task::spawn_blocking;
 use crate::bus::{Bus, Outbox, Subject};
 use crate::layout::Layout;
 use crate::members::Members;
+use crate::reasoning;
 use crate::roots::{Admitted, Roots, Verdict};
 use crate::rules;
 use crate::scenario::{self, Scenario};
@@ -32,6 +33,8 @@ use crate::{keys, lock, now, receipts};
 const ROOT: &str = "debian";
 /// How long one scan of a submitted rule may run.
 const RULE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest reasoning trace stored per model call.
+const REASONING_MAX: usize = 256 * 1024;
 /// Longest the ransomware may run.
 const DETONATION_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -281,12 +284,24 @@ impl Daemon {
         })
     }
 
-    /// `model_call`: chain an agent's model call into the receipt log, as that agent.
+    /// `model_call`: chain an agent's model call into the receipt log, as that agent. A
+    /// reasoning trace is stored in `reasoning.ndjson` under the receipt's number, and the
+    /// receipt carries its digest.
     ///
     /// # Errors
-    /// Fails if the caller is not the agent it names or the receipt cannot be written.
+    /// Fails if the caller is not the agent it names, the trace is too large, or the receipt or
+    /// trace cannot be written.
     fn model_call(&self, peer: &Peer, call: ModelCall) -> Result<CoreResponse> {
         let role = peer.role(call.from)?;
+        if call
+            .reasoning
+            .as_ref()
+            .is_some_and(|text| text.len() > REASONING_MAX)
+        {
+            bail!("a reasoning trace is at most {REASONING_MAX} bytes");
+        }
+        let actor = Principal::Agent { role };
+        let model = call.model.clone();
         let action = Action::ModelCall {
             purpose: call.purpose,
             model: call.model,
@@ -294,8 +309,20 @@ impl Daemon {
             request: call.request,
             response: call.response,
             replayed: call.replayed,
+            reasoning: call.reasoning.as_deref().map(reasoning::digest),
+            reasoning_tokens: call.reasoning_tokens,
         };
-        self.receipt(Principal::Agent { role }, action, Outcome::Allowed)?;
+        let seq = self.receipt(actor.clone(), action, Outcome::Allowed)?;
+        if let Some(text) = call.reasoning {
+            let trace = reasoning::Trace {
+                receipt: seq,
+                role: describe(&actor),
+                model,
+                tokens: call.reasoning_tokens,
+                text,
+            };
+            reasoning::append(&self.layout.reasoning(), &trace)?;
+        }
         Ok(CoreResponse::Ok)
     }
 
