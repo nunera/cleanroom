@@ -18,6 +18,7 @@ mod keys;
 mod layout;
 mod members;
 mod plan;
+mod probe;
 mod receipts;
 mod roots;
 mod scenario;
@@ -95,6 +96,14 @@ enum Command {
         /// Program and arguments, after `--`.
         #[arg(last = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Test a stratum's walls from inside it (network, capabilities, nested user namespaces,
+    /// environment, read-only evidence, host home), one signed receipt per wall. Exits 0 when
+    /// every wall holds, 1 when one is broken.
+    Probe {
+        /// Agent stratum that runs commands: hunter or forensics.
+        #[arg(default_value = "hunter")]
+        stratum: String,
     },
     /// Work with declarative host plans offline (no daemon needed).
     Plan {
@@ -193,6 +202,7 @@ async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<Exi
             timeout,
             argv,
         } => client::run(&socket()?, &stratum, argv, Duration::from_secs(timeout)).await,
+        Command::Probe { stratum } => client::probe(&socket()?, &stratum).await,
     }
 }
 
