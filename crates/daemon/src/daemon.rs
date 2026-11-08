@@ -22,15 +22,13 @@ use crate::bus::{Bus, Outbox, Subject};
 use crate::layout::Layout;
 use crate::members::Members;
 use crate::reasoning;
-use crate::roots::{Admitted, Roots, Verdict};
+use crate::roots::{self, Admitted, Roots, Verdict};
 use crate::rules;
 use crate::scenario::{self, Scenario};
-use crate::strata::{self, Captured, Launch};
+use crate::strata::{self, Captured, Launch, Placement};
 use crate::tools::{self, Granted, Grants, Policy};
 use crate::{keys, lock, now, receipts};
 
-/// The root every stratum runs on.
-const ROOT: &str = "debian";
 /// How long one scan of a submitted rule may run.
 const RULE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest reasoning trace stored per model call.
@@ -128,6 +126,8 @@ pub(crate) struct Daemon {
     receipts: Mutex<receipts::Log>,
     /// Admitted roots.
     roots: Roots,
+    /// Which root each stratum runs on.
+    placement: Placement,
     /// Tool admission policy.
     policy: Policy,
     /// Tools each role holds.
@@ -154,8 +154,14 @@ impl Daemon {
         let assets = scenario::load_assets(&layout.assets())?;
         let policy = Policy::load(&layout.repo)?;
         let members = Members::load(&layout.keys().join("members.ndjson"))?;
+        let placement = Placement::from_env()?;
+        for root in placement.roots() {
+            roots::check_lock(&layout, root)?;
+        }
+        tracing::info!(%placement, "strata roots");
         let daemon = Arc::new(Self {
             roots: Roots::new(layout.clone()),
+            placement,
             layout,
             session: session_tag(),
             next_message: AtomicU64::new(1),
@@ -347,7 +353,7 @@ impl Daemon {
             bail!("no incident is open; detection rules are written for one");
         }
         let actor = Principal::Agent { role };
-        let root = self.launchable_root(&actor).await?;
+        let root = self.launchable_root(&actor, strata::RULE_CHECK).await?;
         let yara = self
             .grants
             .of(Role::Hunter)
@@ -439,7 +445,7 @@ impl Daemon {
                 None,
             );
         }
-        let root = match self.launchable_root(&actor).await {
+        let root = match self.launchable_root(&actor, &request.stratum).await {
             Ok(root) => root,
             Err(error) => {
                 let reason = format!("{error:#}");
@@ -589,26 +595,39 @@ impl Daemon {
         }
     }
 
-    /// The admitted root, admitting it first if this run has not, and re-checking its tree.
+    /// The root `stratum` runs on.
     ///
     /// # Errors
-    /// Fails if admission fails or rejects the root, or the tree changed since admission.
-    async fn launchable_root(&self, actor: &Principal) -> Result<Admitted> {
-        let root = match self.roots.admitted(ROOT) {
+    /// Fails for a stratum that launches no commands.
+    fn root_of(&self, stratum: &str) -> Result<&str> {
+        self.placement
+            .root(stratum)
+            .with_context(|| format!("the {stratum} stratum launches no commands"))
+    }
+
+    /// The admitted root `stratum` runs on, admitting it first if this run has not, and
+    /// re-checking its tree.
+    ///
+    /// # Errors
+    /// Fails for a stratum that launches no commands, if admission fails or rejects the root,
+    /// or if the tree changed since admission.
+    async fn launchable_root(&self, actor: &Principal, stratum: &str) -> Result<Admitted> {
+        let name = self.root_of(stratum)?;
+        let root = match self.roots.admitted(name) {
             Some(root) => root,
-            None => match self.admit_root(actor, ROOT).await? {
+            None => match self.admit_root(actor, name).await? {
                 Verdict::Admitted(root) => root,
                 Verdict::Rejected(mismatch) => bail!(
-                    "root {ROOT} failed admission: layer {} does not match its lock",
+                    "root {name} failed admission: layer {} does not match its lock",
                     mismatch.layer
                 ),
             },
         };
         if !self.roots.intact(&root).await? {
             self.status(format!(
-                "root {ROOT} changed on disk since admission (tree digest mismatch); launches refused until it is re-admitted"
+                "root {name} changed on disk since admission (tree digest mismatch); launches refused until it is re-admitted"
             ));
-            bail!("root {ROOT} changed on disk since admission; re-admit it");
+            bail!("root {name} changed on disk since admission; re-admit it");
         }
         Ok(root)
     }
@@ -962,13 +981,16 @@ impl Daemon {
             bail!("acme-fs was already detonated ({id}); reset first");
         }
         let ransom = scenario::find_ransom(&self.layout)?;
-        let root = self.launchable_root(&peer.principal).await?;
+        let root_name = self.root_of(strata::VICTIM)?;
+        let root = self
+            .launchable_root(&peer.principal, strata::VICTIM)
+            .await?;
         let action = Action::Detonate {
             scenario: name.to_owned(),
         };
         let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
         self.status(format!(
-            "{} detonated {name} in the acme-fs stratum: Debian root read-only, share read-write, no network (receipt #{seq})",
+            "{} detonated {name} in the acme-fs stratum: {root_name} root read-only, share read-write, no network (receipt #{seq})",
             peer.name()
         ));
         let summary = self.run_ransomware(&root, &ransom, argv).await?;

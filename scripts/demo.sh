@@ -63,9 +63,10 @@ window=(-c "$repo" -e "PATH=$PATH")
 tmux new-session -d -s "$session" -n daemon -x 200 -y 50 "${window[@]}" target/release/cleanroomd
 tmux set-option -t "$session" remain-on-exit on >/dev/null
 tmux new-window -d -t "$session" -n agents "${window[@]}" bash -c "$agents"
-# Admission is lazy, so admit the Debian root (waits for the daemon) before launching from it.
+# Admission is lazy, so admit both roots (waits for the daemon) before launching from Debian; Alpine
+# is Forensics' root, admitted here so its first command doesn't wait on a fetch.
 tmux new-window -t "$session" -n tui "${window[@]}" bash -c \
-  'target/release/cleanroomd admit debian && exec scripts/launch-tui.sh --no-build'
+  'target/release/cleanroomd admit debian && target/release/cleanroomd admit alpine && exec scripts/launch-tui.sh --no-build'
 
 echo "demo: up. Windows: daemon, agents, tui." >&2
 if [[ -n ${TMUX:-} ]]; then

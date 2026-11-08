@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use cleanroom_proto::{ExecOutcome, Grant, Mount, MountMode, Network, Role};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::layout::Layout;
-use crate::roots::Admitted;
+use crate::roots::{Admitted, is_root_name};
 use crate::tools::Granted;
 
 /// Bytes kept per output stream.
@@ -31,6 +31,106 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The victim stratum the scenario runs in.
 pub(crate) const VICTIM: &str = "acme-fs";
+/// The stratum a submitted YARA rule is checked in.
+pub(crate) const RULE_CHECK: &str = "rule-check";
+
+/// Every stratum that launches commands, with the root it runs on unless [`ROOTS_VAR`] moves
+/// it: Forensics on Alpine (a busybox userland), the others on Debian.
+const DEFAULT_ROOTS: [(&str, &str); 4] = [
+    ("hunter", "debian"),
+    ("forensics", "alpine"),
+    (VICTIM, "debian"),
+    (RULE_CHECK, "debian"),
+];
+/// The variable that moves strata onto other roots: `stratum=root` pairs, comma-separated.
+pub(crate) const ROOTS_VAR: &str = "CLEANROOM_ROOTS";
+
+/// Which admitted root each stratum that launches commands runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// `(stratum, root)` for every stratum in [`DEFAULT_ROOTS`], in that order.
+    roots: Vec<(&'static str, String)>,
+}
+
+impl Placement {
+    /// The defaults with [`ROOTS_VAR`] applied.
+    ///
+    /// # Errors
+    /// Fails if the variable is set but not a valid placement.
+    pub(crate) fn from_env() -> Result<Self> {
+        let spec = std::env::var(ROOTS_VAR).ok();
+        Self::parse(spec.as_deref()).with_context(|| format!("{ROOTS_VAR} is not usable"))
+    }
+
+    /// The defaults with `spec` (`stratum=root` pairs, comma-separated) applied.
+    ///
+    /// # Errors
+    /// Fails for a pair without `=`, a stratum that launches no commands or is named twice, or
+    /// a root that is not a plain root name.
+    pub(crate) fn parse(spec: Option<&str>) -> Result<Self> {
+        let mut roots: Vec<(&'static str, String)> = DEFAULT_ROOTS
+            .iter()
+            .map(|&(stratum, root)| (stratum, root.to_owned()))
+            .collect();
+        let mut named: Vec<&str> = Vec::new();
+        let pairs = spec
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty());
+        for pair in pairs {
+            let (stratum, root) = pair
+                .split_once('=')
+                .with_context(|| format!("`{pair}` is not stratum=root"))?;
+            let (stratum, root) = (stratum.trim(), root.trim());
+            let slot = roots
+                .iter_mut()
+                .find(|(known, _)| *known == stratum)
+                .with_context(|| {
+                    format!(
+                        "`{stratum}` is not a stratum that launches commands (hunter, forensics, {VICTIM}, {RULE_CHECK})"
+                    )
+                })?;
+            if !is_root_name(root) {
+                bail!("`{root}` is not a root name");
+            }
+            if named.contains(&stratum) {
+                bail!("{stratum} is placed twice");
+            }
+            named.push(stratum);
+            slot.1 = root.to_owned();
+        }
+        Ok(Self { roots })
+    }
+
+    /// The root `stratum` runs on; `None` for a stratum that launches no commands.
+    pub(crate) fn root(&self, stratum: &str) -> Option<&str> {
+        self.roots
+            .iter()
+            .find(|(known, _)| *known == stratum)
+            .map(|(_, root)| root.as_str())
+    }
+
+    /// Every root some stratum runs on, sorted, each once.
+    pub(crate) fn roots(&self) -> Vec<&str> {
+        let mut roots: Vec<&str> = self.roots.iter().map(|(_, root)| root.as_str()).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    }
+}
+
+impl std::fmt::Display for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (at, (stratum, root)) in self.roots.iter().enumerate() {
+            if at > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{stratum} on {root}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Evidence: the victim's share, as investigators see it.
 pub(crate) const EVIDENCE_SHARE: &str = "/evidence/acme-fs";
@@ -68,7 +168,7 @@ pub(crate) const MOUNT_POINTS: [&str; 10] = [
     VICTIM_BIN,
 ];
 
-/// Debian's default search path; admitted tools go in front of it.
+/// The default search path of both Debian and Alpine; admitted tools go in front of it.
 const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// The kernel's message for `EROFS`.
 const READ_ONLY: &str = "Read-only file system";
@@ -169,7 +269,7 @@ pub(crate) const RULE_CHECK_RULES: &str = RULES;
 /// Fails if a host path is not UTF-8.
 pub(crate) fn rule_check(layout: &Layout, root: &Admitted) -> Result<Grant> {
     Ok(Grant {
-        stratum: "rule-check".to_owned(),
+        stratum: RULE_CHECK.to_owned(),
         role: None,
         root: root.manifest.clone(),
         mounts: vec![
@@ -332,7 +432,7 @@ fn bwrap_args(launch: &Launch<'_>) -> Vec<OsString> {
     args
 }
 
-/// `PATH` inside the stratum: admitted tools first, then Debian's.
+/// `PATH` inside the stratum: admitted tools first, then the root's own.
 fn search_path(bins: &[PathBuf]) -> OsString {
     let mut path = OsString::new();
     for bin in bins {
@@ -559,5 +659,49 @@ mod tests {
             ExecOutcome::TimedOut,
             "the timeout wins"
         );
+    }
+
+    /// Two distro roots by default: Forensics runs its tools on Alpine (busybox), the rest on
+    /// Debian.
+    #[test]
+    fn forensics_runs_on_alpine_and_the_rest_on_debian_by_default() {
+        let placement = Placement::parse(None).expect("no override parses");
+        assert_eq!(placement.root("hunter"), Some("debian"));
+        assert_eq!(placement.root("forensics"), Some("alpine"));
+        assert_eq!(placement.root(VICTIM), Some("debian"));
+        assert_eq!(placement.root(RULE_CHECK), Some("debian"));
+        assert_eq!(placement.root("scribe"), None, "scribe launches nothing");
+        assert_eq!(placement.roots(), ["alpine", "debian"]);
+    }
+
+    #[test]
+    fn an_override_moves_only_the_strata_it_names() {
+        let placement =
+            Placement::parse(Some("forensics=debian, hunter=alpine")).expect("override parses");
+        assert_eq!(placement.root("forensics"), Some("debian"));
+        assert_eq!(placement.root("hunter"), Some("alpine"));
+        assert_eq!(
+            placement.root(VICTIM),
+            Some("debian"),
+            "unnamed strata keep their root"
+        );
+        let blank = Placement::parse(Some("  ")).expect("a blank override is no override");
+        assert_eq!(blank, Placement::parse(None).expect("defaults"));
+        let single = Placement::parse(Some("forensics=debian")).expect("one stratum");
+        assert_eq!(single.roots(), ["debian"], "every stratum on one root");
+    }
+
+    #[test]
+    fn a_bad_override_is_refused() {
+        for (spec, why) in [
+            ("scribe=alpine", "scribe runs no commands"),
+            ("forensics", "no root"),
+            ("forensics=", "empty root"),
+            ("forensics=Alpine", "not a plain root name"),
+            ("forensics=../alpine", "not a plain root name"),
+            ("forensics=alpine,forensics=debian", "named twice"),
+        ] {
+            assert!(Placement::parse(Some(spec)).is_err(), "{spec}: {why}");
+        }
     }
 }

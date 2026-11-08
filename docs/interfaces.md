@@ -45,7 +45,7 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 | `enroll` | TUI (admin) | `ok` or `error` |
 | `revoke` | TUI (admin) | Body is `Signed<Revocation>` under `cleanroom/v1/revoke`. `ok`, or `error` when the signer is not an enrolled admin, the key is not enrolled, or it is the last admin. A later `enroll` of the same key reinstates it |
 | `detonate` | TUI | `ok`; scenario progress arrives as bus events, then the daemon publishes `investigate`. Scenario names: `ransomware` (exfil/persistence are stretch) |
-| `tamper` | TUI (demo opener) | `ok`. `root` names an admitted root; the demo uses `debian` |
+| `tamper` | TUI (demo opener) | `ok`. `root` names a root with a lock (`debian`, `alpine`); the demo uses `debian` |
 | `admit` | TUI / CLI | `admitted` or `admit_rejected` (names the layer, expected and actual digest) |
 | `verify_log` | TUI | `log_verified { entries, first_break }` |
 | `reset` | TUI / CLI | `ok` |
@@ -69,12 +69,15 @@ The TUI renders state from these events alone; it never reads the agents' files.
 
 | Stratum | Root | Mounts | Network | Notes |
 | --- | --- | --- | --- | --- |
-| `hunter` | Debian root | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | logs, YARA |
-| `forensics` | Debian root + Nix tools | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
+| `hunter` | `debian` (Debian bookworm) | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | logs, YARA |
+| `forensics` | `alpine` (Alpine 3.21, busybox) + Nix tools | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
 | `scribe` | minimal | incident record `append_only` (through the daemon) | none | no shell tools |
 | `containment` | none | none | none | proposals only; commander must approve |
-| `acme-fs` | Debian root | company share `read_write` | none | victim; the scenario runs here |
+| `acme-fs` | `debian` | company share `read_write` | none | victim; the scenario runs here |
+| `rule-check` | `debian` + `yara` | clean seed, evidence and the candidate rule `read_only` | none | checks a submitted YARA rule |
 | model router | host process | none | egress to the model endpoint only | the only process with network |
+
+Each launch uses the stratum's root from the table (re-checking its tree digest) and admits it on first use. `CLEANROOM_ROOTS=stratum=root[,stratum=root...]` overrides the table for `hunter`, `forensics`, `acme-fs` and `rule-check`; cleanroomd refuses to start if a named root has no lock.
 
 ## Incident record and scope
 
