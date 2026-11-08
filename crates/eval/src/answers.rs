@@ -154,6 +154,7 @@ mod tests {
             ("logpoison", Intent::EvidenceWipe),
             ("credexfil", Intent::CredentialExfil),
             ("stealth", Intent::EvidenceWipe),
+            ("visual", Intent::EvidenceWipe),
             ("benign", Intent::None),
         ] {
             let key = load(repo(), variant).expect("answer key");

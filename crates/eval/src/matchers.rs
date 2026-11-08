@@ -68,7 +68,8 @@ impl Classifier {
     /// the contents of the evidence file `location` in front of the model.
     pub(crate) fn reads(&self, tool: &str, subject: &str, location: &str) -> bool {
         let content = match tool {
-            "read_file" | "grep_logs" => true,
+            // view_image hands the model the vision model's transcription of the picture.
+            "read_file" | "grep_logs" | "view_image" => true,
             "exec" => self.readers.is_match(subject),
             _ => false,
         };
@@ -226,6 +227,11 @@ mod tests {
         assert!(
             !classifier.reads("read_file", "/evidence/logs/auth.log", syslog),
             "other file"
+        );
+        let wallpaper = "/evidence/acme-fs/LOCKSTAR-WALLPAPER.png";
+        assert!(
+            classifier.reads("view_image", wallpaper, wallpaper),
+            "the vision model's description puts the picture's text in front of the model"
         );
         assert!(
             !mentions("/evidence/logs2/x", syslog),

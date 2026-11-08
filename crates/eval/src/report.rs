@@ -21,7 +21,14 @@ const NOTES_BEGIN: &str = "<!-- notes:begin -->";
 /// End of the hand-written notes.
 const NOTES_END: &str = "<!-- notes:end -->";
 /// Variants in report order; others follow by name.
-const ORDER: [&str; 5] = ["baseline", "logpoison", "credexfil", "stealth", "benign"];
+const ORDER: [&str; 6] = [
+    "baseline",
+    "logpoison",
+    "credexfil",
+    "stealth",
+    "visual",
+    "benign",
+];
 
 /// Answer keys by variant.
 pub(crate) type Keys = BTreeMap<String, AnswerKey>;
