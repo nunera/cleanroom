@@ -95,7 +95,9 @@ impl Records {
     /// Create or update one scope record. Returns the record to publish and a result line.
     ///
     /// # Errors
-    /// Returns a message for the model when a new record has no name.
+    /// Returns a message for the model when a new record has no name or no evidence. A new
+    /// asset needs evidence so Scribe updates the known assets instead of inventing look-alike
+    /// ids; the message lists the known ids.
     pub(crate) fn apply_scope(
         &mut self,
         mut update: ScopeUpdate,
@@ -104,6 +106,18 @@ impl Records {
         let record = if let Some(record) = self.scopes.get_mut(&update.asset_id) {
             record
         } else {
+            if update.evidence.is_empty() {
+                let known: Vec<&str> = self.scopes.keys().map(String::as_str).collect();
+                return Err(format!(
+                    "scope record {} does not exist; known assets: {}. Update a known asset by its asset_id, or add a new asset only with evidence that shows it",
+                    update.asset_id,
+                    if known.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            }
             let Some(name) = update.name.take() else {
                 return Err(format!(
                     "scope record {} does not exist yet: include name",
@@ -470,5 +484,87 @@ const fn status_name(status: IncidentStatus) -> &'static str {
         IncidentStatus::Eradicated => "eradicated",
         IncidentStatus::Recovered => "recovered",
         IncidentStatus::Closed => "closed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    const AT: &str = "2026-11-08T04:48:01Z";
+
+    fn update(args: &serde_json::Value) -> ScopeUpdate {
+        serde_json::from_value(args.clone()).expect("well-formed update_scope arguments")
+    }
+
+    /// The daemon's baseline: the organization's known asset, every flag no.
+    fn known_payroll() -> Records {
+        let mut payroll = new_scope("payroll".into(), "Payroll export".into(), AT);
+        payroll.flags = ScopeFlags {
+            locked: Tri::No,
+            exfiltrated: Tri::No,
+            accessed: Tri::No,
+            destroyed: Tri::No,
+            modified: Tri::No,
+        };
+        payroll.updated_by = Principal::System;
+        Records::with_scopes(BTreeMap::from([("payroll".to_owned(), payroll)]))
+    }
+
+    /// A live run created `payroll-2026q3` next to the real `payroll` with no evidence; the
+    /// scope table then showed the same data twice with contradicting flags.
+    #[test]
+    fn a_new_asset_needs_evidence_and_the_error_names_the_known_ones() {
+        let mut records = known_payroll();
+
+        let reason = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll-2026q3", "name": "Payroll data", "locked": "unknown"})),
+                AT,
+            )
+            .expect_err("an asset no evidence shows is refused");
+
+        assert!(
+            reason.contains("payroll"),
+            "names the known asset id: {reason}"
+        );
+        assert!(
+            !records.view().contains("payroll-2026q3"),
+            "the refused asset is not recorded"
+        );
+        assert_eq!(records.scope_updates(), 0, "a refusal is not an update");
+    }
+
+    #[test]
+    fn a_new_asset_with_evidence_is_recorded() {
+        let mut records = known_payroll();
+
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "backup-tapes", "name": "Backup tapes", "locked": "yes", "evidence": ["/evidence/logs/syslog:9"]})),
+                AT,
+            )
+            .expect("evidence shows a new asset");
+
+        assert!(
+            records.view().contains("backup-tapes"),
+            "the new asset is recorded"
+        );
+    }
+
+    #[test]
+    fn a_known_asset_updates_without_new_evidence() {
+        let mut records = known_payroll();
+
+        let (record, _) = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "accessed": "unknown"})),
+                AT,
+            )
+            .expect("known assets keep updating as before");
+
+        assert_eq!(record.flags.accessed, Tri::Unknown, "the flag changed");
     }
 }

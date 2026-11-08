@@ -408,7 +408,8 @@ async fn keep_record(
 ) -> Desk {
     let mut desk = Desk::new(Arc::clone(&case), None);
     desk.records = Records::with_scopes(assets);
-    scribe.converse(&mut desk, opening_task(&case)).await;
+    let task = opening_task(&desk);
+    scribe.converse(&mut desk, task).await;
     while let Some(first) = notes.recv().await {
         let mut batch = vec![first];
         while batch.len() < SCRIBE_BATCH
@@ -463,13 +464,14 @@ fn investigator_task(case: &Case, guardrails: bool, max_steps: u32) -> String {
     }
 }
 
-/// Scribe's first task.
-fn opening_task(case: &Case) -> String {
+/// Scribe's first task, with the known records so it updates those assets from the start.
+fn opening_task(desk: &Desk) -> String {
     format!(
-        "Incident {} was just declared by {}.\nBrief: {}\n\nOpen the incident record now with update_incident (title, severity, category, summary). Hunter and Forensics are investigating; their findings will follow.",
-        case.incident_id,
-        declarer(&case.declared_by),
-        case.brief
+        "Incident {} was just declared by {}.\nBrief: {}\n\nCurrent state:\n{}\nOpen the incident record now with update_incident (title, severity, category, summary). Hunter and Forensics are investigating; their findings will follow.",
+        desk.case.incident_id,
+        declarer(&desk.case.declared_by),
+        desk.case.brief,
+        desk.records.view()
     )
 }
 
