@@ -48,6 +48,8 @@ pub(crate) enum Shape {
     Conversation,
     /// Writing a detection rule for the OS to check and deploy.
     DetectionRule,
+    /// Reading an image: the vision model transcribed and described it.
+    ImageReading,
 }
 
 /// Who could have written what the step read.
@@ -84,6 +86,7 @@ pub(crate) const fn shape(tool: Tool, output_chars: usize) -> Shape {
         Tool::GetSituation => Shape::Briefing,
         Tool::AskAgent | Tool::Reply => Shape::Conversation,
         Tool::SubmitRule => Shape::DetectionRule,
+        Tool::ViewImage => Shape::ImageReading,
     }
 }
 
@@ -91,7 +94,12 @@ pub(crate) const fn shape(tool: Tool, output_chars: usize) -> Shape {
 pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
     let ours = subject == RULES_DIR || subject.starts_with(&format!("{RULES_DIR}/"));
     match tool {
-        Tool::ReadFile | Tool::GrepLogs | Tool::ListFiles | Tool::HashFile | Tool::YaraScan
+        Tool::ReadFile
+        | Tool::GrepLogs
+        | Tool::ListFiles
+        | Tool::HashFile
+        | Tool::YaraScan
+        | Tool::ViewImage
             if ours =>
         {
             Provenance::Cleanroom
@@ -101,6 +109,7 @@ pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
         | Tool::ListFiles
         | Tool::HashFile
         | Tool::YaraScan
+        | Tool::ViewImage
         | Tool::Exec
         | Tool::PageIn => Provenance::AttackerWritable,
         Tool::RequestAdmission
@@ -253,6 +262,11 @@ mod tests {
         );
         assert_eq!(shape(Tool::AskAgent, 0), Shape::Conversation);
         assert_eq!(shape(Tool::Reply, 0), Shape::Conversation);
+        assert_eq!(
+            shape(Tool::ViewImage, 20_000),
+            Shape::ImageReading,
+            "an image the vision model described, however long the description"
+        );
     }
 
     #[test]
@@ -271,6 +285,11 @@ mod tests {
             Provenance::Cleanroom
         );
         assert_eq!(provenance(Tool::ReportFinding, ""), Provenance::AgentClaim);
+        assert_eq!(
+            provenance(Tool::ViewImage, "/evidence/acme-fs/LOCKSTAR-WALLPAPER.png"),
+            Provenance::AttackerWritable,
+            "the attacker drew the picture"
+        );
     }
 
     /// Never train on an action the kernel had to block, on a context the safety model

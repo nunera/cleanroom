@@ -380,6 +380,7 @@ impl Voice {
             | Action::Scope(_)
             | Action::Incident(_)
             | Action::Rule(_)
+            | Action::View(_)
             | Action::PageIn(_)
             | Action::PageOut(_) => "error: the Lead has no such tool".to_owned(),
         }

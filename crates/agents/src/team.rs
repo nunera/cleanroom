@@ -680,13 +680,14 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         ""
     };
     format!(
-        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}{pager}; {}",
+        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}; images (view_image) go to hosted {}{pager}; {}",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),
         router.egress(),
         shared.max_steps,
         router.budgets().summary(),
+        router.vision_model(),
         models(router)
     )
 }

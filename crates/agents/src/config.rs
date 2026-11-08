@@ -22,6 +22,8 @@ const ULTRA: &str = "nvidia/nemotron-3-ultra-550b-a55b";
 const BOLT: &str = "nvidia/nemotron-3.5-bolt-e4b";
 /// Safety layer 1.
 const SAFETY_GUARD: &str = "nvidia/llama-3.1-nemotron-safety-guard-8b-v3";
+/// Image evidence (`view_image`): the only vision model our key reaches.
+const SUPER_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 /// nixpkgs pin for tool requests: the `rev` in this repository's `flake.lock`.
 const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/c56a87d8e41ce69bd2af57eb35dcc117a9dfca33";
 
@@ -77,6 +79,8 @@ pub(crate) struct Models {
     pub(crate) containment: String,
     /// Safety layer 1.
     pub(crate) safety: String,
+    /// Describes image evidence; hosted only.
+    pub(crate) vision: String,
 }
 
 impl Models {
@@ -153,6 +157,7 @@ impl Settings {
             scribe: env.model("CLEANROOM_MODEL_SCRIBE", ULTRA),
             containment: env.model("CLEANROOM_MODEL_CONTAINMENT", LIGHTNING),
             safety: env.model("CLEANROOM_MODEL_SAFETY", SAFETY_GUARD),
+            vision: env.model("CLEANROOM_MODEL_VISION", SUPER_VL),
         };
         let local = env.get("CLEANROOM_LOCAL_BASE_URL").map(|url| LocalRoute {
             endpoint: Endpoint {

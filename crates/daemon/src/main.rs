@@ -12,6 +12,7 @@
 )]
 
 mod bus;
+mod citations;
 mod client;
 mod daemon;
 mod keys;
