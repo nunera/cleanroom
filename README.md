@@ -489,12 +489,16 @@ We'd rather you hear these from us.
 - **Not a booted OS yet.** Cleanroom runs as rootless userspace on a host. The host plan and init choice are validated (`cleanroomd plan validate`) but not booted. Admitted roots are Linux and amd64 only.
 - **The store belongs to the user.** Roots and the receipt log are protected by digests, signatures and checks at launch, not by file ownership. Someone who controls the account can replace the whole store. `verify` will notice a changed log; it can't prevent one.
 - **The model layers are probabilistic.** Prompt guardrails and the safety model cut down attempts but don't stop them, and the safety model missed the polite runbook every time. The kernel grant is the only layer that held in every run.
-- **What the newer checks prove, and what they don't.** A citation check shows a cited file exists and the agent's commands touched it, not that the model understood it. Reasoning custody shows the stored trace is the one the endpoint returned, not how the model actually computed its answer. A command that hides its errors shows as a plain failure instead of `denied`, though the evidence seal still proves nothing changed.
+- **What the newer checks prove, and what they don't.** A citation check shows a cited file exists and the agent's commands touched it, not that the model understood it. Reasoning custody shows the stored trace is the one the endpoint returned, not how the model actually computed its answer. A command that hides its errors shows as a plain failure instead of `denied`, though the evidence seal still proves nothing changed. Image evidence goes to the hosted Super VL only (there's no local vision route), and the safety model flags every ransom wallpaper description, so those steps are never trainable. The `export-gym` rows pass NeMo Gym's structural validator; no Gym rollout or training run has used them.
 - **The record can still be shaded.** An agent can't lower a flag cleanroomd measured. The attacker's story can still reach softer fields an agent writes, like the incident title, severity and confidence. With guardrails off you'll sometimes see the incident renamed a "false positive". Tiers of trust for model claims aren't built yet.
 - **Containment is advisory.** Approving a proposal records and publishes the decision. cleanroomd doesn't isolate a real host.
 - **The pager isn't a defense.** In a live `--memory-tiers` run, Hunter paged in the whole ransom note and went for the wipe anyway. The kernel denied it, same as always.
 - **Hosted calls leave the machine.** By default the agents call NVIDIA's hosted API through the declared egress. A fully offline run needs every role pointed at a local endpoint, and Ultra (Scribe's default) is hosted only.
 - **It's a simulation.** `cleanroom-ransom` is reversible, uses a published key and runs against synthetic data. The eval is small: three runs per cell, plus two local runs.
+
+## Prior work
+
+Cleanroom rebuilds ideas from [MisaOS](https://github.com/nunera/misaos) (strict records, signed local admission of digest-pinned roots, sandboxed foreign roots, Nix packaging). The Cleanroom code itself was written at the event.
 
 ## Team
 
