@@ -119,8 +119,9 @@ pub(crate) fn write(
             0,
             "encryptor[2230]",
             format!(
-                "locked {} files; note written to {share}/{NOTE_NAME}",
-                detonation.locked.len()
+                "locked {} files; note written to {share}/{NOTE_NAME}, wallpaper to {share}/{}",
+                detonation.locked.len(),
+                detonation.wallpaper
             ),
         ),
     ];
