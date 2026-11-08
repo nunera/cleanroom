@@ -34,6 +34,11 @@ use crate::strata::MOUNT_POINTS;
 /// Default manifest media type when a manifest omits it.
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
+/// skopeo's trust policy: accept unsigned images, the containers-common default. Trust comes
+/// from the lock instead: the fetch names the manifest by digest, and admission hashes the
+/// manifest and every blob before anything is unpacked.
+const CONTAINERS_POLICY: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
+
 /// A root lock: which image, pinned to which platform manifest.
 #[derive(Debug, Clone, Deserialize)]
 struct Lock {
@@ -246,14 +251,25 @@ impl Roots {
         );
         let destination = format!("oci:{}:{name}", oci.display());
         tracing::info!(%source, "fetching root {name} with skopeo");
+        self.copy(&source, &destination).await
+    }
+
+    /// `skopeo copy` one image, keeping its digests, under cleanroomd's own trust policy.
+    ///
+    /// # Errors
+    /// Fails if the policy cannot be written, skopeo cannot run, or the copy fails.
+    async fn copy(&self, source: &str, destination: &str) -> Result<()> {
+        let policy = self.layout.containers_policy();
+        if let Some(store) = policy.parent() {
+            fs::create_dir_all(store)
+                .with_context(|| format!("cannot create {}", store.display()))?;
+        }
+        fs::write(&policy, CONTAINERS_POLICY)
+            .with_context(|| format!("cannot write {}", policy.display()))?;
         let output = Command::new("skopeo")
-            .args([
-                "copy",
-                "--quiet",
-                "--preserve-digests",
-                &source,
-                &destination,
-            ])
+            .arg("--policy")
+            .arg(&policy)
+            .args(["copy", "--quiet", "--preserve-digests", source, destination])
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output()
@@ -605,4 +621,75 @@ fn last_line(stderr: &[u8]) -> String {
         .unwrap_or("no error output")
         .trim()
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    /// A fresh directory under the system temp directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let dir = std::env::temp_dir()
+                .join(format!("cleanroomd-{name}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&dir).expect("temp dir is creatable");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            remove_tree(&self.0).expect("temp dir is removable");
+        }
+    }
+
+    /// Run a setup tool and insist it succeeds.
+    fn run(program: &str, args: &[&str]) {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run {program} (use nix develop): {error}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A fresh machine has no containers policy.json; skopeo refuses every copy without one.
+    /// The daemon must bring its own, so the first admission works out of the box.
+    #[tokio::test]
+    async fn copies_without_a_host_containers_policy() {
+        let scratch = Scratch::new("copy");
+        let source = scratch.0.join("source");
+        let source = source.to_str().expect("temp path is UTF-8");
+        run("umoci", &["init", "--layout", source]);
+        run("umoci", &["new", "--image", &format!("{source}:empty")]);
+        let state = scratch.0.join("state");
+        let roots = Roots::new(Layout {
+            socket: scratch.0.join("cleanroomd.sock"),
+            repo: scratch.0.clone(),
+            state: state.clone(),
+        });
+        let copied = state.join("store/oci");
+        fs::create_dir_all(&copied).expect("store dir is creatable");
+        let destination = format!("oci:{}:empty", copied.display());
+
+        roots
+            .copy(&format!("oci:{source}:empty"), &destination)
+            .await
+            .expect("skopeo copies with the daemon's own trust policy");
+
+        assert!(
+            copied.join("index.json").is_file(),
+            "the copy wrote a layout"
+        );
+    }
 }
