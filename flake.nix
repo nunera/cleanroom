@@ -11,8 +11,111 @@
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # What the Rust build and its tests read: the workspace, the policy and plans compiled in or
+      # checked by tests, and the scenario, root locks and nixpkgs pin cleanroomd ships with.
+      src =
+        with nixpkgs.lib.fileset;
+        toSource {
+          root = ./.;
+          fileset = unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./crates
+            ./policy
+            ./plans
+            ./scenario
+            ./roots
+            ./flake.lock
+          ];
+        };
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
     in
     {
+      packages = forAllSystems (
+        pkgs:
+        let
+          # The canary ransomware runs inside the admitted Debian root, where no Nix store
+          # libraries exist, so it is linked statically.
+          ransom = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+            pname = "cleanroom-ransom";
+            inherit version src;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "cleanroom-ransom"
+            ];
+            doCheck = false;
+          };
+          cleanroom = pkgs.rustPlatform.buildRustPackage {
+            pname = "cleanroom";
+            inherit version src;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "cleanroom-daemon"
+              "-p"
+              "cleanroom-agents"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "cleanroom-daemon"
+              "-p"
+              "cleanroom-agents"
+              "-p"
+              "cleanroom-proto"
+            ];
+            # roots::tests copies a local OCI image with skopeo and umoci; the router test builds
+            # an HTTPS client, which needs a CA bundle the build sandbox doesn't have.
+            nativeCheckInputs = with pkgs; [
+              cacert
+              skopeo
+              umoci
+            ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            # cleanroomd finds its repository as the nearest ancestor of its binary holding
+            # scenario/ and roots/, so the package carries them next to bin/.
+            postInstall = ''
+              cp -r scenario roots plans policy flake.lock $out/
+              wrapProgram $out/bin/cleanroomd \
+                --prefix PATH : ${
+                  pkgs.lib.makeBinPath (
+                    with pkgs;
+                    [
+                      bubblewrap
+                      skopeo
+                      umoci
+                    ]
+                  )
+                } \
+                --set-default CLEANROOM_RANSOM_BIN ${ransom}/bin/cleanroom-ransom
+              wrapProgram $out/bin/cleanroom-agents \
+                --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            '';
+            meta = {
+              description = "Cleanroom OS core (cleanroomd) and the Nemotron agent team (cleanroom-agents)";
+              license = pkgs.lib.licenses.asl20;
+              mainProgram = "cleanroomd";
+            };
+          };
+        in
+        {
+          inherit cleanroom ransom;
+          default = cleanroom;
+        }
+      );
+
+      apps = forAllSystems (pkgs: {
+        cleanroom = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.cleanroom}/bin/cleanroomd";
+        };
+        agents = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.cleanroom}/bin/cleanroom-agents";
+        };
+        default = self.apps.${pkgs.stdenv.hostPlatform.system}.cleanroom;
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
