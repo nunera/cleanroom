@@ -1,6 +1,7 @@
 //! The daemon's shared state and its operations: every `request` op, checked publishes, and the
 //! bus messages cleanroomd signs itself.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::spawn_blocking;
 
 use crate::bus::{Bus, Outbox, Subject};
+use crate::citations;
 use crate::layout::Layout;
 use crate::members::Members;
 use crate::reasoning;
@@ -139,6 +141,9 @@ pub(crate) struct Daemon {
     /// The incident agents may write records for: declared by a detonation or a human's
     /// `investigate`, cleared by a reset.
     open_incident: Mutex<Option<String>>,
+    /// Every command cleanroomd ran for each investigator in this incident, for citation checks;
+    /// cleared by a reset.
+    commands: Mutex<HashMap<Role, Vec<String>>>,
 }
 
 impl Daemon {
@@ -172,6 +177,7 @@ impl Daemon {
             scenario: Scenario::new(assets),
             members: Mutex::new(members),
             open_incident: Mutex::default(),
+            commands: Mutex::default(),
             key,
         });
         tracing::info!(
@@ -255,7 +261,54 @@ impl Daemon {
         if let BusBody::Investigate { incident_id, .. } = body {
             *lock(&self.open_incident) = Some(incident_id.clone());
         }
+        let cites = match (&signed.body.from, &signed.body.body) {
+            (Principal::Agent { role }, BusBody::Finding { evidence, .. }) => {
+                Some((*role, evidence.clone()))
+            }
+            _ => None,
+        };
         self.bus.fan_out(signed);
+        if let Some((role, evidence)) = cites {
+            self.check_citations(role, &evidence);
+        }
+    }
+
+    /// Check every evidence path `role`'s finding cites: it must exist in the evidence, and a
+    /// command cleanroomd ran for `role` must have touched it or a directory above it. The result
+    /// is a status line; the finding is already on the bus either way.
+    fn check_citations(&self, role: Role, evidence: &[String]) {
+        let commands = lock(&self.commands).get(&role).cloned().unwrap_or_default();
+        let checked: Vec<citations::Citation> = citations::cited_paths(evidence)
+            .into_iter()
+            .map(|path| citations::Citation {
+                exists: self.evidence_exists(&path),
+                touched: citations::touched(&path, &commands),
+                path,
+            })
+            .collect();
+        if let Some(line) = citations::status(&describe(&Principal::Agent { role }), &checked) {
+            self.status(line);
+        }
+    }
+
+    /// Whether the investigator's path `guest` (under `/evidence`) exists on the host. A path
+    /// with `..` never does, so a citation cannot point outside the evidence.
+    fn evidence_exists(&self, guest: &str) -> bool {
+        if guest.split('/').any(|part| part == "..") {
+            return false;
+        }
+        [
+            (strata::EVIDENCE_SHARE, self.layout.share()),
+            (strata::EVIDENCE_DROP, self.layout.dropbox()),
+            (strata::EVIDENCE_LOGS, self.layout.logs()),
+        ]
+        .into_iter()
+        .any(|(mount, host)| {
+            guest.strip_prefix(mount).is_some_and(|rest| {
+                (rest.is_empty() || rest.starts_with('/'))
+                    && host.join(rest.trim_start_matches('/')).exists()
+            })
+        })
     }
 
     /// Answer one request.
@@ -469,6 +522,10 @@ impl Daemon {
             timeout: Duration::from_millis(request.timeout_ms).min(strata::MAX_TIMEOUT),
         };
         let captured = strata::run(&launch).await?;
+        lock(&self.commands)
+            .entry(role)
+            .or_default()
+            .push(request.argv.join(" "));
         let outcome = strata::classify(strata::stratum_of(role), &captured);
         let evidence = self
             .recheck_evidence(&describe(&actor), &request.argv.join(" "))
@@ -1178,6 +1235,7 @@ impl Daemon {
         self.scenario.set_baseline(baseline);
         self.scenario.set_measured(&[]);
         *lock(&self.open_incident) = None;
+        lock(&self.commands).clear();
         self.grants.reset();
         self.bus.clear_incident();
         *incident = None;
