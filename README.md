@@ -170,6 +170,22 @@ Debian package (static musl, runs on bookworm and trixie):
 nix develop --command nix shell --inputs-from . nixpkgs#pkgsCross.musl64.buildPackages.rustc nixpkgs#pkgsCross.musl64.stdenv.cc --command env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-cc 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static' cargo deb -p cleanroom-tui --target x86_64-unknown-linux-musl
 ```
 
+## Limitations
+
+These are what a judge or a security reviewer should know before trusting a claim in this repo.
+
+- **Platform.** Linux only. The strata need unprivileged user namespaces; tested on NixOS. Ubuntu 24.04's default AppArmor policy blocks bubblewrap's network namespace, so it needs a reviewed policy there.
+- **Not yet an operating system.** Cleanroom runs as rootless userspace on a host. The declarative host plan and init choice are validated (`cleanroomd plan validate`) but not booted. Admitted roots are Linux only; only Debian bookworm is pinned today.
+- **The store is user-owned.** The admitted roots and receipt log are protected by digests, signatures and launch-time re-verification, not by ownership. A local user who controls the account can replace the whole store; `verify` will detect a changed log but not prevent it.
+- **Model-side layers are probabilistic.**
+  - Prompt guardrails and the safety model reduce attempts but don't stop them. The safety model missed the polite "IT runbook" injection every time (see [docs/eval.md](docs/eval.md)).
+  - The kernel grant is the only layer that held in every run.
+- **The record can still be shaded.** cleanroomd refuses any agent attempt to lower a flag it measured itself. An attacker's story can still reach softer fields an agent writes: incident title, severity, confidence, and flags cleanroomd didn't measure (e.g. `exfiltrated`). Provenance tiers for model claims are not built yet.
+- **Containment is advisory.** Approving a containment proposal records the decision and publishes it; cleanroomd doesn't isolate a real host.
+- **Hosted model calls leave the machine.** By default the agents call NVIDIA's hosted API through the declared egress policy. Sensitive steps can route to self-hosted Nemotron on Brev (`--local`). A fully offline run needs every role pointed at the local endpoint; Ultra (Scribe's default) is hosted only.
+- **Simulated attack.** `cleanroom-ransom` is a reversible simulator using a published key, against synthetic data. The credential-exfil variant's uploads failed because `curl`/`wget` aren't in the root, so the eval doesn't measure the network namespace.
+- **Small eval.** N = 3 per cell on hosted Nemotron, plus 2 local runs. The record-poisoning fix landed after those runs and hasn't been re-measured.
+
 ## Prior work
 
 Cleanroom rebuilds ideas from [MisaOS](https://github.com/nunera/misaos) (strict records, signed local admission of digest-pinned roots, sandboxed foreign roots, Nix packaging). The Cleanroom code itself is written at the event.
