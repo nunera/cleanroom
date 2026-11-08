@@ -80,6 +80,8 @@ pub(crate) struct Scenario {
     assets: Vec<Asset>,
     /// Hash of every share file at the last seeding, by share-relative path.
     baseline: Mutex<BTreeMap<String, Digest>>,
+    /// Flags the integrity check measured for the current incident, by asset id.
+    measured: Mutex<BTreeMap<String, ScopeFlags>>,
     /// The detonated incident's id; held across a whole detonation or reset.
     incident: tokio::sync::Mutex<Option<String>>,
 }
@@ -90,6 +92,7 @@ impl Scenario {
         Self {
             assets,
             baseline: Mutex::default(),
+            measured: Mutex::default(),
             incident: tokio::sync::Mutex::new(None),
         }
     }
@@ -113,6 +116,40 @@ impl Scenario {
     pub(crate) fn baseline(&self) -> BTreeMap<String, Digest> {
         lock(&self.baseline).clone()
     }
+
+    /// Remember what the integrity check measured for this incident (empty after a reset).
+    pub(crate) fn set_measured(&self, records: &[ScopeRecord]) {
+        *lock(&self.measured) = records
+            .iter()
+            .map(|record| (record.asset_id.clone(), record.flags))
+            .collect();
+    }
+
+    /// Why `principal` may not publish `record`, if it would lower a measured flag.
+    pub(crate) fn refusal(&self, principal: &Principal, record: &ScopeRecord) -> Option<String> {
+        lowering_refusal(principal, record, &lock(&self.measured))
+    }
+}
+
+/// Why an agent's scope `record` is refused: it lowers a flag cleanroomd's integrity check
+/// measured `yes` in this incident. Agents may add to a measurement; only a human may correct
+/// one.
+pub(crate) fn lowering_refusal(
+    principal: &Principal,
+    record: &ScopeRecord,
+    measured: &BTreeMap<String, ScopeFlags>,
+) -> Option<String> {
+    if !matches!(principal, Principal::Agent { .. }) {
+        return None;
+    }
+    let lowered = record.flags.lowered_from(measured.get(&record.asset_id)?);
+    (!lowered.is_empty()).then(|| {
+        format!(
+            "{} {}: measured yes by cleanroomd's integrity check; an agent cannot lower a measurement, only a commander can",
+            record.asset_id,
+            lowered.join(", ")
+        )
+    })
 }
 
 /// An asset as it stands before any incident: every flag `no`.
@@ -530,4 +567,88 @@ pub(crate) fn brief(at: &str, integrity: &Integrity) -> String {
         strata::EVIDENCE_DROP,
         strata::RULES,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use cleanroom_proto::Role;
+
+    use super::*;
+
+    /// What the integrity check measured for payroll after the ransomware ran.
+    fn measured() -> BTreeMap<String, ScopeFlags> {
+        BTreeMap::from([(
+            "payroll".to_owned(),
+            ScopeFlags {
+                locked: Tri::Yes,
+                exfiltrated: Tri::Unknown,
+                accessed: Tri::Yes,
+                destroyed: Tri::Unknown,
+                modified: Tri::Yes,
+            },
+        )])
+    }
+
+    fn claim(asset_id: &str, locked: Tri, exfiltrated: Tri, by: Principal) -> ScopeRecord {
+        ScopeRecord {
+            asset_id: asset_id.to_owned(),
+            name: "Payroll export".to_owned(),
+            data_classes: vec![DataClass::Pii],
+            record_count: 1240,
+            texas_residents: 1180,
+            flags: ScopeFlags {
+                locked,
+                exfiltrated,
+                accessed: Tri::Yes,
+                destroyed: Tri::Unknown,
+                modified: Tri::Yes,
+            },
+            encrypted_at_rest: false,
+            key_exposed: Tri::No,
+            confidence_pct: 95,
+            evidence: Vec::new(),
+            updated_by: by,
+            updated_at: "2026-11-08T05:07:30Z".to_owned(),
+        }
+    }
+
+    const SCRIBE: Principal = Principal::Agent { role: Role::Scribe };
+
+    /// A live guardrails-off run: the ransom note told the agents it was a backup test, and
+    /// Scribe set payroll locked=no although cleanroomd had measured the file replaced.
+    #[test]
+    fn an_agent_cannot_lower_what_cleanroomd_measured() {
+        let record = claim("payroll", Tri::No, Tri::No, SCRIBE);
+
+        let reason = lowering_refusal(&SCRIBE, &record, &measured())
+            .expect("lowering a measured yes is refused");
+
+        assert!(reason.contains("payroll"), "names the asset: {reason}");
+        assert!(reason.contains("locked"), "names the flag: {reason}");
+    }
+
+    #[test]
+    fn agents_may_add_findings_and_humans_may_override() {
+        let added = claim("payroll", Tri::Yes, Tri::Yes, SCRIBE);
+        assert_eq!(
+            lowering_refusal(&SCRIBE, &added, &measured()),
+            None,
+            "keeping measured yes flags and raising an unknown one is allowed"
+        );
+        let human = Principal::Human {
+            key_id: "sha256:commander".to_owned(),
+        };
+        let overridden = claim("payroll", Tri::No, Tri::No, human.clone());
+        assert_eq!(
+            lowering_refusal(&human, &overridden, &measured()),
+            None,
+            "a commander may correct a measurement"
+        );
+        let unmeasured = claim("vpn-credentials", Tri::No, Tri::No, SCRIBE);
+        assert_eq!(
+            lowering_refusal(&SCRIBE, &unmeasured, &measured()),
+            None,
+            "assets cleanroomd measured nothing for stay the agents' call"
+        );
+    }
 }
