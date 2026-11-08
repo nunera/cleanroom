@@ -3,7 +3,7 @@
 use jiff::{SignedDuration, Timestamp};
 
 use crate::clocks::{self, ClockState, Regime, Urgency};
-use crate::state::{LogStatus, State};
+use crate::state::{Admission, LogStatus, State};
 
 /// The one thing the commander should do next, most pressing first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +14,11 @@ pub(crate) enum NextAction {
     LogBroken {
         /// First receipt that doesn't chain.
         first_break: u64,
+    },
+    /// The last admission was rejected; the clean copy should be admitted again.
+    Readmit {
+        /// The rejected root.
+        root: String,
     },
     /// Tool requests or proposals wait for a signature.
     Approvals {
@@ -41,15 +46,19 @@ pub(crate) enum NextAction {
 
 /// Pick the next action. `connected` is false only when a live link has dropped.
 ///
-/// Order: a dead link or broken log first (nothing else can be trusted), then approvals (agents
-/// are blocked on them), then clocks due within a day or overdue, then starting the agent team,
-/// then the soonest running clock.
+/// Order: a dead link or broken log first (nothing else can be trusted), then a rejected root
+/// (the toolkit isn't admitted until its clean copy is), then approvals (agents are blocked on
+/// them), then clocks due within a day or overdue, then starting the agent team, then the
+/// soonest running clock.
 pub(crate) fn next_action(state: &State, connected: bool, now: Timestamp) -> NextAction {
     if !connected {
         return NextAction::Reconnect;
     }
     if let LogStatus::Broken { first_break, .. } = state.log {
         return NextAction::LogBroken { first_break };
+    }
+    if let Some(Admission::Rejected { root, .. }) = &state.admission {
+        return NextAction::Readmit { root: root.clone() };
     }
     let waiting = state.waiting();
     if waiting > 0 {
@@ -93,9 +102,9 @@ fn soonest_clock(state: &State, now: Timestamp) -> Option<NextAction> {
 #[cfg(test)]
 mod tests {
     use cleanroom_proto::{
-        Audience, BusBody, BusMessage, DataClass, Envelope, Frame, IncidentRecord, IncidentStatus,
-        Principal, Role, ScopeFlags, ScopeRecord, Severity, Signed, ToolRequest, ToolSource, Tri,
-        Triggers, WIRE_VERSION,
+        Audience, BusBody, BusMessage, CoreResponse, DataClass, Envelope, Frame, IncidentRecord,
+        IncidentStatus, Principal, Role, ScopeFlags, ScopeRecord, Severity, Signed, ToolRequest,
+        ToolSource, Tri, Triggers, WIRE_VERSION,
     };
     use jiff::tz::TimeZone;
 
@@ -276,5 +285,43 @@ mod tests {
     fn a_dropped_link_outranks_everything() {
         let state = state_with(vec![tool_request()]);
         assert_eq!(next_action(&state, false, now()), NextAction::Reconnect);
+    }
+
+    #[test]
+    fn a_rejected_root_asks_for_a_clean_admission_until_one_succeeds() {
+        let response = |response| Envelope {
+            v: WIRE_VERSION,
+            frame: Frame::Response { id: 2, response },
+        };
+        let mut state = state_with(vec![tool_request()]);
+        state.apply(
+            response(CoreResponse::AdmitRejected {
+                root: "debian".into(),
+                layer: "sha256:aa".into(),
+                expected: "sha256:bb".into(),
+                actual: "sha256:cc".into(),
+            }),
+            None,
+            now(),
+        );
+        assert_eq!(
+            next_action(&state, true, now()),
+            NextAction::Readmit {
+                root: "debian".into()
+            },
+            "a tampered root outranks waiting approvals"
+        );
+        state.apply(
+            response(CoreResponse::Admitted {
+                root: "debian".into(),
+                manifest: "sha256:bb".into(),
+            }),
+            None,
+            now(),
+        );
+        assert_eq!(
+            next_action(&state, true, now()),
+            NextAction::Approvals { count: 1 }
+        );
     }
 }

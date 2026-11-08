@@ -99,7 +99,7 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 
 `cleanroom-tui` connects as the commander and renders only from bus events: incident header and legal notification clocks, scope of compromised data, live agent trace, approvals, timeline and comms.
 
-Keys: `d` detonate, `t` tamper then admit, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `?` help, `q` quit.
+Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `?` help, `q` quit.
 
 Flags: `--socket PATH`, `--record FILE` (save live events), `--replay FILE [--speed X]` (offline playback with a REPLAY badge; the demo fallback), `--tamper-root NAME` (default `debian`), `--scenario NAME` (default `ransomware`).
 

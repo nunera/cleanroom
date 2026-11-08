@@ -461,6 +461,12 @@ fn action_text(action: &NextAction, view: &View, tz: &TimeZone) -> (String, Colo
             ),
             BRIGHT_RED,
         ),
+        NextAction::Readmit { root } => (
+            format!(
+                "Tampered {root} root was rejected and never ran. Press A (Shift+A) to admit the clean copy."
+            ),
+            AMBER,
+        ),
         NextAction::Approvals { count } => {
             let noun = if *count == 1 { "approval" } else { "approvals" };
             (
@@ -962,6 +968,7 @@ fn render_keys(frame: &mut Frame<'_>, area: Rect, view: &View) {
     let full = [
         ("d", "Detonate"),
         ("t", "Tamper"),
+        ("A", "Admit"),
         ("a", "Approve"),
         ("x", "Deny"),
         ("↑↓", "Select"),
@@ -976,35 +983,38 @@ fn render_keys(frame: &mut Frame<'_>, area: Rect, view: &View) {
     let compact = [
         ("d", "Detonate"),
         ("t", "Tamper"),
+        ("A", "Admit"),
         ("a", "Approve"),
         ("x", "Deny"),
         ("g", "Guard"),
-        ("i", "Invest."),
+        ("i", "Invest"),
         ("v", "Verify"),
         ("r", "Reset"),
         ("c", "Chat"),
     ];
-    let [left, right] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(18)]).areas(area);
+    // Wide terminals get padded badges; narrow ones fall back to the compact set, with tighter
+    // badges on both sides so every action key still fits in 100 columns.
     let wide = Line::from(
         full.iter()
             .flat_map(|(key, label)| hint(key, label, 1))
             .collect::<Vec<_>>(),
     );
-    let line = if wide.width() <= usize::from(left.width) {
-        wide
+    let fits = wide.width() + 18 <= usize::from(area.width);
+    let (line, pad, fixed_width) = if fits {
+        (wide, 1, 18)
     } else {
-        Line::from(
-            compact
-                .iter()
-                .flat_map(|(key, label)| hint(key, label, 0))
-                .collect::<Vec<_>>(),
-        )
+        let compact = compact
+            .iter()
+            .flat_map(|(key, label)| hint(key, label, 0))
+            .collect::<Vec<_>>();
+        (Line::from(compact), 0, 14)
     };
+    let [left, right] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(fixed_width)]).areas(area);
     frame.render_widget(Paragraph::new(line), left);
     let fixed: Vec<Span<'static>> = [("?", "Help"), ("q", "Quit")]
         .iter()
-        .flat_map(|(key, label)| hint(key, label, 1))
+        .flat_map(|(key, label)| hint(key, label, pad))
         .collect();
     frame.render_widget(Paragraph::new(Line::from(fixed).right_aligned()), right);
 }
@@ -1039,7 +1049,8 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View)
     }
 }
 
-/// The tamper beat: a big red refusal naming the layer and both digests.
+/// The tamper beat: a big red refusal naming the layer and both digests, then a big green
+/// admission naming the manifest once the clean copy passes.
 fn render_admission(frame: &mut Frame<'_>, area: Rect, admission: &Admission) {
     let popup = area.centered(Constraint::Percentage(92), Constraint::Length(15));
     frame.render_widget(Clear, popup);
@@ -1069,11 +1080,18 @@ fn render_admission(frame: &mut Frame<'_>, area: Rect, admission: &Admission) {
         ),
         Admission::Admitted { root, manifest } => (
             "ADMITTED",
-            " ADMISSION OK · digests match the lock ",
+            " ADMISSION OK · clean root admitted ",
             Style::new().fg(Color::Black).bg(GREEN),
             vec![
                 detail("Root", root.clone(), Style::new().bold()),
-                detail("Manifest", manifest.clone(), Style::new()),
+                detail(
+                    "Manifest",
+                    manifest.clone(),
+                    Style::new().fg(Color::White).bg(Color::Black).bold(),
+                ),
+                Line::default(),
+                Line::from("Every layer matches its signed lock. Strata launch from this root.")
+                    .bold(),
             ],
         ),
     };
@@ -1137,6 +1155,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         (
             "t",
             "Tamper demo: flip a byte in a root, then try to admit it",
+        ),
+        (
+            "A",
+            "Shift+A: admit the root again; after a rejection the clean copy passes",
         ),
         (
             "a / x",
