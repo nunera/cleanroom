@@ -253,6 +253,12 @@ fn bwrap_args(launch: &Launch<'_>) -> Vec<OsString> {
     let home = if scratch { SCRATCH } else { "/tmp" };
     let mut args: Vec<OsString> = [
         "--unshare-all",
+        // `--unshare-all` only tries for a user namespace; require one so it can be locked:
+        // no nested user namespaces (uid 0 inside one is where most container escapes start),
+        // and no stratum at all if this bubblewrap cannot enforce that.
+        "--unshare-user",
+        "--disable-userns",
+        "--assert-userns-disabled",
         "--die-with-parent",
         "--new-session",
         "--clearenv",
@@ -399,6 +405,49 @@ mod tests {
             code: Some(code),
             stderr: stderr.to_owned(),
             ..Captured::default()
+        }
+    }
+
+    /// A live check found `unshare -U -r` working inside a stratum: a command steered by an
+    /// injection got uid 0 in a nested user namespace, the kernel surface most container escapes
+    /// go through. Every stratum must forbid it, and bubblewrap must refuse to start one it
+    /// cannot forbid it in.
+    #[test]
+    fn strata_cannot_create_nested_user_namespaces() {
+        let grant = Grant {
+            stratum: "hunter".to_owned(),
+            role: None,
+            root: "sha256:root".to_owned(),
+            mounts: Vec::new(),
+            network: Network::None,
+            tools: Vec::new(),
+        };
+        let argv = ["unshare".to_owned(), "-U".to_owned(), "-r".to_owned()];
+        let launch = Launch {
+            rootfs: Path::new("/nonexistent/rootfs"),
+            grant: &grant,
+            bins: &[],
+            argv: &argv,
+            timeout: Duration::from_secs(1),
+        };
+        let args: Vec<String> = bwrap_args(&launch)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let command = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("a -- separator");
+        for flag in [
+            "--unshare-user",
+            "--disable-userns",
+            "--assert-userns-disabled",
+        ] {
+            let at = args.iter().position(|arg| arg == flag);
+            assert!(
+                at.is_some_and(|at| at < command),
+                "{flag} must be a bubblewrap option: {args:?}"
+            );
         }
     }
 
