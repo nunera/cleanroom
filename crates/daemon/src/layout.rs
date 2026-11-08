@@ -1,10 +1,11 @@
 //! Where cleanroomd keeps its state, where it finds the repository's scenario and root locks,
 //! and where its socket lives.
 //!
-//! State (default `$XDG_STATE_HOME/cleanroom`): `store/oci` (OCI layout), `store/staging/<root>`
-//! (copies admission verifies), `store/roots/<root>/rootfs` (unpacked), `keys/` (daemon key,
-//! enrolled members), `run/acme-fs/{share,drop,logs}` (live victim), `run/scratch/<role>`,
-//! `run/bin` (binaries placed into strata) and `receipts.ndjson`.
+//! State (default `$XDG_STATE_HOME/cleanroom`): `store/oci` (OCI layout),
+//! `store/containers-policy.json` (skopeo's trust policy), `store/staging/<root>` (copies
+//! admission verifies), `store/roots/<root>/rootfs` (unpacked), `keys/` (daemon key, enrolled
+//! members), `run/acme-fs/{share,drop,logs}` (live victim), `run/scratch/<role>`, `run/bin`
+//! (binaries placed into strata) and `receipts.ndjson`.
 
 use std::env;
 use std::fs::{self, DirBuilder};
@@ -66,6 +67,12 @@ impl Layout {
     /// OCI image layout that skopeo fills.
     pub(crate) fn oci(&self) -> PathBuf {
         self.state.join("store/oci")
+    }
+
+    /// The containers trust policy cleanroomd hands skopeo, so fetching never depends on the
+    /// host's `policy.json`.
+    pub(crate) fn containers_policy(&self) -> PathBuf {
+        self.state.join("store/containers-policy.json")
     }
 
     /// Staged copies that admission verifies and `tamper` corrupts.
