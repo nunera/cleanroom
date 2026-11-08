@@ -67,7 +67,15 @@ The roots are real distros, so their software runs unchanged. The command center
 
 ### Choose your init
 
-The host itself is a declared plan: services, their dependencies, and the init that runs them, either dinit or s6-rc. cleanroomd checks the graph before anything starts and names the cycle if there is one.
+The host itself is a declared plan: services, their dependencies, and the init that runs them. cleanroomd checks the graph before anything starts and names the cycle if there is one. Then `cleanroomd plan render` turns the same plan into dinit service files or an s6-rc source tree, and you pick which one boots:
+
+```sh
+nix run .#vm -- --init dinit     # or --init s6-rc; add --live for live Nemotron instead of the recorded run
+```
+
+That boots Cleanroom in QEMU/KVM with the chosen init as PID 1. It admits the Debian and Alpine roots, starts the daemon and the agent team, and puts the command center on the console.
+
+NixOS is declarative too, but it's built around systemd, and software has to be packaged in nixpkgs. Cleanroom keeps the plan independent of the init, keeps the trusted base to a small supervisor, and runs other distros' software as it ships.
 
 <img src="docs/os/plan.png" width="100%" alt="cleanroomd plan validate: responder.json is valid with boot order under dinit; cycle.json is invalid under s6-rc with the dependency cycle named">
 
