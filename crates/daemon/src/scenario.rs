@@ -444,14 +444,24 @@ pub(crate) fn find_ransom(layout: &Layout) -> Result<PathBuf> {
 pub(crate) fn install_ransom(layout: &Layout, binary: &Path) -> Result<()> {
     let bin = layout.bin();
     fs::create_dir_all(&bin).with_context(|| format!("cannot create {}", bin.display()))?;
-    let installed = bin.join(RANSOM);
-    fs::copy(binary, &installed).with_context(|| {
-        format!(
-            "cannot copy {} to {}",
-            binary.display(),
-            installed.display()
-        )
-    })?;
+    replace_copy(binary, &bin.join(RANSOM))
+}
+
+/// Copy `from` to `to`, removing an earlier copy first: a copy of a Nix store file keeps its
+/// read-only mode, so copying over it would fail.
+///
+/// # Errors
+/// Fails if the old copy cannot be removed or the new one cannot be made.
+fn replace_copy(from: &Path, to: &Path) -> Result<()> {
+    match fs::remove_file(to) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot remove {}", to.display()));
+        }
+    }
+    fs::copy(from, to)
+        .with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))?;
     Ok(())
 }
 
@@ -1022,5 +1032,25 @@ mod tests {
                 "logs/auth.log (changed)".to_owned(),
             ]
         );
+    }
+
+    /// The flake's ransomware lives in the read-only Nix store, and `fs::copy` keeps its 0555
+    /// mode, so a second detonation in the same daemon could not overwrite the installed copy.
+    #[test]
+    fn a_read_only_binary_can_be_installed_twice() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("cleanroomd-reinstall-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).expect("dir");
+        let source = dir.join("cleanroom-ransom");
+        fs::write(&source, b"#!/bin/sh\n").expect("source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let installed = dir.join("installed");
+
+        replace_copy(&source, &installed).expect("first install");
+        replace_copy(&source, &installed).expect("second install over a read-only copy");
+
+        assert_eq!(fs::read(&installed).expect("installed"), b"#!/bin/sh\n");
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 }
