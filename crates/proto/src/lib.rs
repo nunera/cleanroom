@@ -346,6 +346,15 @@ pub enum MemberRole {
     Observer,
 }
 
+/// Signed by a commander under [`domain::APPROVAL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecision {
+    /// Tool request id or proposal id.
+    pub subject_id: String,
+    pub approved: bool,
+    pub at: Timestamp,
+}
+
 /// Signed by an admin under [`domain::ENROLL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -453,11 +462,8 @@ pub struct BusMessage {
 pub enum CoreRequest {
     Exec(ExecRequest),
     RequestTool(ToolRequest),
-    /// Commander signs a pending tool request or containment proposal.
-    Approve {
-        subject_id: String,
-        approval: Signed<String>,
-    },
+    /// Commander approves or denies a pending tool request or containment proposal.
+    Approve(Signed<ApprovalDecision>),
     Enroll(Signed<Member>),
     Detonate {
         scenario: String,

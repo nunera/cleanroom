@@ -14,7 +14,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 - Newline-delimited JSON. One line = one `Envelope`: `{"v":1,"frame":"<kind>",...}`.
 - The first frame from every client is `hello`, naming its principal, the raw Ed25519 public key that signs its `publish` frames, and the audiences it subscribes to.
 - `request` / `response` frames carry an `id` chosen by the client; the daemon answers with the same `id`.
-- `publish` frames go from clients to the daemon. The daemon checks the signature, appends a receipt if relevant, and fans the message out as `event` frames to subscribers.
+- `publish` frames go from clients to the daemon. The daemon checks the signature, appends a receipt if relevant, and fans the message out as `event` frames to every matching subscriber, **including the sender** (the TUI renders only from events, so it relies on seeing its own chat and toggles echoed back).
 - Agent strata have no network and no access to the socket. The agent *runner* (outside the strata) holds the socket connection and calls `exec` on the agent's behalf; the daemon applies that role's grant.
 
 ## Signing
@@ -37,10 +37,10 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 | --- | --- | --- |
 | `exec` | Agent runner | `exec` with outcome `exited` / `timed_out` / `denied` + `receipt_seq` |
 | `request_tool` | Agent runner | `tool` with decision `auto_allowed` / `approved` / `denied` / `pending` |
-| `approve` | TUI (commander) | `ok`, then a `tool_decision` or `approval` bus event |
+| `approve` | TUI (commander) | Body is `Signed<ApprovalDecision {subject_id, approved, at}>` under `cleanroom/v1/approval`. Response `ok`, then a `tool_decision` or `approval` bus event |
 | `enroll` | TUI (admin) | `ok` or `error` |
-| `detonate` | TUI | `ok`; scenario progress arrives as bus events |
-| `tamper` | TUI (demo opener) | `ok` |
+| `detonate` | TUI | `ok`; scenario progress arrives as bus events, then the daemon publishes `investigate`. Scenario names: `ransomware` (exfil/persistence are stretch) |
+| `tamper` | TUI (demo opener) | `ok`. `root` names an admitted root; the demo uses `debian` |
 | `admit` | TUI / CLI | `admitted` or `admit_rejected` (names the layer, expected and actual digest) |
 | `verify_log` | TUI | `log_verified { entries, first_break }` |
 | `reset` | TUI / CLI | `ok` |
