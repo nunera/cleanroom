@@ -305,6 +305,28 @@ enum Attempt {
     },
 }
 
+/// One model call as reported to cleanroomd: which model at which endpoint answered whom, with
+/// digests of the exact bytes sent and received.
+#[derive(Debug, Clone)]
+pub(crate) struct CallRecord {
+    /// The role the call was for.
+    pub(crate) role: Role,
+    /// `agent`, `chat` or `safety`.
+    pub(crate) purpose: &'static str,
+    /// The model asked.
+    pub(crate) model: String,
+    /// The endpoint's base URL (`none` when replaying a route that has no endpoint).
+    pub(crate) endpoint: String,
+    /// `sha256:` of the request body.
+    pub(crate) request: String,
+    /// `sha256:` of the response body.
+    pub(crate) response: String,
+    /// The answer came from the replay store, not a live model.
+    pub(crate) replayed: bool,
+    /// Time from request to response, including any recorded pace in replay.
+    pub(crate) latency_ms: u64,
+}
+
 /// Routes model calls to the hosted or local endpoint.
 #[derive(Debug)]
 pub(crate) struct Router {
@@ -320,6 +342,8 @@ pub(crate) struct Router {
     cache: Cache,
     /// What egress this router has, for the status line.
     egress: String,
+    /// Where every call is reported, when someone listens.
+    calls: Option<tokio::sync::mpsc::UnboundedSender<CallRecord>>,
 }
 
 impl Router {
@@ -378,7 +402,17 @@ impl Router {
             models: settings.models.clone(),
             cache,
             egress,
+            calls: None,
         })
+    }
+
+    /// Report every call to `calls`.
+    pub(crate) fn with_call_log(
+        mut self,
+        calls: tokio::sync::mpsc::UnboundedSender<CallRecord>,
+    ) -> Self {
+        self.calls = Some(calls);
+        self
     }
 
     /// Whether this router can open network connections at all.
@@ -540,6 +574,7 @@ impl Router {
             purpose: purpose.label(),
         };
         let key = cache::key(&body);
+        let started = Instant::now();
         let (raw, origin) = match &self.cache {
             Cache::Replay(store) => {
                 let replayed = store.replay(store.next_slot(stream), &key).await?;
@@ -548,7 +583,6 @@ impl Router {
             }
             Cache::Record(store) => {
                 let slot = store.next_slot(stream);
-                let started = Instant::now();
                 let raw = self.post(self.endpoint(route)?, body.clone()).await?;
                 let exchange = (body.as_ref(), raw.as_ref());
                 if let Err(error) = store.record(slot, &key, exchange, started.elapsed()).await {
@@ -558,6 +592,23 @@ impl Router {
             }
             Cache::Off => (self.post(self.endpoint(route)?, body).await?, Origin::Live),
         };
+        if let Some(calls) = &self.calls {
+            let record = CallRecord {
+                role,
+                purpose: purpose.label(),
+                model: self.model(role, purpose, route).to_owned(),
+                endpoint: self
+                    .endpoint(route)
+                    .map_or_else(|_| "none".to_owned(), |endpoint| endpoint.base_url.clone()),
+                request: format!("sha256:{key}"),
+                response: format!("sha256:{}", cache::key(&raw)),
+                replayed: matches!(origin, Origin::Replayed(_)),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            };
+            if calls.send(record).is_err() {
+                tracing::debug!("nobody listens for model-call records any more");
+            }
+        }
         parse_reply(&raw, self.model(role, purpose, route), origin)
     }
 
@@ -778,5 +829,55 @@ mod tests {
         let offline = Router::new(&settings("https://evil.example/v1", LlmMode::Replay))
             .expect("replay makes no connections, so no endpoint is checked");
         assert!(!offline.can_connect(), "replay builds no network client");
+    }
+
+    /// Every model call is reported with the model, the endpoint and digests of the exact bytes
+    /// sent and received, so cleanroomd can chain a receipt of which model said what. A replayed
+    /// answer says so.
+    #[tokio::test]
+    async fn every_model_call_is_reported_with_digests_of_what_was_sent_and_received() {
+        let dir = std::env::temp_dir().join(format!("cleanroom-llm-calls-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let mut settings = settings("https://integrate.api.nvidia.com/v1", LlmMode::Replay);
+        settings.cache_dir = dir.clone();
+        let messages = [Message::User {
+            content: "list /evidence".to_owned(),
+        }];
+        let model = settings.models.for_role(Role::Hunter).to_owned();
+        let body = request_body(&model, &messages, &[], AGENT_MAX_TOKENS).expect("body");
+        let response: &[u8] =
+            br#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#;
+        let store = Store::new(dir.clone());
+        let slot = store.next_slot(Stream {
+            role: "hunter",
+            purpose: "agent",
+        });
+        store
+            .record(
+                slot,
+                &cache::key(&body),
+                (&body, response),
+                Duration::from_millis(5),
+            )
+            .await
+            .expect("record");
+        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new(&settings).expect("router").with_call_log(calls);
+
+        router
+            .chat(Role::Hunter, ModelRoute::Hosted, &messages, &[])
+            .await
+            .expect("replayed");
+
+        let call = reported.try_recv().expect("the call is reported");
+        assert_eq!(call.role, Role::Hunter);
+        assert_eq!(call.purpose, "agent");
+        assert_eq!(call.model, model);
+        assert_eq!(call.endpoint, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(call.request, format!("sha256:{}", cache::key(&body)));
+        assert_eq!(call.response, format!("sha256:{}", cache::key(response)));
+        assert!(call.replayed, "a replayed answer is not passed off as live");
+        assert!(reported.try_recv().is_err(), "one call, one report");
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

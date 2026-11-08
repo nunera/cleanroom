@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail};
 use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
 use cleanroom_proto::{
     Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
-    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal,
+    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, ModelCall, Outcome, Principal,
     Revocation, Role, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource, domain,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -255,6 +255,7 @@ impl Daemon {
         let result = match request {
             CoreRequest::Exec(exec) => Box::pin(self.exec(peer, exec)).await,
             CoreRequest::RequestTool(ask) => Box::pin(self.request_tool(peer, ask)).await,
+            CoreRequest::ModelCall(call) => self.model_call(peer, call),
             CoreRequest::Approve(decision) => self.approve(peer, decision),
             CoreRequest::Enroll(member) => self.enroll(peer, member),
             CoreRequest::Revoke(revocation) => self.revoke(peer, revocation),
@@ -270,6 +271,24 @@ impl Daemon {
                 message: format!("{error:#}"),
             }
         })
+    }
+
+    /// `model_call`: chain an agent's model call into the receipt log, as that agent.
+    ///
+    /// # Errors
+    /// Fails if the caller is not the agent it names or the receipt cannot be written.
+    fn model_call(&self, peer: &Peer, call: ModelCall) -> Result<CoreResponse> {
+        let role = peer.role(call.from)?;
+        let action = Action::ModelCall {
+            purpose: call.purpose,
+            model: call.model,
+            endpoint: call.endpoint,
+            request: call.request,
+            response: call.response,
+            replayed: call.replayed,
+        };
+        self.receipt(Principal::Agent { role }, action, Outcome::Allowed)?;
+        Ok(CoreResponse::Ok)
     }
 
     /// Run a command in the caller's stratum under its grant.
@@ -357,7 +376,8 @@ impl Daemon {
             | Action::Revoke { .. }
             | Action::RecordUpdate { .. }
             | Action::Detonate { .. }
-            | Action::EvidenceSeal { .. } => String::new(),
+            | Action::EvidenceSeal { .. }
+            | Action::ModelCall { .. } => String::new(),
         };
         let seq = self.receipt(actor, action, receipt_outcome)?;
         if let ExecOutcome::Denied { reason } = &outcome {
@@ -1240,6 +1260,7 @@ const fn op_name(request: &CoreRequest) -> &'static str {
     match request {
         CoreRequest::Exec(_) => "exec",
         CoreRequest::RequestTool(_) => "request_tool",
+        CoreRequest::ModelCall(_) => "model_call",
         CoreRequest::Approve(_) => "approve",
         CoreRequest::Enroll(_) => "enroll",
         CoreRequest::Revoke(_) => "revoke",
