@@ -643,12 +643,13 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
     format!(
-        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; {}",
+        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}; {}",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),
         router.egress(),
         shared.max_steps,
+        router.budgets().summary(),
         models(router)
     )
 }
