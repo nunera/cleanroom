@@ -534,7 +534,7 @@ impl Judge {
             None => {
                 pass.checked.insert(record.asset_id.clone(), record.flags);
             }
-            Some(Role::Hunter | Role::Forensics | Role::Containment) => {}
+            Some(Role::Hunter | Role::Forensics | Role::Containment | Role::Lead) => {}
         }
         pass.finals.insert(record.asset_id.clone(), record.clone());
     }

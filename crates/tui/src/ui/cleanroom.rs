@@ -1,0 +1,808 @@
+//! The Cleanroom screen, the commander's default view.
+//!
+//! The conversation with the Lead fills the left; the team and the situation sit on the right.
+//! After every OS denial the kernel banner is pinned over the conversation for a few seconds.
+
+use cleanroom_proto::{Audience, Role, ScopeRecord, Tri};
+use jiff::Timestamp;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Style, Stylize as _};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Padding, Paragraph};
+
+use super::{
+    Focus, View, fit, grouped, heading, on, pad, panel, role_label, role_name, running_clocks,
+    short_model, spaces, spinner, tail_fit, urgency_color, width_of, wrap,
+};
+use crate::clocks;
+use crate::denials::{Denial, Kind};
+use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who, compromised, yes_flags};
+use crate::team::{self, SPECIALISTS, Status};
+use crate::theme::{
+    ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, DIM, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG,
+    TEXT, glyph, tint,
+};
+
+/// Widest a Lead or specialist message runs before wrapping, for a comfortable measure.
+const MEASURE: usize = 86;
+/// Longest message shown in full; the Controlroom comms pane keeps the whole text.
+const MESSAGE_LINES: usize = 16;
+/// Columns before a card's name: the trunk and its branch.
+const GUTTER: usize = 6;
+
+/// Draw the screen into `area`, everything between the top bar and the hint bar.
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    view: &View,
+    now: Timestamp,
+) {
+    let side = match area.width {
+        150.. => 52,
+        130.. => 46,
+        110.. => 42,
+        _ => 0,
+    };
+    if side == 0 {
+        let [_, talk, _] = Layout::horizontal([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        render_conversation(frame, talk, state, view, now);
+        return;
+    }
+    let [_, talk, _, column, _] = Layout::horizontal([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(2),
+        Constraint::Length(side),
+        Constraint::Length(2),
+    ])
+    .areas(area);
+    render_conversation(frame, talk, state, view, now);
+    render_column(frame, column, state, view, now);
+}
+
+// ---------- Conversation ----------
+
+/// The conversation panel: banner, messages, the latest notice and the message line.
+fn render_conversation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    view: &View,
+    now: Timestamp,
+) {
+    let focused = view.focus == Focus::Input;
+    let title = Line::from(vec![
+        Span::raw(" ◆ ").fg(ACCENT),
+        Span::raw("LEAD").fg(BRIGHT).bold(),
+        Span::raw(" · conversation ").fg(MUTED),
+    ]);
+    let mut block = panel(title, focused).padding(Padding::horizontal(1));
+    if view.scroll > 0 {
+        block = block.title(
+            Line::from(" scrolled back · End returns to the newest ")
+                .fg(DIM)
+                .right_aligned(),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let banner = state.denials.banner(now);
+    let banner_height = match banner {
+        Some(_) if inner.height >= 16 => 4,
+        Some(_) => 2,
+        None => 0,
+    };
+    let [banner_area, _, feed, notice, rule, input] = Layout::vertical([
+        Constraint::Length(banner_height),
+        Constraint::Length(u16::from(banner.is_some())),
+        Constraint::Fill(1),
+        Constraint::Length(u16::from(state.notice.is_some())),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    if let Some(denial) = banner {
+        render_banner(frame, banner_area, denial);
+    }
+    render_feed(frame, feed, state, view);
+    if let Some(note) = &state.notice {
+        let room = usize::from(notice.width).saturating_sub(2);
+        let line = Line::from(vec![
+            Span::raw("↳ ").fg(DIM),
+            Span::raw(fit(&note.text, room)).fg(super::tone_color(note.tone)),
+        ]);
+        frame.render_widget(Paragraph::new(line), notice);
+    }
+    let rule_line = "─".repeat(usize::from(rule.width));
+    frame.render_widget(Paragraph::new(rule_line).fg(LINE), rule);
+    render_input(frame, input, view, focused);
+}
+
+/// The kernel banner: what was blocked, for whom, why, and the receipt that proves it.
+fn render_banner(frame: &mut Frame<'_>, area: Rect, denial: &Denial) {
+    frame.render_widget(Block::new().style(Style::new().bg(RED_BG).fg(BRIGHT)), area);
+    let width = usize::from(area.width);
+    let (headline, reason) = match denial.kind {
+        Kind::Exec => (
+            "KERNEL BLOCKED",
+            denial.reason.replace("read_only", "read-only"),
+        ),
+        Kind::Record => ("OS KEPT THE RECORD", denial.reason.clone()),
+    };
+    let who = denial.role.map_or_else(
+        || denial.who.to_uppercase(),
+        |role| format!("{} {}", glyph(role), role_label(role)),
+    );
+    let lead = format!("  ⛔ {headline}    {who}    ");
+    let command = fit(&denial.command, width.saturating_sub(width_of(&lead) + 1));
+    let first = Line::from(vec![
+        Span::raw("  ⛔ ").bold(),
+        Span::raw(headline).bold(),
+        Span::raw("    "),
+        Span::raw(who).bold(),
+        Span::raw("    "),
+        Span::raw(command).bold(),
+    ]);
+    let mut facts = vec![reason];
+    if let Some(seq) = denial.receipt {
+        facts.push(format!("signed receipt #{seq}"));
+    }
+    if let Some(step) = denial.step {
+        facts.push(format!("step #{step}"));
+    }
+    let second = Line::from(format!(
+        "     {}",
+        fit(&facts.join(" · "), width.saturating_sub(6))
+    ));
+    let top = u16::from(area.height >= 4);
+    let [_, first_area, second_area, _] = Layout::vertical([
+        Constraint::Length(top),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(first), first_area);
+    frame.render_widget(Paragraph::new(second), second_area);
+}
+
+/// The messages and markers, newest at the bottom, scrolled back by `view.scroll` lines.
+fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View) {
+    let rows = usize::from(area.height);
+    if rows == 0 {
+        return;
+    }
+    let lines = feed_lines(state, usize::from(area.width));
+    if lines.is_empty() {
+        frame.render_widget(Paragraph::new(empty_feed(rows)), area);
+        return;
+    }
+    let limit = lines.len().saturating_sub(rows);
+    view.scroll_limit.set(limit);
+    let back = view.scroll.min(limit);
+    let end = lines.len() - back;
+    let start = end.saturating_sub(rows);
+    let mut shown: Vec<Line<'static>> = vec![Line::default(); rows - (end - start)];
+    shown.extend(lines.into_iter().skip(start).take(end - start));
+    frame.render_widget(Paragraph::new(shown), area);
+}
+
+/// What the conversation says before anything happened.
+fn empty_feed(rows: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default(); rows.saturating_sub(5) / 2];
+    lines.extend([
+        Line::from(Span::raw("◆").fg(ACCENT)).centered(),
+        Line::default(),
+        Line::from("The Lead is standing by.").fg(TEXT).centered(),
+        Line::from("Ask what happened, what to do first, or to check on a specialist.")
+            .fg(MUTED)
+            .centered(),
+        Line::from("Nothing has happened yet: Esc, then d detonates a scenario.")
+            .fg(DIM)
+            .centered(),
+    ]);
+    lines
+}
+
+/// How an entry sits in the conversation, for spacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// A full message from the commander, the Lead or a specialist answering a human.
+    Message,
+    /// A compact delegation, reply or report between agents.
+    Card,
+    /// A key system event.
+    Marker,
+}
+
+/// Every conversation line at `width`, oldest first.
+fn feed_lines(state: &State, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut previous: Option<Class> = None;
+    for item in &state.talk {
+        let class = match item {
+            Talk::Marker(_) => Class::Marker,
+            Talk::Said(said) => said_class(said),
+        };
+        if previous.is_some_and(|previous| class == Class::Message || previous != class) {
+            lines.push(Line::default());
+        }
+        previous = Some(class);
+        match item {
+            Talk::Marker(marker) => lines.push(marker_line(marker, width)),
+            Talk::Said(said) => match said_class(said) {
+                Class::Message => message_lines(said, width, &mut lines),
+                Class::Card | Class::Marker => card_lines(said, width, &mut lines),
+            },
+        }
+    }
+    lines
+}
+
+/// Whether a chat message is a full message or a compact card.
+const fn said_class(said: &Said) -> Class {
+    match (&said.from, &said.to) {
+        (Who::Me | Who::Human(_) | Who::System, _)
+        | (Who::Agent(_), Audience::Humans)
+        | (Who::Agent(Role::Lead), Audience::All) => Class::Message,
+        (Who::Agent(_), Audience::Role { .. } | Audience::All) => Class::Card,
+    }
+}
+
+/// `• 04:38:24  incident INC-7 declared: Ransomware on acme-fs`.
+fn marker_line(marker: &Marker, width: usize) -> Line<'static> {
+    let color = match marker.tone {
+        Tone::Quiet | Tone::Plain => DIM,
+        Tone::Good => ACCENT,
+        Tone::Warn => AMBER,
+        Tone::Bad => RED,
+    };
+    let lead = format!("  • {}  ", marker.at);
+    let text = fit(&marker.text, width.saturating_sub(width_of(&lead)));
+    Line::from(vec![
+        Span::raw("  • ").fg(color),
+        Span::raw(format!("{}  ", marker.at)).fg(DIM),
+        Span::raw(text).fg(if marker.tone == Tone::Plain {
+            MUTED
+        } else {
+            color
+        }),
+    ])
+}
+
+/// A full message: the commander's right-aligned, everyone else's left-aligned.
+fn message_lines(said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
+    match &said.from {
+        Who::Me | Who::Human(_) => commander_lines(said, width, lines),
+        Who::Agent(role) => agent_lines(*role, said, width, lines),
+        Who::System => agent_lines(Role::Lead, said, width, lines),
+    }
+}
+
+/// The commander's message: a right-aligned bubble under `you · 04:39:02`.
+fn commander_lines(said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
+    let mut header = vec![
+        Span::raw(match &said.from {
+            Who::Human(short) => format!("human {short}"),
+            Who::Me | Who::Agent(_) | Who::System => "you".to_owned(),
+        })
+        .fg(BRIGHT)
+        .bold(),
+    ];
+    if let Audience::Role { role } = &said.to
+        && *role != Role::Lead
+    {
+        header.extend([Span::raw(" → ").fg(DIM), role_name(*role)]);
+    }
+    header.extend([Span::raw(format!("  {}", said.at)).fg(DIM), Span::raw(" ")]);
+    lines.push(Line::from(header).right_aligned());
+    let measure = (width * 3 / 5).max(24).min(width.saturating_sub(4));
+    let wrapped = wrap(&clean(&said.text), measure.saturating_sub(2));
+    let bubble = wrapped.iter().map(|line| width_of(line)).max().unwrap_or(0) + 2;
+    let bubble_style = Style::new().bg(RAISED_HI).fg(BRIGHT);
+    for line in wrapped.into_iter().take(MESSAGE_LINES) {
+        let fill = bubble.saturating_sub(width_of(&line) + 1);
+        lines.push(
+            Line::from(vec![
+                Span::styled(format!(" {line}"), bubble_style),
+                spaces(fill, bubble_style),
+                Span::raw(" "),
+            ])
+            .right_aligned(),
+        );
+    }
+}
+
+/// A message from the Lead (or a specialist answering a human): `◆ LEAD  04:39:20`, then the
+/// text, left-aligned at a comfortable measure.
+fn agent_lines(role: Role, said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(vec![
+        Span::raw(format!("{} ", glyph(role))).fg(tint(role)),
+        Span::raw(role_label(role)).fg(BRIGHT).bold(),
+        Span::raw(format!("  {}", said.at)).fg(DIM),
+    ]));
+    let measure = width.saturating_sub(2).min(MEASURE);
+    let wrapped = wrap(&clean(&said.text), measure);
+    let total = wrapped.len();
+    for (index, line) in wrapped.into_iter().take(MESSAGE_LINES).enumerate() {
+        let text = if index + 1 == MESSAGE_LINES && total > MESSAGE_LINES {
+            format!("{line} …")
+        } else {
+            line
+        };
+        lines.push(Line::from(vec![Span::raw("  "), Span::raw(text).fg(TEXT)]));
+    }
+}
+
+/// A compact card between agents: `│ ◆ Lead → ▲ Hunter  What did you find?`, two lines at most.
+fn card_lines(said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
+    let Who::Agent(from) = said.from else {
+        return;
+    };
+    let mut header = vec![
+        Span::raw("    │ ").fg(LINE),
+        role_name(from),
+        Span::raw(" → ").fg(DIM),
+    ];
+    match &said.to {
+        Audience::Role { role } => header.push(role_name(*role)),
+        Audience::All => header.push(Span::raw("team").fg(MUTED)),
+        Audience::Humans => header.push(Span::raw("you").fg(BRIGHT)),
+    }
+    header.push(Span::raw("  "));
+    let used: usize = header.iter().map(Span::width).sum();
+    let text = crate::state::one_line(&said.text);
+    let first_room = width.saturating_sub(used);
+    let wrapped = wrap(&text, first_room.max(8));
+    let first = wrapped.first().cloned().unwrap_or_default();
+    let rest: String = wrapped.get(1..).unwrap_or_default().join(" ");
+    let second_room = width.saturating_sub(GUTTER);
+    header.push(Span::raw(first).fg(MUTED));
+    lines.push(Line::from(header));
+    if !rest.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    │ ").fg(LINE),
+            Span::raw(fit(&rest, second_room)).fg(MUTED),
+        ]));
+    }
+}
+
+/// Message text for the screen: markdown emphasis and headings dropped, blank runs collapsed.
+fn clean(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut blank = false;
+    for line in text.lines() {
+        let line = line
+            .trim_end()
+            .trim_start_matches('#')
+            .trim_start()
+            .replace("**", "")
+            .replace("__", "")
+            .replace('`', "");
+        if line.chars().all(|ch| matches!(ch, '|' | '-' | ':' | ' ')) && !line.is_empty() {
+            continue;
+        }
+        if line.is_empty() {
+            if !blank && !out.is_empty() {
+                out.push(String::new());
+            }
+            blank = true;
+        } else {
+            out.push(line);
+            blank = false;
+        }
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// The message line: `› ` and the draft, or a hint of what to type.
+fn render_input(frame: &mut Frame<'_>, area: Rect, view: &View, focused: bool) {
+    let width = usize::from(area.width);
+    let prompt = Span::raw("› ")
+        .fg(if focused { ACCENT } else { DIM })
+        .bold();
+    let send = if focused {
+        "Enter ↵ "
+    } else {
+        "Enter to type "
+    };
+    let room = width.saturating_sub(2 + width_of(send) + 1);
+    let mut spans = vec![prompt];
+    if view.draft.is_empty() {
+        let placeholder = match (focused, room >= 84) {
+            (true, true) => {
+                "Ask the Lead anything · @hunter, @forensics, @scribe or @containment asks a specialist"
+            }
+            (true, false) => "Ask the Lead · @hunter asks a specialist",
+            (false, _) => "Press Enter to talk to the Lead",
+        };
+        spans.push(Span::raw(fit(placeholder, room)).fg(DIM));
+    } else {
+        let shown = tail_fit(&view.draft, room);
+        spans.extend(draft_spans(&shown, focused));
+        if focused {
+            let x = area
+                .x
+                .saturating_add(2)
+                .saturating_add(u16::try_from(width_of(&shown)).unwrap_or(u16::MAX));
+            frame.set_cursor_position(Position::new(x.min(area.right().saturating_sub(1)), area.y));
+        }
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + width_of(send))),
+    ));
+    spans.push(Span::raw(send).fg(DIM));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if focused && view.draft.is_empty() {
+        frame.set_cursor_position(Position::new(area.x.saturating_add(2), area.y));
+    }
+}
+
+/// The draft, with a leading `@name` in the addressed role's tint (red when nobody has it).
+fn draft_spans(shown: &str, focused: bool) -> Vec<Span<'static>> {
+    let text_color = if focused { BRIGHT } else { MUTED };
+    let Some(rest) = shown.strip_prefix('@') else {
+        return vec![Span::raw(shown.to_owned()).fg(text_color)];
+    };
+    let (name, tail) = rest
+        .split_once(' ')
+        .map_or((rest, ""), |(name, tail)| (name, tail));
+    let color = team::mention(name).map_or(RED, tint);
+    let mut spans = vec![Span::raw(format!("@{name}")).fg(color).bold()];
+    if !tail.is_empty() || rest.contains(' ') {
+        spans.push(Span::raw(format!(" {tail}")).fg(text_color));
+    }
+    spans
+}
+
+// ---------- Right column ----------
+
+/// TEAM on top, SITUATION below.
+fn render_column(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+    let team_height: u16 = 2 + 2 + 3 * 4;
+    let gap = u16::from(area.height >= team_height + 19);
+    let [team_area, _, situation] = Layout::vertical([
+        Constraint::Length(team_height),
+        Constraint::Length(gap),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    render_team(frame, team_area, state, now);
+    render_situation(frame, situation, state, view, now);
+}
+
+/// The Lead's card, and the four specialists hanging off it. A link lights while the Lead waits
+/// on that specialist.
+fn render_team(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
+    let width = usize::from(area.width);
+    let mut lines = vec![heading("TEAM"), Line::default()];
+    lines.extend(agent_card(Role::Lead, state, width, now));
+    let lit = SPECIALISTS.map(|role| state.team.link(role, now));
+    let lowest = lit.iter().rposition(|lit| *lit);
+    let wire = |on: bool| Style::new().fg(if on { ACCENT } else { LINE });
+    for (index, role) in SPECIALISTS.into_iter().enumerate() {
+        let last = index + 1 == SPECIALISTS.len();
+        let through = lowest.is_some_and(|lowest| index <= lowest);
+        let below = lowest.is_some_and(|lowest| index < lowest);
+        let branch = lit.get(index).copied().unwrap_or(false);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("│", wire(through)),
+        ]));
+        let [first, second] = agent_card(role, state, width.saturating_sub(GUTTER), now);
+        let mut top = vec![
+            Span::raw("  "),
+            Span::styled(if last { "└" } else { "├" }, wire(through)),
+            Span::styled("── ", wire(branch)),
+        ];
+        top.extend(first.spans);
+        lines.push(Line::from(top));
+        let mut bottom = vec![
+            Span::raw("  "),
+            Span::styled(if last { " " } else { "│" }, wire(below)),
+            Span::raw("   "),
+        ];
+        bottom.extend(second.spans);
+        lines.push(Line::from(bottom));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// A two-line card, `width` columns wide: glyph, name, model and status, then the last action.
+fn agent_card(role: Role, state: &State, width: usize, now: Timestamp) -> [Line<'static>; 2] {
+    let card = Style::new().bg(RAISED);
+    let desk = state.team.desk(role);
+    let status = state.team.status(role, state.waiting_on(role), now);
+    let status_spans = status_spans(&status, now);
+    let status_width: usize = status_spans.iter().map(Span::width).sum();
+    let model = desk
+        .model
+        .as_deref()
+        .map(short_model)
+        .map(|model| match desk.route {
+            Some(cleanroom_proto::ModelRoute::Local) => format!("{model} · local"),
+            Some(cleanroom_proto::ModelRoute::Hosted) | None => model,
+        });
+    let name = pad(role_label(role), 12);
+    let mut top = vec![
+        Span::styled(format!(" {} ", glyph(role)), card.fg(tint(role))),
+        Span::styled(name, card.fg(BRIGHT).bold()),
+    ];
+    let room = width.saturating_sub(16 + status_width + 1);
+    let model = model.as_deref().filter(|_| room >= 10).unwrap_or("");
+    let model_text = fit(model, room.saturating_sub(1));
+    top.push(Span::styled(model_text.clone(), card.fg(DIM)));
+    let fill = width.saturating_sub(16 + width_of(&model_text) + status_width + 1);
+    top.push(spaces(fill, card));
+    top.extend(status_spans.into_iter().map(|span| on(card, span)));
+    top.push(spaces(1, card));
+    let blocked = status == Status::Blocked;
+    let last = desk.last.as_deref().unwrap_or(match role {
+        Role::Lead => "waiting for your question",
+        Role::Hunter | Role::Forensics | Role::Scribe | Role::Containment => "no activity yet",
+    });
+    let last = fit(last, width.saturating_sub(5));
+    let last_color = if blocked {
+        RED
+    } else if desk.last.is_some() {
+        MUTED
+    } else {
+        DIM
+    };
+    let used = 4 + width_of(&last);
+    let bottom = vec![
+        Span::styled("    ", card),
+        Span::styled(last, card.fg(last_color)),
+        spaces(width.saturating_sub(used), card),
+    ];
+    [Line::from(top), Line::from(bottom)]
+}
+
+/// The status at the right of a card.
+fn status_spans(status: &Status, now: Timestamp) -> Vec<Span<'static>> {
+    match status {
+        Status::Idle => vec![Span::raw("idle").fg(DIM)],
+        Status::Thinking => vec![
+            Span::raw(spinner(now)).fg(ACCENT),
+            Span::raw(" thinking").fg(MUTED),
+        ],
+        Status::Asking(roles) => {
+            let names: Vec<&str> = roles.iter().map(|role| team::title(*role)).collect();
+            vec![
+                Span::raw(spinner(now)).fg(ACCENT),
+                Span::raw(format!(" asking {}", names.join(", "))).fg(ACCENT),
+            ]
+        }
+        Status::Running(tool) => vec![
+            Span::raw("▸ ").fg(ACCENT),
+            Span::raw(fit(tool, 18)).fg(TEXT).bold(),
+        ],
+        Status::Blocked => vec![Span::styled(
+            " BLOCKED BY OS ",
+            Style::new().fg(BRIGHT).bg(RED_BG).bold(),
+        )],
+        Status::Refused => vec![Span::raw("✓ refused").fg(ACCENT).bold()],
+        Status::Waiting => vec![Span::raw("waiting on you").fg(AMBER).bold()],
+    }
+}
+
+/// Assets, the nearest legal clocks, the approvals waiting and, when there is room, what each
+/// defense layer stopped.
+fn render_situation(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+    let width = usize::from(area.width);
+    let roomy = area.height >= 20;
+    let mut lines = vec![heading("SITUATION")];
+    if roomy {
+        lines.push(Line::default());
+    }
+    asset_tiles(state, width, &mut lines);
+    lines.push(Line::default());
+    clock_lines(state, width, now, &mut lines);
+    lines.push(Line::default());
+    approval_lines(state, view, width, &mut lines);
+    if usize::from(area.height) >= lines.len() + 5 {
+        lines.push(Line::default());
+        lines.extend(defense_lines(state));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// What each layer stopped: the model refusing, the kernel blocking, the safety model flagging.
+fn defense_lines(state: &State) -> [Line<'static>; 4] {
+    let counters = state.counters;
+    let kernel = Some(u32::try_from(state.blocks()).unwrap_or(u32::MAX));
+    let row = |label: &str, value: Option<u32>, color| {
+        let value = value.map_or_else(|| "–".to_owned(), |value| value.to_string());
+        Line::from(vec![
+            Span::raw(format!("  {label:<18}")).fg(MUTED),
+            Span::raw(format!("{value:>4}")).fg(color).bold(),
+        ])
+    };
+    [
+        heading("DEFENSE LAYERS"),
+        row(
+            "model refused",
+            counters.map(|counters| counters.blocked_by_model),
+            ACCENT,
+        ),
+        row("kernel blocked", kernel, RED),
+        row(
+            "safety flagged",
+            counters.map(|counters| counters.safety_flags),
+            AMBER,
+        ),
+    ]
+}
+
+/// Up to six assets as two-line tiles, two to a row: the accent when clean, red when hit, amber
+/// when unknown.
+fn asset_tiles(state: &State, width: usize, lines: &mut Vec<Line<'static>>) {
+    if state.scope.is_empty() {
+        lines.push(Line::from("  no assets reported yet").fg(DIM));
+        return;
+    }
+    let tile = width.saturating_sub(2) / 2;
+    for (row, pair) in state.scope.chunks(2).take(3).enumerate() {
+        if row > 0 {
+            lines.push(Line::default());
+        }
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for (index, asset) in pair.iter().enumerate() {
+            if index > 0 {
+                first.push(Span::raw("  "));
+                second.push(Span::raw("  "));
+            }
+            let [name, state_line] = tile_lines(asset, tile);
+            first.extend(name);
+            second.extend(state_line);
+        }
+        lines.push(Line::from(first));
+        lines.push(Line::from(second));
+    }
+    let more = state.scope.len().saturating_sub(6);
+    if more > 0 {
+        lines.push(Line::from(format!("  +{more} more in the Controlroom")).fg(DIM));
+    }
+}
+
+/// One asset tile: its name, then what happened to it and its record count.
+fn tile_lines(asset: &ScopeRecord, width: usize) -> [Vec<Span<'static>>; 2] {
+    let hit = yes_flags(asset.flags);
+    let unknown = [
+        asset.flags.locked,
+        asset.flags.exfiltrated,
+        asset.flags.accessed,
+        asset.flags.destroyed,
+        asset.flags.modified,
+    ]
+    .iter()
+    .filter(|value| **value == Tri::Unknown)
+    .count();
+    let (surface, word, word_color): (Color, String, Color) = if compromised(asset.flags) {
+        let word = match hit.as_slice() {
+            [only] => (*only).to_owned(),
+            [first, rest @ ..] => format!("{first} +{}", rest.len()),
+            [] => String::new(),
+        };
+        (RED_BG, word, BRIGHT)
+    } else if unknown > 0 {
+        (AMBER_BG, format!("{unknown} UNKNOWN"), BRIGHT)
+    } else {
+        (ACCENT_BG, "clean".to_owned(), ACCENT)
+    };
+    let style = Style::new().bg(surface);
+    let name = pad(&format!(" {}", asset.name), width);
+    let count = format!("{} rec ", grouped(asset.record_count));
+    let records = if width_of(&word) + width_of(&count) + 2 <= width {
+        count
+    } else {
+        String::new()
+    };
+    let word = fit(&word, width.saturating_sub(width_of(&records) + 2));
+    let fill = width.saturating_sub(1 + width_of(&word) + width_of(&records));
+    [
+        vec![Span::styled(name, style.fg(BRIGHT).bold())],
+        vec![
+            Span::styled(" ", style),
+            Span::styled(word, style.fg(word_color).bold()),
+            spaces(fill, style),
+            Span::styled(records, style.fg(TEXT)),
+        ],
+    ]
+}
+
+/// The three nearest running legal clocks.
+fn clock_lines(state: &State, width: usize, now: Timestamp, lines: &mut Vec<Line<'static>>) {
+    lines.push(heading("LEGAL CLOCKS"));
+    let running = running_clocks(state);
+    if running.is_empty() {
+        lines.push(
+            Line::from(fit(
+                "  none running · each starts when the record sets its trigger",
+                width,
+            ))
+            .fg(DIM),
+        );
+        return;
+    }
+    let label_width = width.saturating_sub(25).clamp(10, 22);
+    for (clock, due) in running.into_iter().take(3) {
+        let remaining = due.duration_since(now);
+        let countdown = clocks::countdown(remaining);
+        let day = super::due_label(due, &state.display_tz, "%a %b %-d");
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(pad(clock.regime.notice(), label_width)).fg(MUTED),
+            Span::raw(format!("{countdown:>10}"))
+                .fg(urgency_color(clocks::urgency(remaining)))
+                .bold(),
+            Span::raw(format!("   {day}")).fg(DIM),
+        ]));
+    }
+}
+
+/// What waits for the commander's signature, with the keys that decide it.
+fn approval_lines(state: &State, view: &View, width: usize, lines: &mut Vec<Line<'static>>) {
+    let waiting = state.waiting();
+    let mut header = vec![Span::raw("APPROVALS").fg(MUTED).bold()];
+    if waiting > 0 {
+        header.extend([
+            Span::raw(format!("   {waiting} waiting")).fg(AMBER).bold(),
+            Span::raw("   a approve · x deny").fg(DIM),
+        ]);
+    }
+    lines.push(Line::from(header));
+    if state.queue.is_empty() {
+        lines.push(Line::from("  nothing waiting for your signature").fg(DIM));
+        return;
+    }
+    let first = view.selected.saturating_sub(2);
+    for (index, item) in state.queue.iter().enumerate().skip(first).take(3) {
+        lines.push(queue_line(item, index == view.selected, width));
+    }
+}
+
+/// `▸ ▣ Containment  isolate host acme-fs from the network`.
+fn queue_line(item: &QueueItem, selected: bool, width: usize) -> Line<'static> {
+    let base = if selected {
+        Style::new().bg(RAISED_HI)
+    } else {
+        Style::new()
+    };
+    let what = match &item.ask {
+        Ask::Tool { tool, .. } => format!("wants {tool}"),
+        Ask::Proposal { action, .. } => action.clone(),
+    };
+    let who = match &item.from {
+        Who::Agent(role) => role_name(*role),
+        Who::System | Who::Me | Who::Human(_) => Span::raw(crate::state::who_title(&item.from)),
+    };
+    let status = match item.sent {
+        None => String::new(),
+        Some(true) => "  approved, confirming…".to_owned(),
+        Some(false) => "  denied, confirming…".to_owned(),
+    };
+    let used = 2 + who.width() + 2 + width_of(&status);
+    let what = fit(&what, width.saturating_sub(used + 1));
+    let fill = width.saturating_sub(used + width_of(&what));
+    Line::from(vec![
+        Span::styled(if selected { "▸ " } else { "  " }, base.fg(AMBER).bold()),
+        on(base, who),
+        Span::styled("  ", base),
+        Span::styled(what, base.fg(TEXT)),
+        Span::styled(status, base.fg(MUTED)),
+        spaces(fill, base),
+    ])
+}

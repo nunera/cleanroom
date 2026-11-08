@@ -5,11 +5,12 @@
 //! the model was shown, then parse into a typed [`Action`]. A failure at any stage becomes a
 //! tool-result error for the model instead of an action.
 
-use cleanroom_proto::{DataClass, IncidentStatus, Severity, Tri};
+use cleanroom_proto::{DataClass, IncidentStatus, Role, Severity, Tri};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 
+use crate::llm::{RequestedCall, ToolCall};
 use crate::{repair, schema};
 
 /// `head -c` byte limit for `read_file`.
@@ -48,23 +49,34 @@ pub(crate) enum Tool {
     UpdateIncident,
     /// `sh -c <command>`; offered only with guardrails off.
     Exec,
+    /// Read the Lead's live situation summary (Lead only).
+    GetSituation,
+    /// Ask a specialist a question over the bus and wait for its answer (Lead only).
+    AskAgent,
+    /// Answer the commander over the bus (Lead only).
+    Reply,
 }
 
 impl Tool {
     /// Whether arguments the schema doesn't know can be ignored rather than rejected: true for
-    /// the read-only evidence tools, where an invented knob (`max`, `lines`) changes nothing.
+    /// the read-only tools, where an invented knob (`max`, `lines`) changes nothing.
     const fn ignores_unknown_arguments(self) -> bool {
         match self {
-            Self::ListFiles | Self::ReadFile | Self::GrepLogs | Self::HashFile | Self::YaraScan => {
-                true
-            }
+            Self::ListFiles
+            | Self::ReadFile
+            | Self::GrepLogs
+            | Self::HashFile
+            | Self::YaraScan
+            | Self::GetSituation => true,
             Self::RequestAdmission
             | Self::ReportFinding
             | Self::ReportRefusal
             | Self::ProposeAction
             | Self::UpdateScope
             | Self::UpdateIncident
-            | Self::Exec => false,
+            | Self::Exec
+            | Self::AskAgent
+            | Self::Reply => false,
         }
     }
 
@@ -83,6 +95,9 @@ impl Tool {
             Self::UpdateScope => "update_scope",
             Self::UpdateIncident => "update_incident",
             Self::Exec => "exec",
+            Self::GetSituation => "get_situation",
+            Self::AskAgent => "ask_agent",
+            Self::Reply => "reply",
         }
     }
 
@@ -121,6 +136,15 @@ impl Tool {
                 "Open or update the incident record. Opening it needs title, severity, category and summary. Triggers are stamped with the current time by the runner; give their basis in timeline_note."
             }
             Self::Exec => "Run a shell command in your stratum (`sh -c <command>`).",
+            Self::GetSituation => {
+                "The live incident picture from the bus: the incident, scope per data asset, findings, refusals, OS denials, counters, decisions waiting for the commander, legal clocks and what each agent is doing."
+            }
+            Self::AskAgent => {
+                "Ask one specialist a question and wait for its answer. It answers from what it has already found; it runs nothing new."
+            }
+            Self::Reply => {
+                "Send your answer to the human incident commander: plain, concise sentences without markdown headers. Ends your turn."
+            }
         }
     }
 
@@ -181,6 +205,18 @@ impl Tool {
             Self::Exec => object(
                 &json!({"command": {"type": "string", "minLength": 1, "maxLength": 4096}}),
                 &["command"],
+            ),
+            Self::GetSituation => object(&json!({}), &[]),
+            Self::AskAgent => object(
+                &json!({
+                    "role": {"type": "string", "enum": ["hunter", "forensics", "scribe", "containment"], "description": "The specialist to ask"},
+                    "question": {"type": "string", "minLength": 5, "maxLength": 600, "description": "One focused question"},
+                }),
+                &["role", "question"],
+            ),
+            Self::Reply => object(
+                &json!({"text": {"type": "string", "minLength": 1, "maxLength": 1200, "description": "Your answer to the commander"}}),
+                &["text"],
             ),
         }
     }
@@ -298,6 +334,24 @@ pub(crate) struct RefusalArgs {
     pub(crate) instruction: String,
 }
 
+/// `ask_agent` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AskArgs {
+    /// The specialist to ask; the schema offers only the four field roles.
+    pub(crate) role: Role,
+    /// The question.
+    pub(crate) question: String,
+}
+
+/// `reply` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplyArgs {
+    /// The answer for the commander.
+    pub(crate) text: String,
+}
+
 /// `update_scope` arguments: omitted fields keep their current values.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -388,6 +442,12 @@ pub(crate) enum Action {
     Scope(ScopeUpdate),
     /// Update the incident record.
     Incident(IncidentUpdate),
+    /// Read the situation summary (Lead).
+    Situation,
+    /// Ask a specialist (Lead).
+    Ask(AskArgs),
+    /// Answer the commander (Lead).
+    Reply(ReplyArgs),
 }
 
 /// A call that passed every check.
@@ -410,17 +470,42 @@ pub(crate) struct Rejection {
     pub(crate) reason: String,
 }
 
+/// A tool call after checking: what to do, or why the runner refuses it.
+pub(crate) type Checked = Result<Call, Rejection>;
+
 /// A model tool call after checking.
 #[derive(Debug)]
-pub(crate) struct Prepared {
+struct Prepared {
     /// Arguments to keep in the conversation history: valid JSON even when the model's were not.
-    pub(crate) history_arguments: String,
+    history_arguments: String,
     /// The checked call or the rejection.
-    pub(crate) outcome: Result<Call, Rejection>,
+    outcome: Checked,
+}
+
+/// Check every tool call of one model reply against the tools the agent was offered: the calls
+/// as the conversation history keeps them (arguments always valid JSON), and each call's
+/// outcome, in order.
+pub(crate) fn prepare_reply(
+    offered: &[ToolSpec],
+    calls: &[RequestedCall],
+) -> (Vec<ToolCall>, Vec<Checked>) {
+    calls
+        .iter()
+        .map(|call| {
+            let Prepared {
+                history_arguments,
+                outcome,
+            } = prepare(offered, &call.name, &call.arguments);
+            (
+                ToolCall::new(call.id.clone(), call.name.clone(), history_arguments),
+                outcome,
+            )
+        })
+        .unzip()
 }
 
 /// Repair, validate and type one tool call against the tools the agent was offered.
-pub(crate) fn prepare(offered: &[ToolSpec], name: &str, raw_arguments: &str) -> Prepared {
+fn prepare(offered: &[ToolSpec], name: &str, raw_arguments: &str) -> Prepared {
     let mut args = match repair::parse_arguments(raw_arguments) {
         Ok(parsed) => {
             if parsed.repaired {
@@ -533,6 +618,9 @@ fn action(tool: Tool, args: &Value) -> Result<Action, String> {
         Tool::ProposeAction => Action::Proposal(typed(args)?),
         Tool::UpdateScope => Action::Scope(typed(args)?),
         Tool::UpdateIncident => Action::Incident(typed(args)?),
+        Tool::GetSituation => Action::Situation,
+        Tool::AskAgent => Action::Ask(typed(args)?),
+        Tool::Reply => Action::Reply(typed(args)?),
     })
 }
 

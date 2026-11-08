@@ -55,6 +55,9 @@ pub enum Role {
     Forensics,
     Scribe,
     Containment,
+    /// The commander's point of contact: talks with humans and delegates to the other agents.
+    /// No stratum and no exec.
+    Lead,
 }
 
 /// Who did or said something.

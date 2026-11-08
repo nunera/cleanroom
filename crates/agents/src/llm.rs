@@ -139,6 +139,9 @@ pub(crate) struct Reply {
 enum Purpose {
     /// An agent step.
     Agent,
+    /// A conversational turn: the Lead talking with the commander, or a specialist answering a
+    /// question.
+    Chat,
     /// A safety verdict.
     Safety,
 }
@@ -148,10 +151,28 @@ impl Purpose {
     const fn label(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Chat => "chat",
             Self::Safety => "safety",
         }
     }
 }
+
+/// Chat-template switches the Nemotron endpoints accept as `chat_template_kwargs`.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct TemplateKwargs {
+    /// Whether the model writes a reasoning trace before it answers.
+    enable_thinking: bool,
+}
+
+/// A specialist's answer to a question skips the reasoning trace.
+///
+/// The answer summarizes work already done: hosted Lightning then answers in about a second, and
+/// the token budget goes to the answer (in a live run a specialist spent all of its tokens
+/// reasoning and answered nothing). The Lead keeps its reasoning: without it, it answered "ask
+/// Hunter" from the situation instead of asking Hunter.
+const NO_THINKING: TemplateKwargs = TemplateKwargs {
+    enable_thinking: false,
+};
 
 /// The request body.
 #[derive(Serialize)]
@@ -168,6 +189,10 @@ struct Body<'a> {
     tool_choice: Option<&'static str>,
     /// Token budget.
     max_tokens: u32,
+    /// Chat-template switches. Only conversational turns set them, so agent steps and safety
+    /// requests, and the cache keys of their recordings, stay as they were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<TemplateKwargs>,
 }
 
 /// Serialize a chat-completions request. The bytes are both what is sent and what the cache keys on.
@@ -180,12 +205,27 @@ pub(crate) fn request_body(
     tools: &[ToolSpec],
     max_tokens: u32,
 ) -> serde_json::Result<Vec<u8>> {
+    body(model, messages, tools, max_tokens, None)
+}
+
+/// Serialize a request with optional chat-template switches.
+///
+/// # Errors
+/// Fails only if a message cannot be serialized.
+fn body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    max_tokens: u32,
+    chat_template_kwargs: Option<TemplateKwargs>,
+) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&Body {
         model,
         messages,
         tools,
         tool_choice: (!tools.is_empty()).then_some("auto"),
         max_tokens,
+        chat_template_kwargs,
     })
 }
 
@@ -411,6 +451,27 @@ impl Router {
             .await
     }
 
+    /// One conversational turn for `role` on `route`: the Lead talking with the commander, or a
+    /// specialist answering a question ([`NO_THINKING`]). It replays from its own stream, so
+    /// questions never shift the positions of an investigation's recorded steps.
+    ///
+    /// # Errors
+    /// Fails like [`Router::chat`].
+    pub(crate) async fn talk(
+        &self,
+        role: Role,
+        route: ModelRoute,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Reply> {
+        let model = self.model(role, Purpose::Chat, route);
+        let switches = (role != Role::Lead).then_some(NO_THINKING);
+        let request = body(model, messages, tools, AGENT_MAX_TOKENS, switches)
+            .context("cannot encode the model request")?;
+        self.complete(role, Purpose::Chat, route, Bytes::from(request))
+            .await
+    }
+
     /// Score `text` with the safety model on `route`. Returns the verdict and the model used.
     ///
     /// # Errors
@@ -439,9 +500,9 @@ impl Router {
     /// The model `purpose` uses for `role` on `route`.
     fn model(&self, role: Role, purpose: Purpose, route: ModelRoute) -> &str {
         match (route, &self.local, purpose) {
-            (ModelRoute::Local, Some(local), Purpose::Agent) => &local.model,
+            (ModelRoute::Local, Some(local), Purpose::Agent | Purpose::Chat) => &local.model,
             (ModelRoute::Local, Some(local), Purpose::Safety) => &local.safety_model,
-            (ModelRoute::Local | ModelRoute::Hosted, _, Purpose::Agent) => {
+            (ModelRoute::Local | ModelRoute::Hosted, _, Purpose::Agent | Purpose::Chat) => {
                 self.models.for_role(role)
             }
             (ModelRoute::Local | ModelRoute::Hosted, _, Purpose::Safety) => &self.models.safety,
@@ -686,6 +747,7 @@ mod tests {
             },
             local: None,
             models: Models {
+                lead: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
                 hunter: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
                 forensics: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
                 scribe: model("nvidia/nemotron-3-ultra-550b-a55b"),

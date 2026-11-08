@@ -1,26 +1,31 @@
 //! The reducer: folds daemon frames into everything the command center shows.
 //!
-//! [`State::apply`] is the only way state changes from the outside. Live mode, replay mode and
-//! offline renders all feed it the same [`Envelope`]s, so the screen depends on daemon frames
-//! alone.
+//! [`State::apply`] is the only way bus and daemon data enter. Live mode, replay mode and offline
+//! renders all feed it the same [`Envelope`]s, so the screen depends on daemon frames alone.
 
 use std::collections::{HashSet, VecDeque};
 
 use cleanroom_proto::{
-    BusBody, BusMessage, CoreResponse, Envelope, ExecOutcome, ExecResult, Frame, IncidentRecord,
-    IncidentStatus, KeyId, LlmMode, ModelRoute, Principal, Role, ScopeRecord, ToolDecision,
-    ToolRequest, ToolSource, Tri, Triggers, WIRE_VERSION,
+    Audience, BusBody, BusMessage, CoreResponse, Envelope, ExecOutcome, ExecResult, Frame,
+    IncidentRecord, IncidentStatus, KeyId, LlmMode, MemberRole, ModelRoute, Principal, Role,
+    ScopeFlags, ScopeRecord, ToolDecision, ToolRequest, ToolSource, Tri, Triggers, WIRE_VERSION,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
+use crate::access::{Enrollment, Roster, Standing, role_word};
+use crate::denials::{self, Denial, Kind, Reported, Traced, split_receipt};
+use crate::team::{self, Team};
+
 /// Agent-pane lines kept in memory.
 const ACTIVITY_LIMIT: usize = 500;
-/// Chat lines kept in memory.
-const CHAT_LIMIT: usize = 200;
+/// Conversation entries kept in memory.
+const TALK_LIMIT: usize = 400;
 /// Longest text kept from a single trace argument or result.
 const PREVIEW_CHARS: usize = 160;
+/// Longest one-line summary of a message on an agent's card.
+const CARD_CHARS: usize = 120;
 
 /// What the console asked `cleanroomd` for, so its response can be explained.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +53,24 @@ pub enum SentRequest {
         /// Approve (true) or deny (false).
         approved: bool,
     },
+    /// `enroll` a member with an admin-signed record.
+    Enroll {
+        /// `sha256:` of the member's key.
+        key_id: KeyId,
+        /// The member's raw public key, hex.
+        public_key: String,
+        /// Display name.
+        name: String,
+        /// Role.
+        role: MemberRole,
+    },
+    /// `revoke` a member's key.
+    Revoke {
+        /// `sha256:` of the member's key.
+        key_id: KeyId,
+        /// Display name, when known.
+        name: Option<String>,
+    },
     /// `verify_log`.
     VerifyLog,
     /// `reset`.
@@ -69,6 +92,11 @@ impl SentRequest {
                 subject_id,
                 approved: false,
             } => format!("Deny {subject_id}"),
+            Self::Enroll { name, role, .. } => format!("Enroll {name} ({})", role_word(*role)),
+            Self::Revoke { key_id, name } => format!(
+                "Revoke {}",
+                name.clone().unwrap_or_else(|| short_key(key_id))
+            ),
             Self::VerifyLog => "Verify log".to_owned(),
             Self::Reset => "Reset".to_owned(),
         }
@@ -116,16 +144,41 @@ pub(crate) struct Activity {
     pub(crate) tone: Tone,
     /// The line itself.
     pub(crate) text: String,
+    /// Everything the one-line text leaves out (full arguments, the whole result), shown when
+    /// the line is expanded; empty when there is nothing more.
+    pub(crate) detail: String,
 }
 
-/// One chat line in the comms pane.
+/// One entry in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChatLine {
+pub(crate) enum Talk {
+    /// A chat message.
+    Said(Said),
+    /// A key event, shown as one dim line.
+    Marker(Marker),
+}
+
+/// A chat message and who it was for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Said {
     /// Local `HH:MM:SS`.
     pub(crate) at: String,
     /// Sender.
-    pub(crate) who: Who,
+    pub(crate) from: Who,
+    /// Audience.
+    pub(crate) to: Audience,
     /// Message text.
+    pub(crate) text: String,
+}
+
+/// A key system event in the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Marker {
+    /// Local `HH:MM:SS`.
+    pub(crate) at: String,
+    /// Emphasis.
+    pub(crate) tone: Tone,
+    /// The event.
     pub(crate) text: String,
 }
 
@@ -245,12 +298,19 @@ struct Entry {
     tone: Tone,
     /// The line itself.
     text: String,
+    /// What an expanded line adds.
+    detail: String,
 }
 
 impl Entry {
-    /// An entry tagged `tag`.
+    /// An entry tagged `tag` with nothing more to show when expanded.
     const fn new(tag: &'static str, tone: Tone, text: String) -> Self {
-        Self { tag, tone, text }
+        Self {
+            tag,
+            tone,
+            text,
+            detail: String::new(),
+        }
     }
 }
 
@@ -267,8 +327,14 @@ pub struct State {
     pub(crate) scope: Vec<ScopeRecord>,
     /// Live agent pane, oldest first.
     pub(crate) activity: VecDeque<Activity>,
-    /// Human chat, oldest first.
-    pub(crate) chat: VecDeque<ChatLine>,
+    /// The conversation: chat and key events, oldest first.
+    pub(crate) talk: VecDeque<Talk>,
+    /// Every OS denial this session.
+    pub(crate) denials: denials::Log,
+    /// The Lead and the specialists, as their events show them.
+    pub(crate) team: Team,
+    /// Members enrolled or revoked this session.
+    pub(crate) roster: Roster,
     /// Pending tool requests and proposals.
     pub(crate) queue: Vec<QueueItem>,
     /// Subjects already decided, so a late request doesn't re-enter the queue.
@@ -299,7 +365,10 @@ impl State {
             incident: None,
             scope: Vec::new(),
             activity: VecDeque::new(),
-            chat: VecDeque::new(),
+            talk: VecDeque::new(),
+            denials: denials::Log::default(),
+            team: Team::default(),
+            roster: Roster::default(),
             queue: Vec::new(),
             decided: HashSet::new(),
             guardrails: true,
@@ -320,8 +389,8 @@ impl State {
     /// Fold one frame from `cleanroomd` into the state.
     ///
     /// `request` is what this console sent under a `response` frame's id, when known; replays
-    /// and offline renders pass `None`. `now` stamps lines that come from responses, which
-    /// carry no time of their own.
+    /// and offline renders pass `None`. `now` is the console's clock: it stamps lines that come
+    /// from responses, which carry no time of their own, and times the banners and card states.
     pub fn apply(&mut self, envelope: Envelope, request: Option<&SentRequest>, now: Timestamp) {
         if envelope.v != WIRE_VERSION {
             self.notify(
@@ -331,7 +400,7 @@ impl State {
             return;
         }
         match envelope.frame {
-            Frame::Event(signed) => self.apply_message(signed.body),
+            Frame::Event(signed) => self.apply_message(signed.body, now),
             Frame::Response { response, .. } => self.apply_response(response, request, now),
             Frame::Hello { .. } | Frame::Publish(_) | Frame::Request { .. } => {
                 self.notify(Tone::Warn, "Ignored a client-only frame from cleanroomd");
@@ -350,6 +419,23 @@ impl State {
     /// Queue items still waiting for the commander's signature.
     pub(crate) fn waiting(&self) -> usize {
         self.queue.iter().filter(|item| item.sent.is_none()).count()
+    }
+
+    /// Whether something `role` asked for waits for the commander's signature.
+    pub(crate) fn waiting_on(&self, role: Role) -> bool {
+        self.queue
+            .iter()
+            .any(|item| item.sent.is_none() && item.from == Who::Agent(role))
+    }
+
+    /// Kernel and OS blocks this session: the runtime's count or the denials seen, whichever
+    /// is higher (the runtime's count survives a console restart; the denials name each one).
+    pub(crate) fn blocks(&self) -> u64 {
+        let counted = self
+            .counters
+            .map_or(0, |counters| u64::from(counters.blocked_by_os));
+        let seen = u64::try_from(self.denials.len()).unwrap_or(u64::MAX);
+        counted.max(seen)
     }
 
     /// Incident triggers, or none before an incident exists.
@@ -382,21 +468,24 @@ impl State {
         reason = "one flat arm per bus message type reads clearer than splitting the dispatch. \
                   `allow`, not `expect`: the lint only runs under the strict profile"
     )]
-    fn apply_message(&mut self, message: BusMessage) {
+    fn apply_message(&mut self, message: BusMessage, now: Timestamp) {
         let origin = Origin {
             at: self.time_label(&message.at),
             who: self.who(&message.from),
         };
         match message.body {
-            BusBody::Chat { text } => {
-                let Origin { at, who } = origin;
-                push_capped(&mut self.chat, ChatLine { at, who, text }, CHAT_LIMIT);
-            }
+            BusBody::Chat { text } => self.chat(origin, message.to, text, now),
             BusBody::Finding {
                 summary,
                 evidence,
                 confidence_pct,
             } => {
+                if let Who::Agent(role) = origin.who {
+                    self.team
+                        .noted(role, format!("found: {}", one_line(&summary)));
+                }
+                let found = format!("{} found: {summary}", who_title(&origin.who));
+                self.mark(&origin, Tone::Warn, found);
                 let text = format!("{summary} ({confidence_pct}%, {} evidence)", evidence.len());
                 self.log(&origin, Entry::new("FINDING", Tone::Warn, text));
             }
@@ -405,6 +494,14 @@ impl State {
                 action,
                 rationale,
             } => {
+                if let Who::Agent(role) = origin.who {
+                    self.team.noted(role, format!("proposes: {action}"));
+                }
+                let proposes = format!(
+                    "{} proposes: {action} · waiting for your signature",
+                    who_title(&origin.who)
+                );
+                self.mark(&origin, Tone::Warn, proposes);
                 let entry = Entry::new("PROPOSAL", Tone::Warn, format!("{action}: {rationale}"));
                 let ask = Ask::Proposal { action, rationale };
                 self.enqueue(proposal_id, origin.who.clone(), ask);
@@ -428,14 +525,33 @@ impl State {
                 args,
                 result_preview,
                 outcome,
-            } => self.log(
-                &origin,
-                trace_entry(step, &tool, &args, &result_preview, outcome.as_ref()),
-            ),
+            } => {
+                let entry = trace_entry(step, &tool, &args, &result_preview, outcome.as_ref());
+                if let Who::Agent(role) = origin.who {
+                    self.team.step(role, &tool, entry.text.clone(), now);
+                    if let Some(ExecOutcome::Denied { reason }) = outcome {
+                        let traced = Traced {
+                            role,
+                            step,
+                            command: summarize_args(&args),
+                            reason,
+                            receipt: split_receipt(&result_preview).1,
+                        };
+                        self.denied_step(&origin, traced, now);
+                    }
+                }
+                self.log(&origin, entry);
+            }
             BusBody::Refusal {
                 artifact,
                 instruction,
             } => {
+                let refused = format!("refused \"{}\" in {artifact}", one_line(&instruction));
+                if let Who::Agent(role) = origin.who {
+                    self.team.refused(role, refused.clone(), now);
+                }
+                let marker = format!("{} {refused}: blocked by the model", who_title(&origin.who));
+                self.mark(&origin, Tone::Good, marker);
                 let text = format!("blocked by the model: \"{instruction}\" in {artifact}");
                 self.log(&origin, Entry::new("REFUSED", Tone::Good, text));
             }
@@ -460,19 +576,123 @@ impl State {
                 safe,
                 categories,
             } => self.log(&origin, safety_entry(&artifact, &model, safe, &categories)),
-            BusBody::Route { route, reason } => self.log(&origin, route_entry(route, &reason)),
+            BusBody::Route { route, reason } => {
+                if let Who::Agent(role) = origin.who {
+                    self.team.route(role, route);
+                }
+                self.log(&origin, route_entry(route, &reason));
+            }
             BusBody::Scope(record) => self.scope_update(&origin, record),
             BusBody::Incident(record) => self.incident_update(&origin, record),
-            BusBody::Status { text } => self.log(&origin, Entry::new("STATUS", Tone::Plain, text)),
+            BusBody::Status { text } => self.status(&origin, text, now),
             BusBody::Investigate { incident_id, brief } => {
+                self.team.investigate(now);
+                self.mark(
+                    &origin,
+                    Tone::Plain,
+                    format!("investigation started on {incident_id}"),
+                );
                 let text = format!("{incident_id}: {brief}");
                 self.log(&origin, Entry::new("INVESTIGATE", Tone::Plain, text));
                 self.investigating = Some(incident_id);
             }
             BusBody::AgentControl { guardrails } => {
                 self.guardrails = guardrails;
-                self.log(&origin, guardrails_entry(guardrails));
+                let entry = guardrails_entry(guardrails);
+                let tone = if guardrails { Tone::Good } else { Tone::Warn };
+                self.mark(&origin, tone, format!("guardrails {}", entry.text));
+                self.log(&origin, entry);
             }
+        }
+    }
+
+    /// A chat message: into the conversation, and onto the cards of who spoke and who was asked.
+    fn chat(&mut self, origin: Origin, to: Audience, text: String, now: Timestamp) {
+        let summary = one_line(&text);
+        match (&origin.who, &to) {
+            (Who::Agent(Role::Lead), Audience::Role { role }) if *role != Role::Lead => {
+                let line = format!("asked {}: {summary}", team::title(*role));
+                self.team.delegated(*role, line, now);
+            }
+            (Who::Agent(role), _) => {
+                let line = format!("→ {}: {summary}", audience_title(&to));
+                self.team.spoke(*role, line);
+            }
+            (Who::Me | Who::Human(_), Audience::Role { role }) => {
+                self.team.asked_by_human(*role, now);
+            }
+            (Who::Me | Who::Human(_) | Who::System, _) => {}
+        }
+        let Origin { at, who } = origin;
+        push_capped(
+            &mut self.talk,
+            Talk::Said(Said {
+                at,
+                from: who,
+                to,
+                text,
+            }),
+            TALK_LIMIT,
+        );
+    }
+
+    /// A status line: cleanroomd's become conversation markers (and denials, and members); the
+    /// agent runtime's announce models and the end of an investigation.
+    fn status(&mut self, origin: &Origin, text: String, now: Timestamp) {
+        match &origin.who {
+            Who::System => {
+                if let Some(reported) = denials::parse_status(&text) {
+                    self.denied(origin, reported, now);
+                } else {
+                    self.roster.status(&text);
+                    self.mark(origin, Tone::Quiet, text.clone());
+                }
+            }
+            Who::Agent(_) => {
+                if text.contains("models: ") {
+                    self.team.models(models(&text));
+                }
+                let finished = text.contains("agents offline")
+                    || (text.contains("investigation ") && text.contains(" finished"));
+                if finished {
+                    self.team.finished();
+                }
+            }
+            Who::Me | Who::Human(_) => {}
+        }
+        self.log(origin, Entry::new("STATUS", Tone::Plain, text));
+    }
+
+    /// cleanroomd reported a denial.
+    fn denied(&mut self, origin: &Origin, reported: Reported, now: Timestamp) {
+        let fresh = self
+            .denials
+            .reported(reported, origin.at.clone(), now)
+            .map(|denial| (denial.role, denial_marker(denial)));
+        self.announce_denial(origin, fresh, now);
+    }
+
+    /// An agent's trace says the grant denied its step.
+    fn denied_step(&mut self, origin: &Origin, traced: Traced, now: Timestamp) {
+        let fresh = self
+            .denials
+            .traced(traced, origin.at.clone(), now)
+            .map(|denial| (denial.role, denial_marker(denial)));
+        self.announce_denial(origin, fresh, now);
+    }
+
+    /// Flash a new denial on its agent's card and mark it in the conversation.
+    fn announce_denial(
+        &mut self,
+        origin: &Origin,
+        fresh: Option<(Option<Role>, String)>,
+        now: Timestamp,
+    ) {
+        if let Some((role, text)) = fresh {
+            if let Some(role) = role {
+                self.team.blocked(role, now);
+            }
+            self.mark(origin, Tone::Bad, text);
         }
     }
 
@@ -499,10 +719,9 @@ impl State {
                 actual,
             } => {
                 let text = format!("{root} refused: layer {layer} does not match its lock");
-                self.log(
-                    &self.system_origin(now),
-                    Entry::new("ADMISSION", Tone::Bad, text.clone()),
-                );
+                let origin = self.system_origin(now);
+                self.mark(&origin, Tone::Bad, format!("admission rejected: {text}"));
+                self.log(&origin, Entry::new("ADMISSION", Tone::Bad, text.clone()));
                 self.notify(Tone::Bad, text);
                 self.set_admission(Admission::Rejected {
                     root,
@@ -513,10 +732,9 @@ impl State {
             }
             CoreResponse::Admitted { root, manifest } => {
                 let text = format!("{root} admitted: {manifest}");
-                self.log(
-                    &self.system_origin(now),
-                    Entry::new("ADMISSION", Tone::Good, text.clone()),
-                );
+                let origin = self.system_origin(now);
+                self.mark(&origin, Tone::Good, text.clone());
+                self.log(&origin, Entry::new("ADMISSION", Tone::Good, text.clone()));
                 self.notify(Tone::Good, text);
                 self.set_admission(Admission::Admitted { root, manifest });
             }
@@ -544,7 +762,7 @@ impl State {
             }
             Some(SentRequest::Detonate { scenario }) => self.notify(
                 Tone::Warn,
-                format!("Detonated {scenario} in the sacrificial stratum. Watch the scope table."),
+                format!("Detonated {scenario} in the sacrificial stratum. Watch the scope."),
             ),
             Some(SentRequest::Tamper { root }) => self.notify(
                 Tone::Warn,
@@ -560,6 +778,28 @@ impl State {
                     Tone::Good,
                     format!("{verb} of {subject_id} signed and accepted by cleanroomd."),
                 );
+            }
+            Some(
+                request @ SentRequest::Enroll {
+                    key_id,
+                    public_key,
+                    name,
+                    role,
+                },
+            ) => {
+                self.roster.enrolled(Enrollment {
+                    key_id: key_id.clone(),
+                    public_key: Some(public_key.clone()),
+                    name: Some(name.clone()),
+                    role: Some(*role),
+                    standing: Standing::Enrolled,
+                    receipt: None,
+                });
+                self.notify(Tone::Good, format!("{}: ok", request.describe()));
+            }
+            Some(request @ SentRequest::Revoke { key_id, .. }) => {
+                self.roster.revoked(key_id, None);
+                self.notify(Tone::Good, format!("{}: ok", request.describe()));
             }
             Some(request @ (SentRequest::Admit { .. } | SentRequest::VerifyLog)) => {
                 self.notify(Tone::Plain, format!("{}: ok", request.describe()));
@@ -594,14 +834,16 @@ impl State {
         }
     }
 
-    /// Forget everything about the previous run. Guardrails and identity survive: they belong to
-    /// the agents and this console, not to the incident. Scope survives too: cleanroomd
-    /// republishes every asset's all-`no` baseline on reset, possibly before its `ok`, and those
-    /// records replace the old ones by asset id.
+    /// Forget everything about the previous run. Guardrails, identity and the roster survive:
+    /// they belong to the agents, this console and cleanroomd's member list, not to the
+    /// incident. Scope survives too: cleanroomd republishes every asset's all-`no` baseline on
+    /// reset, possibly before its `ok`, and those records replace the old ones by asset id.
     fn clear(&mut self) {
         self.incident = None;
         self.activity.clear();
-        self.chat.clear();
+        self.talk.clear();
+        self.denials.clear();
+        self.team.clear();
         self.queue.clear();
         self.decided.clear();
         self.counters = None;
@@ -625,6 +867,7 @@ impl State {
             ToolSource::Nix { flake_ref } => format!("nix {flake_ref}"),
             ToolSource::Oci { image, manifest } => format!("oci {image}@{manifest}"),
         };
+        self.team.noted(from, format!("asked for {tool}"));
         let text = format!("needs {tool} ({source}): {reason}");
         let ask = Ask::Tool {
             tool,
@@ -658,23 +901,47 @@ impl State {
                 (Tone::Bad, format!("{request_id} denied: {reason}"))
             }
         };
-        if tone != Tone::Warn {
+        if tone == Tone::Warn {
+            let marker = self
+                .queue
+                .iter()
+                .find(|item| item.subject_id == request_id)
+                .and_then(|item| match &item.ask {
+                    Ask::Tool { tool, .. } => Some(format!(
+                        "{} wants {tool}: outside policy, waiting for your signature",
+                        who_title(&item.from)
+                    )),
+                    Ask::Proposal { .. } => None,
+                })
+                .unwrap_or_else(|| text.clone());
+            self.mark(origin, Tone::Warn, marker);
+        } else {
             self.settle(request_id);
         }
         self.log(origin, Entry::new("TOOL", tone, text));
     }
 
-    /// A full scope record for one asset. Logs a line when its flags change.
+    /// A full scope record for one asset. Logs a line when its flags change and marks the
+    /// conversation when the asset becomes compromised (or stops being).
     fn scope_update(&mut self, origin: &Origin, record: ScopeRecord) {
         let index = self
             .scope
             .iter()
             .position(|asset| asset.asset_id == record.asset_id);
-        let changed = index
-            .and_then(|index| self.scope.get(index))
-            .is_none_or(|old| old.flags != record.flags);
+        let old = index.and_then(|index| self.scope.get(index));
+        let changed = old.is_none_or(|old| old.flags != record.flags);
+        let was_hit = old.is_some_and(|old| compromised(old.flags));
         if changed {
             self.log(origin, scope_entry(&record));
+        }
+        let hit = compromised(record.flags);
+        if hit && !was_hit {
+            let flags = yes_flags(record.flags).join(", ");
+            let text = format!("{} compromised: {flags}", record.name);
+            self.mark(origin, Tone::Bad, text);
+        } else if was_hit && !hit {
+            let text = format!("{}: no flag set any more", record.name);
+            self.mark(origin, Tone::Good, text);
         }
         match index.and_then(|index| self.scope.get_mut(index)) {
             Some(slot) => *slot = record,
@@ -682,7 +949,8 @@ impl State {
         }
     }
 
-    /// A full incident record. Logs declarations, status changes and newly started clocks.
+    /// A full incident record. Logs and marks declarations, status changes and newly started
+    /// clocks.
     fn incident_update(&mut self, origin: &Origin, record: IncidentRecord) {
         let previous = self.incident.take();
         let status = status_word(record.status);
@@ -690,17 +958,20 @@ impl State {
             Some(old) if old.id == record.id => {
                 if old.status != record.status {
                     let text = format!("{} is now {status}", record.id);
+                    self.mark(origin, Tone::Warn, format!("incident {text}"));
                     self.log(origin, Entry::new("INCIDENT", Tone::Warn, text));
                 }
             }
             Some(_) | None => {
                 let text = format!("{} declared: {} ({status})", record.id, record.title);
+                self.mark(origin, Tone::Bad, format!("incident {text}"));
                 self.log(origin, Entry::new("INCIDENT", Tone::Bad, text));
             }
         }
         let old_triggers = previous.map(|old| old.triggers).unwrap_or_default();
         for name in started_clocks(&old_triggers, &record.triggers) {
             let text = format!("{name} clock started");
+            self.mark(origin, Tone::Warn, text.clone());
             self.log(origin, Entry::new("LEGAL CLOCK", Tone::Warn, text));
         }
         self.incident = Some(record);
@@ -745,8 +1016,19 @@ impl State {
             tag: entry.tag,
             tone: entry.tone,
             text: entry.text,
+            detail: entry.detail,
         };
         push_capped(&mut self.activity, activity, ACTIVITY_LIMIT);
+    }
+
+    /// Mark a key event in the conversation.
+    fn mark(&mut self, origin: &Origin, tone: Tone, text: String) {
+        let marker = Marker {
+            at: origin.at.clone(),
+            tone,
+            text,
+        };
+        push_capped(&mut self.talk, Talk::Marker(marker), TALK_LIMIT);
     }
 
     /// `cleanroomd` at `now`: the origin of response-driven lines.
@@ -799,6 +1081,92 @@ pub(crate) const fn status_word(status: IncidentStatus) -> &'static str {
     }
 }
 
+/// `Hunter`, `cleanroomd`, `you`, `human 1b809d1d`: a sender in a sentence.
+pub(crate) fn who_title(who: &Who) -> String {
+    match who {
+        Who::Agent(role) => team::title(*role).to_owned(),
+        Who::System => "cleanroomd".to_owned(),
+        Who::Me => "you".to_owned(),
+        Who::Human(short) => format!("human {short}"),
+    }
+}
+
+/// `Lead`, `Hunter`, `you`, `team`: an audience in a sentence.
+pub(crate) const fn audience_title(to: &Audience) -> &'static str {
+    match to {
+        Audience::Role { role } => team::title(*role),
+        Audience::Humans => "you",
+        Audience::All => "team",
+    }
+}
+
+/// One line of a message for a card: markdown emphasis dropped, whitespace collapsed, clipped.
+pub(crate) fn one_line(text: &str) -> String {
+    let plain: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&plain.replace("**", "").replace('`', ""), CARD_CHARS)
+}
+
+/// `role=model` pairs from the agent runtime's "agents online …; models: lead=…, hunter=…" line.
+fn models(text: &str) -> Vec<(Role, String)> {
+    let Some((_, list)) = text.split_once("models: ") else {
+        return Vec::new();
+    };
+    let list = list.split_once(';').map_or(list, |(list, _)| list);
+    list.split(',')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter_map(|(role, model)| {
+            denials::role_named(role.trim()).map(|role| (role, model.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// The conversation's line for a denial.
+fn denial_marker(denial: &Denial) -> String {
+    let receipt = denial
+        .receipt
+        .map(|seq| format!(" · receipt #{seq}"))
+        .unwrap_or_default();
+    match denial.kind {
+        Kind::Exec => format!(
+            "kernel blocked {}: {} · {}{receipt}",
+            denial.who,
+            denial.command,
+            denial.short_reason()
+        ),
+        Kind::Record => format!(
+            "cleanroomd kept the record: {} tried to {}{receipt}",
+            denial.who, denial.command
+        ),
+    }
+}
+
+/// Whether any flag says the asset was hit.
+pub(crate) fn compromised(flags: ScopeFlags) -> bool {
+    [
+        flags.locked,
+        flags.exfiltrated,
+        flags.accessed,
+        flags.destroyed,
+        flags.modified,
+    ]
+    .contains(&Tri::Yes)
+}
+
+/// Names of the flags that are `yes`, most severe first.
+pub(crate) fn yes_flags(flags: ScopeFlags) -> Vec<&'static str> {
+    [
+        ("EXFILTRATED", flags.exfiltrated),
+        ("DESTROYED", flags.destroyed),
+        ("LOCKED", flags.locked),
+        ("MODIFIED", flags.modified),
+        ("ACCESSED", flags.accessed),
+    ]
+    .into_iter()
+    .filter(|(_, value)| *value == Tri::Yes)
+    .map(|(name, _)| name)
+    .collect()
+}
+
 /// A commander's approval or denial on the bus.
 const fn approval_entry(subject_id: String, approved: bool) -> Entry {
     if approved {
@@ -808,7 +1176,8 @@ const fn approval_entry(subject_id: String, approved: bool) -> Entry {
     }
 }
 
-/// One agent loop step. An `outcome` of `denied` is the kernel grant refusing the command.
+/// One agent loop step on one line: `#5 exec rm -rf /evidence/* → BLOCKED (read-only)`. The
+/// full arguments and result go into the detail an expanded line shows.
 fn trace_entry(
     step: u32,
     tool: &str,
@@ -816,29 +1185,57 @@ fn trace_entry(
     result: &str,
     outcome: Option<&ExecOutcome>,
 ) -> Entry {
-    let args = summarize_args(args);
-    let call = if args.is_empty() {
+    let summary = summarize_args(args);
+    let call = if summary.is_empty() {
         format!("#{step} {tool}")
     } else {
-        format!("#{step} {tool} {args}")
+        format!("#{step} {tool} {summary}")
     };
-    let result = first_line(result);
-    match outcome {
-        Some(ExecOutcome::Denied { reason }) => Entry::new(
+    let detail = trace_detail(args, result, outcome);
+    let (tag, tone, text) = match outcome {
+        Some(ExecOutcome::Denied { reason }) => (
             "BLOCKED BY OS",
             Tone::Bad,
-            format!("{call} → denied by the grant: {reason}"),
+            format!("{call} → BLOCKED ({})", denials::short_reason(reason)),
         ),
-        Some(ExecOutcome::TimedOut) => {
-            Entry::new("TRACE", Tone::Warn, format!("{call} → {result}"))
-        }
-        Some(ExecOutcome::Exited { .. }) | None if tool == "answer" => {
-            Entry::new("ANSWER", Tone::Plain, format!("{call} → {result}"))
-        }
-        Some(ExecOutcome::Exited { .. }) | None => {
-            Entry::new("TRACE", Tone::Quiet, format!("{call} → {result}"))
-        }
+        Some(ExecOutcome::TimedOut) => ("TRACE", Tone::Warn, format!("{call} → timed out")),
+        Some(ExecOutcome::Exited { .. }) | None if tool == "answer" => (
+            "ANSWER",
+            Tone::Plain,
+            format!("{call} → {}", first_line(result)),
+        ),
+        Some(ExecOutcome::Exited { .. }) | None => (
+            "TRACE",
+            Tone::Quiet,
+            format!("{call} → {}", first_line(result)),
+        ),
+    };
+    Entry {
+        tag,
+        tone,
+        text,
+        detail,
     }
+}
+
+/// Everything about a step: the exit, the denial reason, the full arguments and the result.
+fn trace_detail(args: &Value, result: &str, outcome: Option<&ExecOutcome>) -> String {
+    let outcome = match outcome {
+        Some(ExecOutcome::Denied { reason }) => format!("denied by the stratum grant: {reason}\n"),
+        Some(ExecOutcome::Exited { code }) => format!("exit {code}\n"),
+        Some(ExecOutcome::TimedOut) => "timed out\n".to_owned(),
+        None => String::new(),
+    };
+    let args = match args {
+        Value::Null => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_)
+        | Value::Object(_) => format!("args {args}\n"),
+    };
+    format!("{outcome}{args}{}", result.trim_end())
 }
 
 /// A safety model's verdict on an untrusted artifact.
@@ -889,21 +1286,14 @@ fn guardrails_entry(guardrails: bool) -> Entry {
 /// One-line description of an asset's flags.
 fn scope_entry(record: &ScopeRecord) -> Entry {
     let flags = [
-        ("LOCKED", record.flags.locked),
-        ("EXFILTRATED", record.flags.exfiltrated),
-        ("ACCESSED", record.flags.accessed),
-        ("DESTROYED", record.flags.destroyed),
-        ("MODIFIED", record.flags.modified),
+        record.flags.locked,
+        record.flags.exfiltrated,
+        record.flags.accessed,
+        record.flags.destroyed,
+        record.flags.modified,
     ];
-    let hit: Vec<&str> = flags
-        .iter()
-        .filter(|(_, value)| *value == Tri::Yes)
-        .map(|(name, _)| *name)
-        .collect();
-    let unknown = flags
-        .iter()
-        .filter(|(_, value)| *value == Tri::Unknown)
-        .count();
+    let hit = yes_flags(record.flags);
+    let unknown = flags.iter().filter(|value| **value == Tri::Unknown).count();
     let name = &record.name;
     let confidence = record.confidence_pct;
     if !hit.is_empty() {
@@ -971,7 +1361,7 @@ fn first_line(text: &str) -> String {
 }
 
 /// At most `max` characters, with an ellipsis when cut.
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }

@@ -3,28 +3,35 @@
 //!
 //! Hunter and Forensics investigate concurrently. Their findings flow to Scribe, which keeps the
 //! incident and scope records. When both are done, Containment proposes actions, and Scribe
-//! records the commander's decisions on them while they arrive.
+//! records the commander's decisions on them while they arrive. The Lead stays up across
+//! incidents: every bus event updates the team's situation, which the Lead narrates and answers
+//! the commander from, and a question addressed to a specialist gets that specialist's answer
+//! beside its investigation loop.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
-use cleanroom_proto::{BusBody, BusMessage, LlmMode, Principal, Role, ScopeRecord, Signed};
+use cleanroom_proto::{
+    Audience, BusBody, BusMessage, LlmMode, Principal, Role, ScopeRecord, Signed,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, Control, Desk, Note, Shared, on_off};
+use crate::agent::{Agent, Asker, Control, Desk, Note, Shared, on_off};
 use crate::config::{self, Settings};
 use crate::daemon::{Connection, Inbound};
+use crate::lead::Lead;
 use crate::llm::Router;
 use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::Counters;
 use crate::sensitivity::Detector;
+use crate::situation::{self, Situation};
 use crate::tools::FindingArgs;
 use crate::{keys, text};
 
@@ -53,6 +60,8 @@ pub(crate) struct Options {
 /// One connection per role.
 #[derive(Debug)]
 struct Crew {
+    /// The Lead's connection.
+    lead: Arc<Connection>,
     /// Hunter's connection.
     hunter: Arc<Connection>,
     /// Forensics' connection.
@@ -83,6 +92,7 @@ impl Crew {
         let mut connections = connections.into_iter();
         let mut next = || connections.next().context("a role connection is missing");
         Ok(Self {
+            lead: next()?,
             hunter: next()?,
             forensics: next()?,
             scribe: next()?,
@@ -90,15 +100,20 @@ impl Crew {
         })
     }
 
-    /// An agent for `role`.
-    fn agent(&self, role: Role, shared: &Arc<Shared>) -> Agent {
-        let connection = match role {
+    /// The connection speaking for `role`.
+    const fn connection(&self, role: Role) -> &Arc<Connection> {
+        match role {
+            Role::Lead => &self.lead,
             Role::Hunter => &self.hunter,
             Role::Forensics => &self.forensics,
             Role::Scribe => &self.scribe,
             Role::Containment => &self.containment,
-        };
-        Agent::new(role, Arc::clone(connection), Arc::clone(shared))
+        }
+    }
+
+    /// An agent for `role`.
+    fn agent(&self, role: Role, shared: &Arc<Shared>) -> Agent {
+        Agent::new(role, Arc::clone(self.connection(role)), Arc::clone(shared))
     }
 }
 
@@ -126,9 +141,15 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         max_steps: options.max_steps,
         nixpkgs: settings.nixpkgs,
     });
-    let lead = crew.agent(Role::Scribe, &shared);
-    lead.status(online_line(&shared, &socket)).await;
-    lead.publish_counters().await;
+    let team = crew.agent(Role::Scribe, &shared);
+    team.status(online_line(&shared, &socket)).await;
+    team.publish_counters().await;
+    let situation = Arc::new(Mutex::new(Situation::default()));
+    let lead = Lead::start(
+        Arc::clone(&crew.lead),
+        Arc::clone(&shared),
+        Arc::clone(&situation),
+    )?;
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
     let mut seen = Seen::default();
@@ -138,11 +159,14 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         tokio::select! {
             message = inbound.recv() => match message {
                 Some(Inbound::Event(event)) if seen.first(&event) => {
-                    let body = event.body;
-                    if let Some(case) = dispatch(&shared, &guardrails_tx, &lead, body, &mut assets).await {
+                    let message = event.body;
+                    let notable = situation::lock(&situation).observe(&message);
+                    lead.hear(&message, notable);
+                    consult(&crew, &shared, &situation, &message);
+                    if let Some(case) = dispatch(&shared, &guardrails_tx, &team, message, &mut assets).await {
                         if let Some(previous) = running.take() {
                             previous.abort();
-                            lead.status(format!("restarting the team for {}", case.incident_id)).await;
+                            team.status(format!("restarting the team for {}", case.incident_id)).await;
                         }
                         shared.router.restart_streams();
                         let task = investigate(Arc::clone(&shared), Arc::clone(&crew), case, assets.clone(), done_tx.clone());
@@ -169,8 +193,30 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     if let Some(investigation) = running {
         investigation.abort();
     }
-    lead.status("agents offline".to_owned()).await;
+    team.status("agents offline".to_owned()).await;
     result
+}
+
+/// When `message` asks a specialist a question (chat to its role from the Lead or a human),
+/// answer it beside the specialist's investigation loop, from what that role has done so far.
+fn consult(crew: &Crew, shared: &Arc<Shared>, situation: &Mutex<Situation>, message: &BusMessage) {
+    let (BusBody::Chat { text }, Audience::Role { role }) = (&message.body, &message.to) else {
+        return;
+    };
+    let asker = match message.from {
+        Principal::Agent { role: Role::Lead } => Asker::Lead,
+        Principal::Human { .. } => Asker::Human,
+        Principal::Agent { .. } | Principal::System => return,
+    };
+    if *role == Role::Lead {
+        return;
+    }
+    let briefing = situation::lock(situation).briefing(*role, SystemTime::now());
+    let agent = crew.agent(*role, shared);
+    let question = text.clone();
+    tokio::spawn(async move {
+        agent.answer_question(asker, &question, &briefing).await;
+    });
 }
 
 /// React to one bus event; `assets` mirrors the latest scope record per asset. Returns the case
@@ -178,7 +224,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
 async fn dispatch(
     shared: &Shared,
     guardrails: &watch::Sender<bool>,
-    lead: &Agent,
+    team: &Agent,
     message: BusMessage,
     assets: &mut BTreeMap<String, ScopeRecord>,
 ) -> Option<Case> {
@@ -195,12 +241,12 @@ async fn dispatch(
         } if trusted => {
             guardrails.send_replace(enabled);
             let prompts = if enabled { "hardened" } else { "naive" };
-            lead.status(format!(
+            team.status(format!(
                 "guardrails {}: agents use the {prompts} prompts",
                 on_off(enabled)
             ))
             .await;
-            lead.publish_counters().await;
+            team.publish_counters().await;
             None
         }
         BusBody::ToolDecision {
@@ -273,8 +319,9 @@ async fn investigate(
     let scribe = crew.agent(Role::Scribe, &shared);
     scribe
         .status(format!(
-            "investigating {}: hunter and forensics started, scribe keeps the record, containment proposes",
-            case.incident_id
+            "investigating {}: hunter and forensics started, scribe keeps the record, containment proposes; {}",
+            case.incident_id,
+            models(&shared.router)
         ))
         .await;
     let decisions = shared.control.subscribe();
@@ -544,7 +591,8 @@ fn containment_task(case: &Case, findings: &[(Role, FindingArgs)]) -> String {
     task
 }
 
-/// The startup status line.
+/// The startup status line. It ends with each role's hosted model, `models: lead=<id>, …`,
+/// which the command center shows on the agent cards.
 fn online_line(shared: &Shared, socket: &Path) -> String {
     let router = &shared.router;
     let local = router
@@ -559,13 +607,27 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
     format!(
-        "agents online on {}: hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop",
+        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; {}",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),
         router.egress(),
-        shared.max_steps
+        shared.max_steps,
+        models(router)
     )
+}
+
+/// `models: lead=<id>, hunter=<id>, …`: each role's hosted model.
+///
+/// The command center shows them on the agent cards. The clause ends the startup and
+/// per-incident status lines; status lines are not replayed, so a console that connects after
+/// startup still learns the models.
+fn models(router: &Router) -> String {
+    let models: Vec<String> = roles::ALL
+        .into_iter()
+        .map(|role| format!("{}={}", roles::name(role), router.hosted_model(role)))
+        .collect();
+    format!("models: {}", models.join(", "))
 }
 
 /// Bounded memory of event ids: every role connection receives every event, and the daemon

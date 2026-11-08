@@ -34,18 +34,15 @@ Prompt guardrails and safety models are probabilistic layers. The read-only gran
 
 ## Screenshots
 
-Before detonation: every asset clean, legal clocks not started.
+Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45.
 
-![Command center before detonation](docs/screenshots/tui-before.png)
+**Cleanroom** (the default screen): the commander's conversation with the Lead agent, the Lead's delegations to the specialists, the team with live status, and the situation (assets, the nearest legal clocks, approvals waiting). The red banner is pinned for a few seconds after the kernel blocks an agent.
 
-About a minute after detonation (live run, guardrails off, hosted Nemotron):
-- The scope table is red.
-- GDPR, HIPAA and Texas clocks are running.
-- Containment's isolation proposal is waiting for a signature.
-- Scribe's attempt to lower a measured flag was refused ("cannot lower a measurement").
-- Both agents' `rm -rf /evidence/*` attempts were blocked by the OS (`by OS 2`).
+![Cleanroom screen](docs/screenshots/cleanroom.png)
 
-![Command center after detonation](docs/screenshots/tui-after.png)
+**Controlroom**: the dense operator view. Every OS denial stays pinned at the top with its receipt; below are the legal clocks, the scope table, the one-line agent trace, approvals, the incident timeline and comms.
+
+![Controlroom screen](docs/screenshots/controlroom.png)
 
 ## Quick start
 
@@ -56,7 +53,7 @@ scripts/demo.sh --local            # route sensitive steps to Nemotron on Brev (
 scripts/demo.sh --replay           # replay recorded model responses, no network
 ```
 
-In the command center: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset.
+In the command center (Esc first if the message line has focus): `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset, `m` members, `Tab` switch screens.
 
 ## Layout
 
@@ -133,22 +130,25 @@ cleanroomd plan validate FILE                           # offline: boot order, o
 
 ## Agents
 
-`cleanroom-agents` connects to `cleanroomd` with one socket connection per role (Hunter, Forensics, Scribe, Containment), waits for an `investigate` bus event, and runs the team: Hunter and Forensics investigate concurrently inside their strata, their findings flow to Scribe, which keeps the incident and scope records, and Containment proposes actions for the commander to approve.
+`cleanroom-agents` connects to `cleanroomd` with one socket connection per role (Lead, Hunter, Forensics, Scribe, Containment), waits for an `investigate` bus event, and runs the team: Hunter and Forensics investigate concurrently inside their strata, their findings flow to Scribe, which keeps the incident and scope records, and Containment proposes actions for the commander to approve. The Lead is the commander's point of contact and stays up across incidents (with `--once`, the runner exits after the first investigation).
 
 ```sh
 cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--once]
 ```
 
 - `--guardrails` picks the hardened or the naive setup at start; `agent_control` bus events switch prompts and tools at runtime. With guardrails on, Hunter and Forensics use typed read-only tools, report findings as they go, and record each instruction they decline from untrusted data as a `refusal`. With guardrails off they run like a sloppy operator deployment: a "helpful sysadmin assistant" with only a shell (`exec`) and `report_finding`, handed the alert and told to read the notes on the share and handle them. Nothing names the injected instruction; the ransom note talks the model into it, and the stratum grant denies it (`trace.outcome` is `denied`).
+- **Lead:** it keeps a live picture of the incident from bus events alone: the incident, scope per asset, findings, refusals, OS denials (`trace.outcome` `denied`), counters, proposals and tool requests waiting for the commander, and the legal clocks from the incident's triggers. It narrates key events to `humans` in short templated lines, with no model call and at most one line every 4 s: the detonation, each agent's first OS denial (with the file it had just read and the receipt number), each agent's first finding, proposals waiting for a decision (merged when several arrive together), and Scribe's scope changes. A human `chat` to `role: lead` gets exactly one answer, from Nemotron (Lightning by default), even when the model fails; narration waits while the Lead answers. The Lead's tools are `get_situation`, `ask_agent` (a `chat` to a specialist's role, then up to 45 s for its answer) and `reply`. Its prompt is always the hardened one, whatever the guardrails setting, and an answer that claims an approval goes back to the model to be rewritten: approvals are human-only.
+- **Specialists answer questions:** a `chat` to a specialist's role from the Lead or a human gets one short answer from that specialist's model, with its current prompt and what it has done in this incident (its findings, refusals, denied commands and latest steps; Scribe also sees the records, Containment its proposals). It runs no tools and nothing new, beside the investigation loop, never blocking it. The answer goes to `role: lead`, or to `humans` when a human asked. Conversation turns replay from their own `<role>.chat` streams, so questions never shift a recorded investigation.
 - Tool arguments are conformed before they are validated: numbers sent as text or fractions become integers (`"95%"`, `0.95` → 95), a single path where a list is expected becomes a list, enum values match case-insensitively, over-long free text is clipped, and options the read-only evidence tools don't have are ignored. Anything still invalid goes back to the model as an error it can fix. Halfway through its step budget, an agent that has not reported a finding is offered only its reporting tools, and again in its last two calls.
 - Every evidence-bearing tool output is scored by the Nemotron safety model (`safety_verdict`) before a model sees it; with guardrails on, unsafe output is wrapped in an untrusted-data envelope. Output with personal data or credentials moves the conversation to the local endpoint (`route`).
-- `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands).
+- `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands). A denied command's `trace.result_preview` ends with its receipt, ` (receipt #42)`.
 - Tool requests go through the daemon's `request_tool` operation only; the daemon publishes `tool_request` and `tool_decision`. YARA rules come from the read-only `/rules` mount.
 - Scribe starts from the scope records already on the bus (the daemon's baseline and measurement), so it updates those assets instead of inventing new ones: a new asset needs evidence. `update_scope` refuses to lower a flag cleanroomd measured `yes`, with the reason, so an injected "it was only a test" cannot clear the record.
-- Signing keys are created on first run in `$XDG_STATE_HOME/cleanroom/keys/<role>.key` (mode `0600`).
+- Signing keys are created on first run in `$XDG_STATE_HOME/cleanroom/keys/<role>.key` (mode `0600`). The startup `status` line ("agents online on …") and each "investigating …" line end with each role's hosted model, `models: lead=<id>, hunter=<id>, …`.
 
 | Variable | Meaning |
 | --- | --- |
+| `CLEANROOM_MODEL_LEAD` | The Lead's chat model (default `nvidia/nemotron-3.5-lightning-30b-a3b`) |
 | `CLEANROOM_MODEL_HUNTER`, `_FORENSICS`, `_CONTAINMENT` | Tool-loop model (default `nvidia/nemotron-3.5-lightning-30b-a3b`) |
 | `CLEANROOM_MODEL_SCRIBE` | Record keeper model (default `nvidia/nemotron-3-ultra-550b-a55b`) |
 | `CLEANROOM_MODEL_SAFETY` | Safety model (default `nvidia/llama-3.1-nemotron-safety-guard-8b-v3`) |
@@ -158,9 +158,13 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 
 ## Command center
 
-`cleanroom-tui` connects as the commander and renders only from bus events: incident header and legal notification clocks, scope of compromised data, live agent trace, approvals, timeline and comms.
+`cleanroom-tui` connects as the commander and renders only from bus events. Two screens, switched with `Tab` (or `F1`/`F2`):
+- **Cleanroom** (default): the conversation with the Lead agent, its delegations to the specialists as compact cards, key system events as one-line markers, the team (status, model, last action; a Lead↔specialist link lights while a delegation is open) and the situation (asset tiles, the three nearest legal clocks, approvals waiting). A kernel denial pins a red banner over the conversation for 8 seconds and leaves a count in the top bar.
+- **Controlroom**: every OS denial pinned with its agent, command and receipt; legal clocks, scope table, one-line agent trace (select a step to expand it), approvals, timeline and comms.
 
-Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `?` help, `q` quit.
+The Cleanroom screen opens with the message line focused: everything typed is text, Enter sends it to the Lead, and `@hunter …` (or any agent name or its first letters) sends it to that specialist. Esc leaves the line for the command keys; Enter or `c` returns.
+
+Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `m` access control (enroll a member by public key, name and role, or revoke one; signed with the commander key), `PgUp`/`PgDn` scroll the conversation, `←`/`→` switch Controlroom panes, `?` help, `q` quit. `NO_COLOR` turns color off.
 
 Flags: `--socket PATH`, `--record FILE` (save live events), `--replay FILE [--speed X]` (offline playback with a REPLAY badge; the demo fallback), `--tamper-root NAME` (default `debian`), `--scenario NAME` (default `ransomware`).
 

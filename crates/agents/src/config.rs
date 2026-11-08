@@ -13,7 +13,8 @@ use cleanroom_proto::{LlmMode, Role};
 
 /// Hosted API used when `NVIDIA_BASE_URL` is unset.
 const DEFAULT_HOSTED_URL: &str = "https://integrate.api.nvidia.com/v1";
-/// Tool-loop roles (Hunter, Forensics, Containment): fast, 4/4 valid tool calls in the smoke test.
+/// Tool-loop roles (Hunter, Forensics, Containment) and the Lead's chat: fast, 4/4 valid tool
+/// calls in the smoke test.
 const LIGHTNING: &str = "nvidia/nemotron-3.5-lightning-30b-a3b";
 /// Scribe: the strongest writer our key reaches.
 const ULTRA: &str = "nvidia/nemotron-3-ultra-550b-a55b";
@@ -64,6 +65,8 @@ pub(crate) struct LocalRoute {
 /// Hosted model per role.
 #[derive(Debug, Clone)]
 pub(crate) struct Models {
+    /// Lead.
+    pub(crate) lead: String,
     /// Hunter.
     pub(crate) hunter: String,
     /// Forensics.
@@ -80,6 +83,7 @@ impl Models {
     /// The hosted agent model for `role`.
     pub(crate) fn for_role(&self, role: Role) -> &str {
         match role {
+            Role::Lead => &self.lead,
             Role::Hunter => &self.hunter,
             Role::Forensics => &self.forensics,
             Role::Scribe => &self.scribe,
@@ -137,6 +141,7 @@ impl Settings {
             api_key,
         };
         let models = Models {
+            lead: env.model("CLEANROOM_MODEL_LEAD", LIGHTNING),
             hunter: env.model("CLEANROOM_MODEL_HUNTER", LIGHTNING),
             forensics: env.model("CLEANROOM_MODEL_FORENSICS", LIGHTNING),
             scribe: env.model("CLEANROOM_MODEL_SCRIBE", ULTRA),

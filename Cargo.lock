@@ -361,6 +361,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tui-big-text",
+ "unicode-width",
 ]
 
 [[package]]
