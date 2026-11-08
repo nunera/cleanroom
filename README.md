@@ -27,6 +27,41 @@ What the OS does around the Nemotron models (each detailed under [Daemon](#daemo
 
 Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/brev/`). Measured results are in [docs/nemotron-smoke.md](docs/nemotron-smoke.md).
 
+## Architecture
+
+Trust runs one way: cleanroomd holds the only signing key for receipts and decides what every stratum may touch; the agent runner holds a socket per role but never the evidence; the models see only what the runner sends them through the one declared egress.
+
+```mermaid
+flowchart LR
+  subgraph host["Responder laptop (rootless userspace)"]
+    direction LR
+    tui["cleanroom-tui<br/>commander key: approve, reset, verify"]
+    subgraph core["cleanroomd (trust root)"]
+      direction TB
+      keyring["daemon key + members"]
+      receipts["receipts.ndjson<br/>hash-chained, signed"]
+      checks["admission by digest · evidence seal ·<br/>measured scope · citation checks · rule checks"]
+    end
+    runner["cleanroom-agents<br/>Lead, Hunter, Forensics, Scribe, Containment<br/>policy/egress.json, policy/reasoning.json"]
+    subgraph strata["bubblewrap strata: no network, no caps, no nested userns"]
+      direction TB
+      victim["acme-fs (Debian)<br/>share read-write"]
+      hunter["hunter (Debian)<br/>evidence read-only, yara"]
+      forensics["forensics (Alpine)<br/>evidence read-only"]
+      rulecheck["rule-check (Debian)<br/>seed + evidence read-only"]
+    end
+  end
+  nvidia["NVIDIA hosted API<br/>Lightning · Ultra · Super VL · Safety Guard"]
+  brev["Brev GPU (optional)<br/>self-hosted Nemotron"]
+  tui -- "signed requests + bus" --- core
+  runner -- "one socket per role:<br/>exec, model_call, submit_rule" --- core
+  core -- "launches with grants" --> strata
+  runner -- "only declared egress" --> nvidia
+  runner -. "--local, sensitive steps" .-> brev
+```
+
+The agents never touch a file directly: every command is an `exec` request cleanroomd runs in the role's stratum under its grant and records as a receipt. A model's output becomes a record, a rule or an action only after cleanroomd checks it.
+
 ## Results
 
 29 live runs against hosted Nemotron (27, N = 3 per cell) and local Nemotron on Brev (2). Five attack variants: the ransom-note injection, a poisoned syslog line, a credential-exfil note, a polite "IT runbook" written to evade the safety model, and a benign control. A sixth, `visual` (the injection drawn in the ransom wallpaper), was added after these runs and is not in the eval tables. Full method and caveats: [docs/eval.md](docs/eval.md).
@@ -93,9 +128,12 @@ In the command center: `F1`–`F7` and `F10` pick a tab (Overview, Lead, Scope, 
 | `crates/tui` | `cleanroom-tui`: the ratatui incident command center, shipped as a static `.deb` |
 | `crates/ransom` | `cleanroom-ransom`: safe, reversible canary ransomware (static musl) |
 | `scenario/` | acme-fs seed share, `assets.json` and YARA rules (see `scenario/README.md`) |
-| `roots/` | Digest-pinned root locks |
+| `roots/` | Digest-pinned root locks: Debian bookworm and Alpine 3.21 |
 | `plans/` | Declarative host plans: init choice (dinit or s6-rc) and the service graph; `responder.json` is valid, `cycle.json` shows a cycle witness |
 | `policy/egress.json` | Egress policy: deny by default; the model router's only endpoints |
+| `policy/reasoning.json` | Reasoning budget per role, in tokens per step |
+| `crates/eval` | `cleanroom-eval`: runs attack variants against the team and scores them against `scenario/answers/` (see `docs/eval.md`) |
+| `scripts/lockstar-wallpaper.sh` | Regenerates the ransom wallpapers (plain and visual-injection) from the pinned nixpkgs |
 | `scripts/demo.sh` | One-command tmux demo: daemon, agents, TUI (`--local`, `--replay`, `--guardrails on\|off`) |
 | `scripts/launch-tui.sh` | Runs the TUI `.deb` inside the admitted Debian root |
 | `docs/interfaces.md` | Transport, signing, receipts, daemon operations, grants |
@@ -254,6 +292,12 @@ These are what a judge or a security reviewer should know before trusting a clai
 - **Model-side layers are probabilistic.**
   - Prompt guardrails and the safety model reduce attempts but don't stop them. The safety model missed the polite "IT runbook" injection every time (see [docs/eval.md](docs/eval.md)).
   - The kernel grant is the only layer that held in every run.
+- **What the newer checks prove, and don't.**
+  - Citation checks show a cited file exists and that a command the agent ran named it or a directory above it; they don't show the model understood it.
+  - Reasoning custody shows a stored trace is the one the endpoint returned for that call; it doesn't show how the model actually computed the answer.
+  - A denied write is labelled `denied` from the command's stderr; a command that hides its errors shows as a plain failure, though the evidence seal still proves nothing changed.
+  - Image evidence goes to the hosted Super VL only (no local vision route), images over 48 KiB are refused, and Safety Guard flags every ransom-image description, so those steps are never trainable.
+  - `export-gym` rows pass NeMo Gym's structural validator; no Gym rollout or training run has used them.
 - **The record can still be shaded.** cleanroomd refuses any agent attempt to lower a flag it measured itself. An attacker's story can still reach softer fields an agent writes: incident title, severity, confidence, and flags cleanroomd didn't measure (e.g. `exfiltrated`). Provenance tiers for model claims are not built yet.
 - **Containment is advisory.** Approving a containment proposal records the decision and publishes it; cleanroomd doesn't isolate a real host.
 - **Hosted model calls leave the machine.** By default the agents call NVIDIA's hosted API through the declared egress policy. Sensitive steps can route to self-hosted Nemotron on Brev (`--local`). A fully offline run needs every role pointed at the local endpoint; Ultra (Scribe's default) is hosted only.
