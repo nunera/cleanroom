@@ -1,0 +1,13 @@
+{
+  "default": "deny",
+  "model_router": [
+    {
+      "origin": "https://integrate.api.nvidia.com",
+      "why": "hosted Nemotron API"
+    },
+    {
+      "origin": "http://127.0.0.1:8000",
+      "why": "self-hosted Nemotron on Brev, through deploy/brev/tunnel.sh"
+    }
+  ]
+}

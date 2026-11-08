@@ -35,14 +35,23 @@ pub(crate) struct Records {
     scope_updates: usize,
     /// Containment proposals the commander approved.
     approved: HashSet<String>,
+    /// Flags cleanroomd itself published (its measurement), by asset id.
+    measured: BTreeMap<String, ScopeFlags>,
 }
 
 impl Records {
     /// Records that start from the known scope records (the daemon's baseline or earlier
-    /// updates), so Scribe updates those assets instead of inventing new ids.
+    /// updates), so Scribe updates those assets instead of inventing new ids. Records
+    /// cleanroomd published are its measurement, which Scribe may add to but never lower.
     pub(crate) fn with_scopes(scopes: BTreeMap<String, ScopeRecord>) -> Self {
+        let measured = scopes
+            .values()
+            .filter(|record| record.updated_by == Principal::System)
+            .map(|record| (record.asset_id.clone(), record.flags))
+            .collect();
         Self {
             scopes,
+            measured,
             ..Self::default()
         }
     }
@@ -95,7 +104,9 @@ impl Records {
     /// Create or update one scope record. Returns the record to publish and a result line.
     ///
     /// # Errors
-    /// Returns a message for the model when a new record has no name.
+    /// Returns a message for the model when a new record has no name or no evidence, or when
+    /// the update would lower a flag cleanroomd measured. A new asset needs evidence so Scribe
+    /// updates the known assets instead of inventing look-alike ids; the message lists them.
     pub(crate) fn apply_scope(
         &mut self,
         mut update: ScopeUpdate,
@@ -104,6 +115,18 @@ impl Records {
         let record = if let Some(record) = self.scopes.get_mut(&update.asset_id) {
             record
         } else {
+            if update.evidence.is_empty() {
+                let known: Vec<&str> = self.scopes.keys().map(String::as_str).collect();
+                return Err(format!(
+                    "scope record {} does not exist; known assets: {}. Update a known asset by its asset_id, or add a new asset only with evidence that shows it",
+                    update.asset_id,
+                    if known.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            }
             let Some(name) = update.name.take() else {
                 return Err(format!(
                     "scope record {} does not exist yet: include name",
@@ -115,7 +138,19 @@ impl Records {
                 .entry(asset_id.clone())
                 .or_insert_with(|| new_scope(asset_id, name, at))
         };
-        apply_scope_fields(record, update);
+        let mut candidate = record.clone();
+        apply_scope_fields(&mut candidate, update);
+        if let Some(measured) = self.measured.get(&candidate.asset_id) {
+            let lowered = candidate.flags.lowered_from(measured);
+            if !lowered.is_empty() {
+                return Err(format!(
+                    "{} {} measured yes by cleanroomd's integrity check; you cannot lower a measurement (only the commander can). Keep those flags and record what the evidence adds",
+                    candidate.asset_id,
+                    lowered.join(", ")
+                ));
+            }
+        }
+        *record = candidate;
         record.updated_by = Principal::Agent { role: Role::Scribe };
         at.clone_into(&mut record.updated_at);
         self.scope_updates += 1;
@@ -470,5 +505,130 @@ const fn status_name(status: IncidentStatus) -> &'static str {
         IncidentStatus::Eradicated => "eradicated",
         IncidentStatus::Recovered => "recovered",
         IncidentStatus::Closed => "closed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    const AT: &str = "2026-11-08T04:48:01Z";
+
+    fn update(args: &serde_json::Value) -> ScopeUpdate {
+        serde_json::from_value(args.clone()).expect("well-formed update_scope arguments")
+    }
+
+    /// The daemon's baseline: the organization's known asset, every flag no.
+    fn known_payroll() -> Records {
+        let mut payroll = new_scope("payroll".into(), "Payroll export".into(), AT);
+        payroll.flags = ScopeFlags {
+            locked: Tri::No,
+            exfiltrated: Tri::No,
+            accessed: Tri::No,
+            destroyed: Tri::No,
+            modified: Tri::No,
+        };
+        payroll.updated_by = Principal::System;
+        Records::with_scopes(BTreeMap::from([("payroll".to_owned(), payroll)]))
+    }
+
+    /// A live run created `payroll-2026q3` next to the real `payroll` with no evidence; the
+    /// scope table then showed the same data twice with contradicting flags.
+    #[test]
+    fn a_new_asset_needs_evidence_and_the_error_names_the_known_ones() {
+        let mut records = known_payroll();
+
+        let reason = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll-2026q3", "name": "Payroll data", "locked": "unknown"})),
+                AT,
+            )
+            .expect_err("an asset no evidence shows is refused");
+
+        assert!(
+            reason.contains("payroll"),
+            "names the known asset id: {reason}"
+        );
+        assert!(
+            !records.view().contains("payroll-2026q3"),
+            "the refused asset is not recorded"
+        );
+        assert_eq!(records.scope_updates(), 0, "a refusal is not an update");
+    }
+
+    #[test]
+    fn a_new_asset_with_evidence_is_recorded() {
+        let mut records = known_payroll();
+
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "backup-tapes", "name": "Backup tapes", "locked": "yes", "evidence": ["/evidence/logs/syslog:9"]})),
+                AT,
+            )
+            .expect("evidence shows a new asset");
+
+        assert!(
+            records.view().contains("backup-tapes"),
+            "the new asset is recorded"
+        );
+    }
+
+    #[test]
+    fn a_known_asset_updates_without_new_evidence() {
+        let mut records = known_payroll();
+
+        let (record, _) = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "accessed": "unknown"})),
+                AT,
+            )
+            .expect("known assets keep updating as before");
+
+        assert_eq!(record.flags.accessed, Tri::Unknown, "the flag changed");
+    }
+
+    /// A live guardrails-off run: the ransom note's "backup test" story reached Scribe, which
+    /// set payroll locked=no although cleanroomd's integrity check had measured it locked.
+    #[test]
+    fn scribe_cannot_lower_a_flag_cleanroomd_measured() {
+        let mut payroll = new_scope("payroll".into(), "Payroll export".into(), AT);
+        payroll.flags = ScopeFlags {
+            locked: Tri::Yes,
+            exfiltrated: Tri::Unknown,
+            accessed: Tri::Yes,
+            destroyed: Tri::Unknown,
+            modified: Tri::Yes,
+        };
+        payroll.updated_by = Principal::System;
+        let mut records = Records::with_scopes(BTreeMap::from([("payroll".to_owned(), payroll)]));
+
+        let reason = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "locked": "no", "modified": "no"})),
+                AT,
+            )
+            .expect_err("a measured yes cannot be lowered");
+
+        assert!(reason.contains("locked"), "names the flag: {reason}");
+        assert!(
+            reason.contains("cleanroomd"),
+            "says who measured it: {reason}"
+        );
+        assert!(
+            records.view().contains("locked=yes"),
+            "the record is unchanged"
+        );
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "exfiltrated": "yes", "evidence": ["/evidence/dropbox/payroll.csv"]})),
+                AT,
+            )
+            .expect("adding a finding to a measured record still works");
+        assert!(
+            records.view().contains("exfiltrated=yes"),
+            "the finding is recorded"
+        );
     }
 }
