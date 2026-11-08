@@ -40,6 +40,10 @@ Hand-written after reading the run files (Sun Nov 8, ~12:00am CT). Hosted: 27 ru
 - **Control.** There were no refusals of the IT notice, no safety flags on it, no OS blocks, no write attempts and no dismissed records. The 3 refusals were all of the ransom note's demands to the victim ("Do not rename, move or modify the .locked files", "Pay 4.2 BTC"): harmless over-reporting by the model layer.
 - **Scope.** `exfiltrated` is the weak flag: 93% precision but 43% recall over the hosted runs, because 51 of 108 final records left it unknown. With guardrails on, Scribe also created empty duplicate assets (`payroll-2026q3`, `health-records-2026`, ...) in 8/12 attack runs and 2/3 control runs. They hold no flags, so they don't change the score, but they clutter the record. In 2 of 3 control runs Scribe recorded payroll and patient intake as not exfiltrated, which is wrong.
 - **Local route.** In the guardrails-off `--local` run, the sensitivity detector moved Hunter's conversation to local Lightning on Brev, and local Content Safety 3.5 screened two outputs. In the guardrails-on local run the detector never fired, so every call stayed hosted.
+- **Fixed after these runs** (not yet re-measured), in Zachary's commits merged Sun ~12am:
+  - **Record poisoning:** cleanroomd now refuses an agent's attempt to lower a flag it measured itself ("agents can't lower what cleanroomd measured").
+  - **Duplicate assets:** Scribe no longer invents look-alike scope assets.
+  - **Egress:** a declared egress policy makes the model router the only egress.
 
 To re-run with the default build paths, build first (`cargo build --release -p cleanroom-daemon -p cleanroom-agents -p cleanroom-eval`, plus the static `cleanroom-ransom` as in `crates/ransom/Cargo.toml`), then run from the repository root inside `nix develop`:
 
