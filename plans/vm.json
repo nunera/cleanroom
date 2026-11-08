@@ -1,0 +1,37 @@
+{
+  "host": "cleanroom-vm",
+  "init": "dinit",
+  "services": [
+    {
+      "name": "cleanroomd",
+      "kind": "process",
+      "command": "cleanroomd",
+      "depends_on": []
+    },
+    {
+      "name": "admit-debian",
+      "kind": "oneshot",
+      "command": "cleanroomd admit debian",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "admit-alpine",
+      "kind": "oneshot",
+      "command": "cleanroomd admit alpine",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "cleanroom-agents",
+      "kind": "process",
+      "command": "cleanroom-agents run --guardrails off",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "cleanroom-tui",
+      "kind": "process",
+      "command": "cleanroom-console cleanroom-tui",
+      "depends_on": ["admit-debian", "admit-alpine"],
+      "console": true
+    }
+  ]
+}

@@ -135,6 +135,18 @@ enum PlanAction {
         /// The plan file, for example `plans/responder.json`.
         file: PathBuf,
     },
+    /// Turn a valid plan into an init's configuration: dinit service files plus a `boot`
+    /// target, or an s6-rc source tree plus a `default` bundle (compile it with
+    /// `s6-rc-compile`). Exits 0 rendered, 1 invalid, 2 unreadable or unwritable.
+    Render {
+        /// The plan file, for example `plans/vm.json`.
+        file: PathBuf,
+        /// The directory to create.
+        out: PathBuf,
+        /// The init to render for [default: the plan's own].
+        #[arg(long, value_enum)]
+        init: Option<plan::Init>,
+    },
 }
 
 #[tokio::main]
@@ -192,6 +204,9 @@ async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<Exi
         Command::Plan {
             action: PlanAction::Validate { file },
         } => Ok(plan::validate_file(&file)),
+        Command::Plan {
+            action: PlanAction::Render { file, out, init },
+        } => Ok(plan::render_file(&file, &out, init)),
         Command::Reasoning { seq, state } => {
             let state = match state {
                 Some(state) => state,

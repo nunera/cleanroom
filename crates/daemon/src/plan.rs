@@ -1,8 +1,10 @@
-//! Declarative host plans (`plans/*.json`): which init would run the responder host and the
-//! service graph it would start. `cleanroomd plan validate FILE` checks a plan offline: names
-//! are unique, every dependency is declared, and the graph has no cycle (reported with a
-//! witness path). A valid plan prints its boot order. Booting a host from a plan is roadmap;
-//! the output says so.
+//! Declarative host plans (`plans/*.json`): which init runs the responder host and the service
+//! graph it starts. `cleanroomd plan validate FILE` checks a plan offline: names are unique,
+//! every dependency is declared, and the graph has no cycle (reported with a witness path). A
+//! valid plan prints its boot order. `cleanroomd plan render FILE OUT [--init dinit|s6-rc]`
+//! turns a valid plan into that init's own configuration: dinit service files plus a `boot`
+//! target, or an s6-rc source tree plus a `default` bundle. `nix run .#vm` boots
+//! `plans/vm.json` that way, with the init chosen at boot.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,9 +28,9 @@ pub(crate) struct Plan {
 }
 
 /// The selectable inits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
-enum Init {
+pub(crate) enum Init {
     /// dinit.
     Dinit,
     /// s6-rc.
@@ -37,7 +39,7 @@ enum Init {
 
 impl Init {
     /// Its name.
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Dinit => "dinit",
             Self::S6Rc => "s6-rc",
@@ -58,6 +60,9 @@ struct Service {
     /// Services that must be up first.
     #[serde(default)]
     depends_on: Vec<String>,
+    /// Runs on the console (the command center), so its output isn't logged to a file.
+    #[serde(default)]
+    console: bool,
 }
 
 /// Service kinds, common to both inits (dinit process/scripted, s6-rc longrun/oneshot).
@@ -94,6 +99,8 @@ pub(crate) enum Problem {
     },
     /// A dependency loop: each name depends on the next, and the last equals the first.
     Cycle(Vec<String>),
+    /// A service takes the name the init reserves for its own boot target.
+    Reserved(String),
 }
 
 impl fmt::Display for Problem {
@@ -107,6 +114,10 @@ impl fmt::Display for Problem {
                 )
             }
             Self::Cycle(path) => write!(f, "dependency cycle: {}", path.join(" → ")),
+            Self::Reserved(name) => write!(
+                f,
+                "{name} is the name the init uses for its boot target; rename the service"
+            ),
         }
     }
 }
@@ -165,6 +176,218 @@ pub(crate) fn validate(plan: &Plan) -> Result<Vec<String>, Problem> {
         .into_iter()
         .filter_map(|at| plan.services.get(at).map(|service| service.name.clone()))
         .collect())
+}
+
+/// One rendered file: a path relative to the output directory, and its contents.
+pub(crate) type File = (String, String);
+
+/// The plan's services as `init`'s configuration, after validating the plan.
+///
+/// # Errors
+/// Returns the plan's problem, or [`Problem::Reserved`] when a service is named like the
+/// init's boot target (`boot` for dinit, `default` for s6-rc).
+pub(crate) fn render(plan: &Plan, init: Init) -> Result<Vec<File>, Problem> {
+    validate(plan)?;
+    let target = match init {
+        Init::Dinit => "boot",
+        Init::S6Rc => "default",
+    };
+    if plan.services.iter().any(|service| service.name == target) {
+        return Err(Problem::Reserved(target.to_owned()));
+    }
+    Ok(match init {
+        Init::Dinit => dinit(plan),
+        Init::S6Rc => s6_rc(plan),
+    })
+}
+
+/// The header every rendered service carries.
+fn origin(plan: &Plan, service: &Service) -> String {
+    format!(
+        "service {} of host plan {}, rendered by cleanroomd plan render",
+        service.name, plan.host
+    )
+}
+
+/// dinit: one file per service, and an internal `boot` service that depends on all of them.
+fn dinit(plan: &Plan) -> Vec<File> {
+    let mut files = Vec::with_capacity(plan.services.len() + 1);
+    for service in &plan.services {
+        let kind = match service.kind {
+            Kind::Process => "process",
+            Kind::Oneshot => "scripted",
+        };
+        let command = words(&service.command, dinit_word);
+        let mut body = format!(
+            "# {}\ntype = {kind}\ncommand = {command}\n",
+            origin(plan, service)
+        );
+        for dependency in &service.depends_on {
+            body.push_str(&format!("depends-on = {dependency}\n"));
+        }
+        if service.console {
+            body.push_str("options = runs-on-console\n");
+        } else if matches!(service.kind, Kind::Process) {
+            body.push_str(&format!("logfile = /var/log/{}.log\n", service.name));
+        }
+        files.push((service.name.clone(), body));
+    }
+    let mut boot = format!(
+        "# boot target of host plan {}, rendered by cleanroomd plan render\ntype = internal\n",
+        plan.host
+    );
+    for service in &plan.services {
+        boot.push_str(&format!("depends-on = {}\n", service.name));
+    }
+    files.push(("boot".to_owned(), boot));
+    files
+}
+
+/// s6-rc: a source directory per service (`type`, `run` or `up`, `dependencies.d/`), and a
+/// `default` bundle holding every service. `s6-rc-compile` turns it into a database.
+fn s6_rc(plan: &Plan) -> Vec<File> {
+    let mut files = Vec::new();
+    for service in &plan.services {
+        let name = &service.name;
+        match service.kind {
+            Kind::Process => {
+                files.push((format!("{name}/type"), "longrun\n".to_owned()));
+                let log = if service.console {
+                    String::new()
+                } else {
+                    format!("exec >>/var/log/{name}.log 2>&1\n")
+                };
+                let command = words(&service.command, shell_word);
+                files.push((
+                    format!("{name}/run"),
+                    format!(
+                        "#!/bin/sh\n# {}\n{log}exec {command}\n",
+                        origin(plan, service)
+                    ),
+                ));
+            }
+            Kind::Oneshot => {
+                files.push((format!("{name}/type"), "oneshot\n".to_owned()));
+                let command = words(&service.command, execline_word);
+                files.push((format!("{name}/up"), format!("{command}\n")));
+            }
+        }
+        for dependency in &service.depends_on {
+            files.push((format!("{name}/dependencies.d/{dependency}"), String::new()));
+        }
+    }
+    files.push(("default/type".to_owned(), "bundle\n".to_owned()));
+    for service in &plan.services {
+        files.push((
+            format!("default/contents.d/{}", service.name),
+            String::new(),
+        ));
+    }
+    files
+}
+
+/// A command's whitespace-separated words, each quoted by `quote`, joined by spaces. Plan
+/// commands are word lists, not shell: no expansion, no globbing.
+fn words(command: &str, quote: fn(&str) -> String) -> String {
+    command
+        .split_whitespace()
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A dinit token: double-quoted, with `\`, `"`, `#` and `$` escaped so dinit takes it as is.
+fn dinit_word(word: &str) -> String {
+    let mut quoted = String::with_capacity(word.len() + 2);
+    quoted.push('"');
+    for character in word.chars() {
+        if matches!(character, '\\' | '"' | '#' | '$') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// An execline word: double-quoted, with `\` and `"` escaped.
+fn execline_word(word: &str) -> String {
+    let mut quoted = String::with_capacity(word.len() + 2);
+    quoted.push('"');
+    for character in word.chars() {
+        if matches!(character, '\\' | '"') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// A POSIX shell word: single-quoted, with each `'` closed, escaped and reopened.
+fn shell_word(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// `cleanroomd plan render FILE OUT [--init]`: write the init configuration of a valid plan
+/// into `out`, which must not exist yet. `init` defaults to the plan's own. Exits 0 rendered,
+/// 1 invalid, 2 unreadable or unwritable.
+pub(crate) fn render_file(path: &Path, out: &Path, init: Option<Init>) -> ExitCode {
+    let plan = match fs::read_to_string(path)
+        .with_context(|| format!("cannot read {}", path.display()))
+        .and_then(|text| parse(&text))
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            println!("plan {}: {error:#}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let init = init.unwrap_or(plan.init);
+    let files = match render(&plan, init) {
+        Ok(files) => files,
+        Err(problem) => {
+            println!(
+                "plan {}: host {}, init {}: INVALID\n  {problem}",
+                path.display(),
+                plan.host,
+                init.name()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = write_tree(out, &files) {
+        println!("plan {}: {error:#}", path.display());
+        return ExitCode::from(2);
+    }
+    println!(
+        "plan {}: host {}: {} services rendered for {} into {}",
+        path.display(),
+        plan.host,
+        plan.services.len(),
+        init.name(),
+        out.display()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Create `out` and write `files` under it; `run` scripts are executable.
+fn write_tree(out: &Path, files: &[File]) -> Result<()> {
+    fs::create_dir(out).with_context(|| format!("cannot create {}", out.display()))?;
+    for (relative, body) in files {
+        let path = out.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        fs::write(&path, body).with_context(|| format!("cannot write {}", path.display()))?;
+        if path.file_name().is_some_and(|name| name == "run") {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("cannot make {} executable", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Depth-first walk state.
@@ -282,7 +505,7 @@ fn report(path: &Path, plan: &Plan, order: &[String]) -> String {
         text.push('\n');
     }
     text.push_str(&format!(
-        "valid: {} services, every dependency declared, no cycles.\ndeclared and validated; booting the host with {} is roadmap.",
+        "valid: {} services, every dependency declared, no cycles.\nrender it for {} (or the other init) with `cleanroomd plan render`; `nix run .#vm` boots plans/vm.json.",
         order.len(),
         plan.init.name()
     ));
@@ -402,6 +625,134 @@ mod tests {
         assert!(format!("{error:#}").contains("init"), "{error:#}");
     }
 
+    fn rendered(text: &str, init: Init) -> Result<Vec<(String, String)>, Problem> {
+        render(&parse(text).expect("well-formed plan"), init)
+    }
+
+    fn file<'a>(files: &'a [(String, String)], name: &str) -> &'a str {
+        files
+            .iter()
+            .find(|(file, _)| file == name)
+            .map(|(_, body)| body.as_str())
+            .unwrap_or_else(|| panic!("no file {name}: {files:?}"))
+    }
+
+    /// A daemon, a run-once admission after it, and a console service after that.
+    fn three() -> String {
+        plan(
+            r#"{"name": "cleanroomd", "kind": "process", "command": "cleanroomd --state /var/lib/x", "depends_on": []},
+               {"name": "admit", "kind": "oneshot", "command": "cleanroomd admit debian", "depends_on": ["cleanroomd"]},
+               {"name": "tui", "kind": "process", "command": "cleanroom-tui", "depends_on": ["admit"], "console": true}"#,
+        )
+    }
+
+    #[test]
+    fn dinit_gets_one_service_file_per_service_and_a_boot_target() {
+        let files = rendered(&three(), Init::Dinit).expect("a valid plan renders");
+        let daemon = file(&files, "cleanroomd");
+        assert!(daemon.contains("type = process\n"), "{daemon}");
+        assert!(
+            daemon.contains("command = \"cleanroomd\" \"--state\" \"/var/lib/x\"\n"),
+            "each word is its own token: {daemon}"
+        );
+        assert!(
+            daemon.contains("logfile = /var/log/cleanroomd.log\n"),
+            "{daemon}"
+        );
+        assert!(!daemon.contains("depends-on"), "{daemon}");
+        let admit = file(&files, "admit");
+        assert!(admit.contains("type = scripted\n"), "{admit}");
+        assert!(admit.contains("depends-on = cleanroomd\n"), "{admit}");
+        let tui = file(&files, "tui");
+        assert!(tui.contains("options = runs-on-console\n"), "{tui}");
+        assert!(
+            !tui.contains("logfile"),
+            "the console service writes to the console: {tui}"
+        );
+        let boot = file(&files, "boot");
+        assert!(boot.contains("type = internal\n"), "{boot}");
+        for name in ["cleanroomd", "admit", "tui"] {
+            assert!(boot.contains(&format!("depends-on = {name}\n")), "{boot}");
+        }
+        assert_eq!(files.len(), 4, "three services and the boot target");
+    }
+
+    #[test]
+    fn s6_rc_gets_a_source_tree_with_a_default_bundle() {
+        let files = rendered(&three(), Init::S6Rc).expect("a valid plan renders");
+        assert_eq!(file(&files, "cleanroomd/type"), "longrun\n");
+        let run = file(&files, "cleanroomd/run");
+        assert!(run.starts_with("#!/bin/sh\n"), "{run}");
+        assert!(
+            run.contains("exec >>/var/log/cleanroomd.log 2>&1\n"),
+            "{run}"
+        );
+        assert!(
+            run.contains("exec 'cleanroomd' '--state' '/var/lib/x'\n"),
+            "{run}"
+        );
+        assert_eq!(file(&files, "admit/type"), "oneshot\n");
+        assert_eq!(
+            file(&files, "admit/up"),
+            "\"cleanroomd\" \"admit\" \"debian\"\n"
+        );
+        assert_eq!(file(&files, "admit/dependencies.d/cleanroomd"), "");
+        let tui = file(&files, "tui/run");
+        assert!(
+            !tui.contains("/var/log"),
+            "the console service writes to the console: {tui}"
+        );
+        assert_eq!(file(&files, "tui/dependencies.d/admit"), "");
+        assert_eq!(file(&files, "default/type"), "bundle\n");
+        for name in ["cleanroomd", "admit", "tui"] {
+            assert_eq!(file(&files, &format!("default/contents.d/{name}")), "");
+        }
+    }
+
+    #[test]
+    fn commands_are_escaped_for_each_init() {
+        let text = plan(
+            r#"{"name": "say", "kind": "oneshot", "command": "echo \"a#b\" $HOME it's \\x", "depends_on": []}"#,
+        );
+        let dinit = rendered(&text, Init::Dinit).expect("renders");
+        assert!(
+            file(&dinit, "say").contains(r#"command = "echo" "\"a\#b\"" "\$HOME" "it's" "\\x""#),
+            "{dinit:?}"
+        );
+        let s6 = rendered(&text, Init::S6Rc).expect("renders");
+        assert_eq!(
+            file(&s6, "say/up"),
+            "\"echo\" \"\\\"a#b\\\"\" \"$HOME\" \"it's\" \"\\\\x\"\n"
+        );
+        let longrun = text.replace("oneshot", "process");
+        let s6 = rendered(&longrun, Init::S6Rc).expect("renders");
+        assert!(
+            file(&s6, "say/run").contains(r#"exec 'echo' '"a#b"' '$HOME' 'it'\''s' '\x'"#),
+            "{s6:?}"
+        );
+    }
+
+    #[test]
+    fn rendering_refuses_invalid_plans_and_each_inits_reserved_name() {
+        let cycle = plan(&service("cleanroomd", &["cleanroomd"]));
+        assert!(matches!(
+            rendered(&cycle, Init::Dinit),
+            Err(Problem::Cycle(_))
+        ));
+        assert!(matches!(
+            rendered(&cycle, Init::S6Rc),
+            Err(Problem::Cycle(_))
+        ));
+        assert_eq!(
+            rendered(&plan(&service("boot", &[])), Init::Dinit),
+            Err(Problem::Reserved("boot".to_owned()))
+        );
+        assert_eq!(
+            rendered(&plan(&service("default", &[])), Init::S6Rc),
+            Err(Problem::Reserved("default".to_owned()))
+        );
+    }
+
     /// The plans shipped in `plans/`, read through the real parser and validator.
     #[test]
     fn the_shipped_plans_validate_as_documented() {
@@ -417,6 +768,32 @@ mod tests {
         assert!(
             matches!(checked(&broken), Err(Problem::Cycle(_))),
             "the broken example shows a cycle witness"
+        );
+    }
+
+    /// The plan the VM boots renders for both inits, admits both distro roots before the
+    /// command center starts, and puts only the command center on the console.
+    #[test]
+    fn the_vm_plan_boots_under_either_init() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plans");
+        let text = fs::read_to_string(root.join("vm.json")).expect("the VM plan");
+        let order = checked(&text).expect("the VM plan is valid");
+        let position = |name: &str| order.iter().position(|s| s == name).expect("in order");
+        for admit in ["admit-debian", "admit-alpine"] {
+            assert!(position("cleanroomd") < position(admit), "{order:?}");
+            assert!(position(admit) < position("cleanroom-tui"), "{order:?}");
+        }
+        let dinit = rendered(&text, Init::Dinit).expect("renders for dinit");
+        let consoles: Vec<&str> = dinit
+            .iter()
+            .filter(|(_, body)| body.contains("runs-on-console"))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(consoles, ["cleanroom-tui"]);
+        let s6 = rendered(&text, Init::S6Rc).expect("renders for s6-rc");
+        assert_eq!(
+            file(&s6, "admit-alpine/up"),
+            "\"cleanroomd\" \"admit\" \"alpine\"\n"
         );
     }
 }

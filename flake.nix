@@ -28,6 +28,11 @@
             ./flake.lock
           ];
         };
+      # The committed LLM recording the VM replays; kept out of src so it doesn't rebuild the Rust.
+      recordings = builtins.path {
+        path = ./recordings;
+        name = "cleanroom-recordings";
+      };
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
     in
     {
@@ -55,6 +60,8 @@
               "cleanroom-daemon"
               "-p"
               "cleanroom-agents"
+              "-p"
+              "cleanroom-tui"
             ];
             cargoTestFlags = [
               "-p"
@@ -97,9 +104,11 @@
               mainProgram = "cleanroomd";
             };
           };
+          # Bootable QEMU/KVM guest running plans/vm.json: nix run .#vm -- [--init dinit|s6-rc] [--live]
+          vm = import ./vm { inherit pkgs cleanroom recordings; };
         in
         {
-          inherit cleanroom ransom;
+          inherit cleanroom ransom vm;
           default = cleanroom;
         }
       );
@@ -112,6 +121,10 @@
         agents = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.cleanroom}/bin/cleanroom-agents";
+        };
+        vm = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.vm}/bin/cleanroom-vm";
         };
         default = self.apps.${pkgs.stdenv.hostPlatform.system}.cleanroom;
       });
