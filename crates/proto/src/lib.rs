@@ -263,6 +263,23 @@ pub enum Action {
         response: Digest,
         replayed: bool,
     },
+    /// An agent's YARA rule, checked by cleanroomd: `allowed` when it was admitted into
+    /// `/rules`, `denied` with the reason otherwise.
+    YaraRule {
+        name: String,
+        digest: Digest,
+    },
+}
+
+/// An investigator submitting a YARA rule it wrote. cleanroomd admits it into `/rules` only if it
+/// compiles, matches no clean seed file and matches some evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSubmission {
+    pub from: Role,
+    /// Lowercase letters, digits, `-` and `_`; the rule lands at `/rules/agent-<name>.yar`.
+    pub name: String,
+    /// The rule source.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +602,8 @@ pub enum CoreRequest {
     RequestTool(ToolRequest),
     /// An agent runner reporting one model call for the receipt log.
     ModelCall(ModelCall),
+    /// An investigator submitting a YARA rule it wrote.
+    SubmitRule(RuleSubmission),
     /// Commander approves or denies a pending tool request or containment proposal.
     Approve(Signed<ApprovalDecision>),
     Enroll(Signed<Member>),

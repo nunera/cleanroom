@@ -55,6 +55,9 @@ pub(crate) enum Tool {
     AskAgent,
     /// Answer the commander over the bus (Lead only).
     Reply,
+    /// Daemon `submit_rule`: a YARA rule the agent wrote, admitted into `/rules` only if
+    /// cleanroomd's check passes (Hunter only).
+    SubmitRule,
 }
 
 impl Tool {
@@ -76,7 +79,8 @@ impl Tool {
             | Self::UpdateIncident
             | Self::Exec
             | Self::AskAgent
-            | Self::Reply => false,
+            | Self::Reply
+            | Self::SubmitRule => false,
         }
     }
 
@@ -100,7 +104,8 @@ impl Tool {
             | Self::UpdateIncident
             | Self::GetSituation
             | Self::AskAgent
-            | Self::Reply => false,
+            | Self::Reply
+            | Self::SubmitRule => false,
         }
     }
 
@@ -122,6 +127,7 @@ impl Tool {
             Self::GetSituation => "get_situation",
             Self::AskAgent => "ask_agent",
             Self::Reply => "reply",
+            Self::SubmitRule => "submit_yara_rule",
         }
     }
 
@@ -168,6 +174,9 @@ impl Tool {
             }
             Self::Reply => {
                 "Send your answer to the human incident commander: plain, concise sentences without markdown headers. Ends your turn."
+            }
+            Self::SubmitRule => {
+                "Write a YARA rule that detects what this attack left behind (its ransom note, encrypted files, tools or log lines) and submit it. Cleanroom runs it in a sandbox and deploys it to /rules only if it compiles, matches none of the company's clean files from before the attack, and matches some evidence; otherwise you get the reason and can fix the rule. After it is admitted, scan with yara_scan and rules /rules/agent-<name>.yar."
             }
         }
     }
@@ -241,6 +250,13 @@ impl Tool {
             Self::Reply => object(
                 &json!({"text": {"type": "string", "minLength": 1, "maxLength": 1200, "description": "Your answer to the commander"}}),
                 &["text"],
+            ),
+            Self::SubmitRule => object(
+                &json!({
+                    "name": {"type": "string", "pattern": "^[a-z0-9_-]{1,40}$", "description": "Short slug; the rule lands at /rules/agent-<name>.yar"},
+                    "rule": {"type": "string", "minLength": 10, "maxLength": 16384, "description": "The complete YARA rule source"},
+                }),
+                &["name", "rule"],
             ),
         }
     }
@@ -376,6 +392,16 @@ pub(crate) struct ReplyArgs {
     pub(crate) text: String,
 }
 
+/// `submit_yara_rule` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuleArgs {
+    /// The rule's slug.
+    pub(crate) name: String,
+    /// The rule source.
+    pub(crate) rule: String,
+}
+
 /// `update_scope` arguments: omitted fields keep their current values.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -472,6 +498,8 @@ pub(crate) enum Action {
     Ask(AskArgs),
     /// Answer the commander (Lead).
     Reply(ReplyArgs),
+    /// Submit a YARA rule to cleanroomd (Hunter).
+    Rule(RuleArgs),
 }
 
 /// A call that passed every check.
@@ -645,6 +673,7 @@ fn action(tool: Tool, args: &Value) -> Result<Action, String> {
         Tool::GetSituation => Action::Situation,
         Tool::AskAgent => Action::Ask(typed(args)?),
         Tool::Reply => Action::Reply(typed(args)?),
+        Tool::SubmitRule => Action::Rule(typed(args)?),
     })
 }
 
@@ -1202,5 +1231,32 @@ mod tests {
             "unparseable arguments are blanked in history"
         );
         assert!(garbage.outcome.is_err(), "and rejected");
+    }
+
+    /// Hunter writes detection rules; cleanroomd decides whether they ship. The name becomes a
+    /// file name under /rules, so the schema allows only a slug.
+    #[test]
+    fn hunter_submits_yara_rules_under_a_slug_name() {
+        let rule = r#"rule Lockstar_Note { strings: $a = "LOCKSTAR" condition: $a }"#;
+        let raw = json!({"name": "lockstar-note", "rule": rule}).to_string();
+        let submitted = call(Role::Hunter, true, "submit_yara_rule", &raw).expect("offered");
+        match submitted.action {
+            Action::Rule(args) => {
+                assert_eq!(args.name, "lockstar-note");
+                assert_eq!(args.rule, rule);
+            }
+            other => panic!("expected a rule submission, got {other:?}"),
+        }
+
+        let escape = json!({"name": "../../etc", "rule": rule}).to_string();
+        assert!(call(Role::Hunter, true, "submit_yara_rule", &escape).is_err());
+        assert!(
+            call(Role::Forensics, true, "submit_yara_rule", &raw).is_err(),
+            "only the stratum that holds yara writes rules"
+        );
+        assert!(
+            call(Role::Hunter, false, "submit_yara_rule", &raw).is_err(),
+            "the naive shell-only deployment has no rule tool"
+        );
     }
 }

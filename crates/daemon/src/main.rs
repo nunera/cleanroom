@@ -21,6 +21,7 @@ mod plan;
 mod probe;
 mod receipts;
 mod roots;
+mod rules;
 mod scenario;
 mod server;
 mod strata;

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cleanroom_proto::{
     Audience, BusBody, CoreRequest, CoreResponse, ExecOutcome, ExecRequest, ExecResult, LlmMode,
-    ModelRoute, Role, ToolDecision, ToolRequest, ToolSource,
+    ModelRoute, Role, RuleSubmission, ToolDecision, ToolRequest, ToolSource,
 };
 use serde_json::{Map, Value};
 use tokio::sync::broadcast::error::RecvError;
@@ -30,7 +30,7 @@ use crate::sensitivity::{self, Detector};
 use crate::text::{cite_receipt, clip, preview};
 use crate::tools::{
     self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, ProposalArgs, RefusalArgs,
-    Rejection, ScopeUpdate, Tool, ToolAsk, ToolSpec,
+    Rejection, RuleArgs, ScopeUpdate, Tool, ToolAsk, ToolSpec,
 };
 
 /// Characters of tool output a model sees at most.
@@ -41,6 +41,8 @@ const PREVIEW_CHARS: usize = 160;
 const EXEC_GRACE: Duration = Duration::from_secs(10);
 /// How long the daemon may take to answer `request_tool`.
 const TOOL_REQUEST_WAIT: Duration = Duration::from_secs(30);
+/// How long cleanroomd may take to check a submitted YARA rule (two sandboxed scans).
+const RULE_SUBMIT_WAIT: Duration = Duration::from_secs(90);
 /// How long a pending tool request waits for the commander.
 const TOOL_DECISION_WAIT: Duration = Duration::from_secs(90);
 /// Model calls left in a loop when the agent is told to wrap up.
@@ -599,6 +601,7 @@ impl Agent {
             Action::Proposal(proposal) => self.propose(desk, proposal).await,
             Action::Scope(update) => self.scope(desk, update).await,
             Action::Incident(update) => self.incident(desk, update).await,
+            Action::Rule(rule) => self.submit_rule(rule).await,
             // Field agents are never offered the Lead's tools, so `check` rejects these first.
             Action::Situation | Action::Ask(_) | Action::Reply(_) => {
                 Done::error("only the Lead talks with the commander and the specialists")
@@ -806,6 +809,28 @@ impl Agent {
         );
         desk.route = Some(route);
         self.publish(BusBody::Route { route, reason }).await;
+    }
+
+    /// Submit a YARA rule the agent wrote. cleanroomd checks it in a sandbox and deploys it to
+    /// `/rules` or says why not; the reason goes back to the model to fix.
+    async fn submit_rule(&self, rule: RuleArgs) -> Done {
+        let RuleArgs { name, rule } = rule;
+        let request = CoreRequest::SubmitRule(RuleSubmission {
+            from: self.role,
+            name: name.clone(),
+            source: rule,
+        });
+        match self.conn.request(request, RULE_SUBMIT_WAIT).await {
+            Ok(CoreResponse::Ok) => Done::ok(format!(
+                "admitted: cleanroomd compiled the rule, found it matches none of the clean files from before the attack and matches some evidence, and deployed it to /rules/agent-{name}.yar. Scan with yara_scan (rules /rules/agent-{name}.yar) and report what it finds."
+            )),
+            Ok(CoreResponse::Error { message }) => Done::error(&format!("cleanroomd: {message}")),
+            Ok(other) => Done::error(&format!(
+                "cleanroomd answered submit_rule with `{}`",
+                response_kind(&other)
+            )),
+            Err(error) => Done::error(&format!("cannot submit the rule: {error:#}")),
+        }
     }
 
     /// Ask the daemon to admit a tool (the daemon publishes `tool_request` and `tool_decision`);

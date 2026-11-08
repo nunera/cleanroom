@@ -245,6 +245,7 @@ const fn op_label(request: &CoreRequest) -> &'static str {
         CoreRequest::Exec(_)
         | CoreRequest::RequestTool(_)
         | CoreRequest::ModelCall(_)
+        | CoreRequest::SubmitRule(_)
         | CoreRequest::Approve(_)
         | CoreRequest::Enroll(_)
         | CoreRequest::Revoke(_)

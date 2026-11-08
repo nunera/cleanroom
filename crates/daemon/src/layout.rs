@@ -135,9 +135,20 @@ impl Layout {
         self.repo.join("scenario/acme-fs")
     }
 
-    /// YARA rules, mounted read-only at `/rules`.
+    /// YARA rules, mounted read-only at `/rules`: the repository's rules, copied in at every
+    /// seeding, plus the agent rules cleanroomd admitted during the incident.
     pub(crate) fn rules(&self) -> PathBuf {
+        self.state.join("run/rules")
+    }
+
+    /// The repository's own YARA rules.
+    pub(crate) fn rules_seed(&self) -> PathBuf {
         self.repo.join("scenario/rules")
+    }
+
+    /// Where a submitted rule waits while cleanroomd checks it.
+    pub(crate) fn rule_check(&self) -> PathBuf {
+        self.state.join("run/rule-check")
     }
 
     /// Root lock files.

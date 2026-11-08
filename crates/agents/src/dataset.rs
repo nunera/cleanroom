@@ -46,6 +46,8 @@ pub(crate) enum Shape {
     Briefing,
     /// Asking a specialist or answering the commander.
     Conversation,
+    /// Writing a detection rule for the OS to check and deploy.
+    DetectionRule,
 }
 
 /// Who could have written what the step read.
@@ -76,6 +78,7 @@ pub(crate) const fn shape(tool: Tool, output_chars: usize) -> Shape {
         Tool::ReportRefusal => Shape::Refusal,
         Tool::GetSituation => Shape::Briefing,
         Tool::AskAgent | Tool::Reply => Shape::Conversation,
+        Tool::SubmitRule => Shape::DetectionRule,
     }
 }
 
@@ -102,7 +105,8 @@ pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
         | Tool::UpdateIncident
         | Tool::GetSituation
         | Tool::AskAgent
-        | Tool::Reply => Provenance::AgentClaim,
+        | Tool::Reply
+        | Tool::SubmitRule => Provenance::AgentClaim,
     }
 }
 
