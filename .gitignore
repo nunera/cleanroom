@@ -1,0 +1,11 @@
+/target
+/result
+/result-*
+.direnv/
+
+# Secrets and local state
+*.env
+.env*
+*.key
+secret.json
+/state/
