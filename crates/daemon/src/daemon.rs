@@ -193,17 +193,35 @@ impl Daemon {
             );
             return;
         }
-        let verdict = may_publish(&peer.principal, &signed.body.body);
-        if let Some(action) = self.record_update(&signed.body.body) {
+        let body = &signed.body.body;
+        let measured = if let BusBody::Scope(record) = body {
+            self.scenario.refusal(&peer.principal, record)
+        } else {
+            None
+        };
+        let verdict = may_publish(&peer.principal, body)
+            .map_err(str::to_owned)
+            .and_then(|()| measured.clone().map_or(Ok(()), Err));
+        if let Some(action) = self.record_update(body) {
             let outcome = match &verdict {
                 Ok(()) => Outcome::Allowed,
                 Err(reason) => Outcome::Denied {
-                    reason: (*reason).to_owned(),
+                    reason: reason.clone(),
                 },
             };
-            if let Err(error) = self.receipt(peer.principal.clone(), action, outcome) {
-                tracing::error!("cannot record a record update: {error:#}");
-                return;
+            match self.receipt(peer.principal.clone(), action, outcome) {
+                Ok(seq) => {
+                    if let Some(reason) = measured {
+                        self.status(format!(
+                            "OS kept the record: {} tried to lower {reason} (receipt #{seq})",
+                            peer.name()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::error!("cannot record a record update: {error:#}");
+                    return;
+                }
             }
         }
         if let Err(reason) = verdict {
@@ -768,7 +786,9 @@ impl Daemon {
             .await
             .context("the integrity check panicked")??;
         let at = now();
-        for record in scenario::affected(self.scenario.assets(), &integrity, &at) {
+        let measured = scenario::affected(self.scenario.assets(), &integrity, &at);
+        self.scenario.set_measured(&measured);
+        for record in measured {
             self.publish(BusBody::Scope(record));
         }
         let id = scenario::incident_id(&at);
@@ -833,6 +853,7 @@ impl Daemon {
             .await
             .context("re-seeding panicked")??;
         self.scenario.set_baseline(baseline);
+        self.scenario.set_measured(&[]);
         self.grants.reset();
         self.bus.clear_incident();
         *incident = None;

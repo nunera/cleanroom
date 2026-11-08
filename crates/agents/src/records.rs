@@ -35,14 +35,23 @@ pub(crate) struct Records {
     scope_updates: usize,
     /// Containment proposals the commander approved.
     approved: HashSet<String>,
+    /// Flags cleanroomd itself published (its measurement), by asset id.
+    measured: BTreeMap<String, ScopeFlags>,
 }
 
 impl Records {
     /// Records that start from the known scope records (the daemon's baseline or earlier
-    /// updates), so Scribe updates those assets instead of inventing new ids.
+    /// updates), so Scribe updates those assets instead of inventing new ids. Records
+    /// cleanroomd published are its measurement, which Scribe may add to but never lower.
     pub(crate) fn with_scopes(scopes: BTreeMap<String, ScopeRecord>) -> Self {
+        let measured = scopes
+            .values()
+            .filter(|record| record.updated_by == Principal::System)
+            .map(|record| (record.asset_id.clone(), record.flags))
+            .collect();
         Self {
             scopes,
+            measured,
             ..Self::default()
         }
     }
@@ -95,9 +104,9 @@ impl Records {
     /// Create or update one scope record. Returns the record to publish and a result line.
     ///
     /// # Errors
-    /// Returns a message for the model when a new record has no name or no evidence. A new
-    /// asset needs evidence so Scribe updates the known assets instead of inventing look-alike
-    /// ids; the message lists the known ids.
+    /// Returns a message for the model when a new record has no name or no evidence, or when
+    /// the update would lower a flag cleanroomd measured. A new asset needs evidence so Scribe
+    /// updates the known assets instead of inventing look-alike ids; the message lists them.
     pub(crate) fn apply_scope(
         &mut self,
         mut update: ScopeUpdate,
@@ -129,7 +138,19 @@ impl Records {
                 .entry(asset_id.clone())
                 .or_insert_with(|| new_scope(asset_id, name, at))
         };
-        apply_scope_fields(record, update);
+        let mut candidate = record.clone();
+        apply_scope_fields(&mut candidate, update);
+        if let Some(measured) = self.measured.get(&candidate.asset_id) {
+            let lowered = candidate.flags.lowered_from(measured);
+            if !lowered.is_empty() {
+                return Err(format!(
+                    "{} {} measured yes by cleanroomd's integrity check; you cannot lower a measurement (only the commander can). Keep those flags and record what the evidence adds",
+                    candidate.asset_id,
+                    lowered.join(", ")
+                ));
+            }
+        }
+        *record = candidate;
         record.updated_by = Principal::Agent { role: Role::Scribe };
         at.clone_into(&mut record.updated_at);
         self.scope_updates += 1;
@@ -566,5 +587,48 @@ mod tests {
             .expect("known assets keep updating as before");
 
         assert_eq!(record.flags.accessed, Tri::Unknown, "the flag changed");
+    }
+
+    /// A live guardrails-off run: the ransom note's "backup test" story reached Scribe, which
+    /// set payroll locked=no although cleanroomd's integrity check had measured it locked.
+    #[test]
+    fn scribe_cannot_lower_a_flag_cleanroomd_measured() {
+        let mut payroll = new_scope("payroll".into(), "Payroll export".into(), AT);
+        payroll.flags = ScopeFlags {
+            locked: Tri::Yes,
+            exfiltrated: Tri::Unknown,
+            accessed: Tri::Yes,
+            destroyed: Tri::Unknown,
+            modified: Tri::Yes,
+        };
+        payroll.updated_by = Principal::System;
+        let mut records = Records::with_scopes(BTreeMap::from([("payroll".to_owned(), payroll)]));
+
+        let reason = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "locked": "no", "modified": "no"})),
+                AT,
+            )
+            .expect_err("a measured yes cannot be lowered");
+
+        assert!(reason.contains("locked"), "names the flag: {reason}");
+        assert!(
+            reason.contains("cleanroomd"),
+            "says who measured it: {reason}"
+        );
+        assert!(
+            records.view().contains("locked=yes"),
+            "the record is unchanged"
+        );
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "exfiltrated": "yes", "evidence": ["/evidence/dropbox/payroll.csv"]})),
+                AT,
+            )
+            .expect("adding a finding to a measured record still works");
+        assert!(
+            records.view().contains("exfiltrated=yes"),
+            "the finding is recorded"
+        );
     }
 }

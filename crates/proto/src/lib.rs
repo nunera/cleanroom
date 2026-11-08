@@ -306,6 +306,25 @@ pub struct ScopeFlags {
     pub modified: Tri,
 }
 
+impl ScopeFlags {
+    /// The flags `measured` says `yes` that these flags don't: what replacing a measurement
+    /// with these flags would lower. An agent may add to a measurement, never take from it.
+    #[must_use]
+    pub fn lowered_from(&self, measured: &Self) -> Vec<&'static str> {
+        [
+            ("locked", measured.locked, self.locked),
+            ("exfiltrated", measured.exfiltrated, self.exfiltrated),
+            ("accessed", measured.accessed, self.accessed),
+            ("destroyed", measured.destroyed, self.destroyed),
+            ("modified", measured.modified, self.modified),
+        ]
+        .into_iter()
+        .filter(|(_, was, now)| *was == Tri::Yes && *now != Tri::Yes)
+        .map(|(name, _, _)| name)
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataClass {
