@@ -1,0 +1,46 @@
+[package]
+name = "cleanroom-tui"
+description = "Cleanroom incident command center: live scope, legal clocks, agent bus and approvals in the terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cleanroom-proto.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+jiff = { version = "0.2.40", features = ["static"] }
+ratatui = "0.30.2"
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-stream = "0.1.19"
+tui-big-text = "0.8.10"
+
+# Debian package. The roots are bookworm (glibc 2.36) and trixie (2.41), so the binary is a
+# static-pie musl build with no shared-library dependencies (`$auto` then resolves to none).
+# nixpkgs' musl rustc links dynamically against the Nix store unless crt-static is forced.
+# From the repo root:
+#
+#   nix develop --command nix shell --inputs-from . \
+#     nixpkgs#pkgsCross.musl64.buildPackages.rustc nixpkgs#pkgsCross.musl64.stdenv.cc \
+#     --command env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-cc \
+#     'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static' \
+#     cargo deb -p cleanroom-tui --target x86_64-unknown-linux-musl
+#
+# Output: target/debian/cleanroom-tui_<version>-1_amd64.deb
+[package.metadata.deb]
+maintainer = "Michael Kryvonis <michaelnkryvonis@gmail.com>"
+copyright = "2026, the Cleanroom authors"
+extended-description = """\
+The incident commander's console for Cleanroom. It connects to cleanroomd over its Unix \
+socket and shows the incident record, the scope of compromised data per asset, legal \
+notification clocks (GDPR, HIPAA, Texas §521.053, SEC 8-K), the agents' live trace and the \
+approvals queue. Approvals are signed with the commander's Ed25519 key. --replay plays a \
+recorded incident without a daemon."""
+section = "admin"
+priority = "optional"
+depends = "$auto"
+assets = [["target/release/cleanroom-tui", "usr/bin/", "755"]]
