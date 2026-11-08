@@ -8,7 +8,25 @@ Built at HackUTD 2026 (ZeroDay) for the NVIDIA and Winstead tracks.
 
 ## Status
 
-The shared wire contract (`crates/proto`, [docs/interfaces.md](docs/interfaces.md)), the daemon `cleanroomd` (`crates/daemon`: admission, strata, grants, receipts, bus server, scenario), the Nemotron agent team (`crates/agents`) and the command center (`crates/tui`) are in place.
+The full demo runs end to end on one Linux laptop:
+- **Admission:** the Debian root is admitted by digest. A tampered byte is rejected, naming the layer, and the clean copy is re-admitted.
+- **Detonation:** the canary ransomware locks the `acme-fs` share inside a sandbox, and the scope table turns red.
+- **Investigation:** Nemotron agents investigate inside bubblewrap strata.
+- **Injection:** with prompt guardrails off, the ransom note's injection talks Hunter and Forensics into `rm -rf /evidence/*`, and the kernel grant denies it, with a signed receipt.
+- **Records:** Scribe fills the incident record, scope and legal clocks. The receipt log verifies offline.
+
+Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/brev/`). Measured results are in [docs/nemotron-smoke.md](docs/nemotron-smoke.md).
+
+## Quick start
+
+```sh
+scripts/demo.sh                    # hosted Nemotron, guardrails on
+scripts/demo.sh --guardrails off   # show the kernel stopping what the model was talked into
+scripts/demo.sh --local            # route sensitive steps to Nemotron on Brev (run deploy/brev/tunnel.sh first)
+scripts/demo.sh --replay           # replay recorded model responses, no network
+```
+
+In the command center: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset.
 
 ## Layout
 
@@ -26,6 +44,8 @@ The shared wire contract (`crates/proto`, [docs/interfaces.md](docs/interfaces.m
 | `docs/interfaces.md` | Transport, signing, receipts, daemon operations, grants |
 | `docs/concept.md` | What we're building and why |
 | `docs/research/` | Research notes behind the design |
+| `deploy/brev/` | Self-hosted Nemotron on a Brev GPU (Lightning, Content Safety 3.5, Bolt behind one endpoint) and the laptop tunnel |
+| `docs/nemotron-smoke.md` | Measured hosted vs local model behavior: tool calls, latency, prompt injection, safety models |
 
 ## Develop
 
