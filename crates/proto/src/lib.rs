@@ -31,6 +31,7 @@ pub mod domain {
     pub const BUS: &str = "cleanroom/v1/bus";
     pub const RECEIPT: &str = "cleanroom/v1/receipt";
     pub const ENROLL: &str = "cleanroom/v1/enroll";
+    pub const REVOKE: &str = "cleanroom/v1/revoke";
     pub const APPROVAL: &str = "cleanroom/v1/approval";
     pub const ROOT_LOCK: &str = "cleanroom/v1/root-lock";
 }
@@ -199,6 +200,7 @@ pub enum Action {
     ToolGrant { request_id: String, tool: String },
     Approval { subject_id: String },
     Enroll { member: KeyId },
+    Revoke { member: KeyId },
     RecordUpdate { incident_id: String, field: String },
     Detonate { scenario: String },
 }
@@ -385,6 +387,15 @@ pub struct Member {
     pub enrolled_at: Timestamp,
 }
 
+/// Signed by an admin under [`domain::REVOKE`]: the member's key no longer approves, enrolls or
+/// revokes. A later enrollment of the same key reinstates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revocation {
+    pub key_id: KeyId,
+    pub reason: String,
+    pub revoked_at: Timestamp,
+}
+
 // ---------- Bus ----------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +519,8 @@ pub enum CoreRequest {
     /// Commander approves or denies a pending tool request or containment proposal.
     Approve(Signed<ApprovalDecision>),
     Enroll(Signed<Member>),
+    /// Admin revokes an enrolled member's key.
+    Revoke(Signed<Revocation>),
     Detonate {
         scenario: String,
     },

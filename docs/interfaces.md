@@ -24,14 +24,14 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 - Ed25519. A key id is `sha256:<hex>` of the raw 32-byte public key.
 - Signed bytes: `domain + "\n" + hex(sha256(JCS(body)))`, where JCS is RFC 8785 canonical JSON. Domains are in `cleanroom_proto::domain`.
 - No floats on the wire (percentages are `u8`), so canonical JSON stays unambiguous.
-- Each agent role has its own key; humans have their own keys, enrolled by an admin (`Signed<Member>` under `cleanroom/v1/enroll`).
+- Each agent role has its own key; humans have their own keys, enrolled by an admin (`Signed<Member>` under `cleanroom/v1/enroll`) and revoked by an admin (`Signed<Revocation {key_id, reason, revoked_at}>` under `cleanroom/v1/revoke`).
 - Use `cleanroom_proto::sign` (`sign`, `verify`, `digest_of`, `key_id`, `generate_key`, `signing_key_from_hex`, `verifying_key_from_hex`) on both sides so the bytes always match. `digest_of` is also how a receipt computes `prev`.
 
 ## Receipts
 
 Every allowed or denied action appends a `Receipt` to a hash-chained log. `prev` is the digest of the previous signed receipt; the first entry uses `sha256:` followed by 64 zeros. `verify_log` walks the chain offline and reports the first break.
 
-Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `record_update`, `detonate`.
+Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`.
 
 ## Daemon operations (`request.op`)
 
@@ -41,6 +41,7 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 | `request_tool` | Agent runner | `tool` with decision `auto_allowed` / `approved` / `denied` / `pending` |
 | `approve` | TUI (commander) | Body is `Signed<ApprovalDecision {subject_id, approved, at}>` under `cleanroom/v1/approval`. Response `ok`, then a `tool_decision` or `approval` bus event |
 | `enroll` | TUI (admin) | `ok` or `error` |
+| `revoke` | TUI (admin) | Body is `Signed<Revocation>` under `cleanroom/v1/revoke`. `ok`, or `error` when the signer is not an enrolled admin, the key is not enrolled, or it is the last admin. A later `enroll` of the same key reinstates it |
 | `detonate` | TUI | `ok`; scenario progress arrives as bus events, then the daemon publishes `investigate`. Scenario names: `ransomware` (exfil/persistence are stretch) |
 | `tamper` | TUI (demo opener) | `ok`. `root` names an admitted root; the demo uses `debian` |
 | `admit` | TUI / CLI | `admitted` or `admit_rejected` (names the layer, expected and actual digest) |
