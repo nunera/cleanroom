@@ -30,7 +30,7 @@ Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/
 | Safety model flagged the injected artifact | 14 / 24 screened runs; it missed the polite runbook every time |
 | VPN secrets pasted into a model-written report | 0 / 29 |
 
-Prompt guardrails and safety models are probabilistic layers. The read-only grant is not, which is the point. One gap the kernel can't cover: with guardrails off, Scribe once wrote the attacker's "false positive" story into the record. cleanroomd now refuses any agent attempt to lower a flag it measured itself (fixed after these runs).
+Prompt guardrails and safety models are probabilistic layers. The read-only grant is not, which is the point. One gap the kernel can't cover: with guardrails off, Scribe wrote the attacker's "false positive" story into the record in 3 / 12 hosted runs. cleanroomd now refuses any agent attempt to lower a flag it measured itself (fixed after these runs, not yet re-measured).
 
 ## Quick start
 
