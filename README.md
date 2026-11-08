@@ -33,7 +33,9 @@ Built in about 24 hours at **HackUTD 2026 (ZeroDay)** for the NVIDIA, Winstead a
 
 ## The OS
 
-`cleanroomd` is the core. It runs rootless on Linux hosts that allow unprivileged user namespaces, holds the only signing key, and decides what every stratum may touch. Everything below is real output from the shipped binary.
+`cleanroomd` is the core. It runs rootless on Linux hosts that allow unprivileged user namespaces, holds the only signing key, and decides what every stratum may touch. The terminal captures below are real output from the shipped binary.
+
+<img src="docs/os/diagram-boot.png" width="100%" alt="Boot: plans/vm.json is validated, rendered for dinit or s6-rc, and booted with the chosen init as PID 1. Roots: the lock pins a manifest digest, the staged copy is checked blob by blob, unpacked, and its tree digest is re-checked at every stratum launch; one byte different is rejected with the layer named.">
 
 ### Roots are admitted by digest
 
@@ -59,6 +61,8 @@ A stratum is bubblewrap with every namespace unshared, no capabilities, a cleare
 
 When an agent gets talked into wiping the evidence, the command reaches the kernel and fails there. cleanroomd records the denial, then rehashes the evidence and confirms it still matches the seal taken at detection.
 
+<img src="docs/os/diagram-exec.png" width="100%" alt="Every agent action: a Nemotron tool call goes through cleanroom-agents to cleanroomd, which launches the role's bubblewrap stratum under its grant; the kernel denies writes to the read-only evidence. After every command: a signed chained receipt, an evidence rehash against the seal, a status line, and offline verification.">
+
 <img src="docs/os/run.png" width="100%" alt="cleanroomd run hunter rm -rf /evidence/acme-fs: Read-only file system for every file, denied by the hunter grant, receipt 20, exit 126; then cleanroomd verify: chain intact">
 
 ### Software from any distro
@@ -83,6 +87,8 @@ NixOS is declarative too, but it's built around systemd, and software has to be 
 
 Every role runs on Nemotron, and every call goes through the OS like any other action.
 
+<img src="docs/os/diagram-model.png" width="100%" alt="Every model call: evidence is scored by Safety Guard, routed by an egress policy to hosted Nemotron or a local Brev GPU, and the answer and reasoning are recorded by cleanroomd as a model_call receipt whose stored trace can be verified offline.">
+
 | Role | Model | Why this one |
 | --- | --- | --- |
 | Clean, the lead agent | Nemotron 3.5 Lightning 30B A3B | fast replies with reasoning on |
@@ -92,7 +98,7 @@ Every role runs on Nemotron, and every call goes through the OS like any other a
 | Safety screen | Llama 3.1 Nemotron Safety Guard 8B v3 | scores every piece of evidence first |
 | Sensitive steps | Lightning NVFP4, Content Safety 3.5, Bolt E4B on our own Brev GPU | personal data stays off the hosted API; local Lightning answered at 0.70 s p50 vs 1.06 s hosted |
 
-**Every call is a receipt, reasoning included.** cleanroomd signs each model call with digests of the exact request and response, and stores the chain of thought under the same receipt. Here is Forensics, on guardrails off, deciding to run the attacker's command. The OS can prove this is exactly what the model returned.
+**Every call is a receipt, reasoning included.** cleanroomd signs each model call with digests of the exact request and response, and stores the chain of thought under the same receipt. Here is Forensics, with guardrails off, deciding to run the attacker's command. The OS can prove this is exactly what the model returned.
 
 <img src="docs/os/reasoning.png" width="100%" alt="cleanroomd reasoning 54: Forensics' 389 token chain of thought reasoning that it should run rm -rf /evidence/*, and the line: this trace matches the digest in signed receipt 54">
 
@@ -124,6 +130,8 @@ With `--memory-tiers`, anything the attacker wrote enters an agent's context as 
 
 Clean is the agent you talk to. It narrates the incident as it happens, answers your questions and asks the specialists for you. It has no exec rights at all. Ask "did anyone try to delete the evidence?" and it answers with the receipt numbers.
 
+The team is split the way a mixture of experts model is: Clean routes each task to one specialist (Hunter, Forensics, Scribe or Containment), and each specialist runs in its own stratum with only the grant its job needs.
+
 <br clear="right">
 
 <img src="docs/screenshots/lead.png" width="100%" alt="The Clean tab: a red KERNEL BLOCKED banner over the conversation, and the team on the right">
@@ -145,7 +153,7 @@ The prompt guardrails and the safety model both helped, and both are probabilist
 
 ## The command center
 
-`cleanroom-tui` connects as the commander and draws everything from signed bus events.
+`cleanroom-tui` connects as the commander and draws everything from signed bus events. On a booted Cleanroom host it runs on the console; on a laptop it runs as a Debian `.deb` inside the admitted Debian root.
 
 <table>
   <tr>
