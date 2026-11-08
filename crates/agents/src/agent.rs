@@ -538,7 +538,10 @@ impl Agent {
         let mut subject = None;
         let done = match action {
             Action::Exec(spec) => {
-                subject = Some(format!("{} {}", tool.name(), spec.subject()));
+                subject = Some((
+                    format!("{} {}", tool.name(), spec.subject()),
+                    tool.screened(spec.subject()),
+                ));
                 self.exec(spec).await
             }
             Action::RequestTool(ask) => self.request_tool(desk, ask).await,
@@ -550,7 +553,9 @@ impl Agent {
         };
         self.trace(desk.steps, tool.name(), args, done.shown).await;
         match subject {
-            Some(subject) if done.untrusted => self.screen(desk, thread, &subject, done.text).await,
+            Some((subject, scored)) if done.untrusted => {
+                self.screen(desk, thread, &subject, scored, done.text).await
+            }
             Some(_) | None => done.text,
         }
     }
@@ -609,15 +614,20 @@ impl Agent {
         }
     }
 
-    /// Sensitivity routing and safety layer 1 for evidence-bearing output.
+    /// Sensitivity routing for evidence-bearing output, then safety layer 1 when the output is
+    /// attacker-written text (`scored`).
     async fn screen(
         &self,
         desk: &mut Desk,
         thread: &mut Thread,
         subject: &str,
+        scored: bool,
         text: String,
     ) -> String {
         self.check_sensitive(desk, thread, &text).await;
+        if !scored {
+            return text;
+        }
         let route = if thread.sensitive && self.shared.router.local_model().is_some() {
             ModelRoute::Local
         } else {
