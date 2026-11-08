@@ -119,6 +119,7 @@ cleanroomd [--socket PATH] reset                        # re-seed the victim, cl
 cleanroomd [--socket PATH] detonate [SCENARIO]          # default ransomware; starts the investigation
 cleanroomd [--socket PATH] tamper [ROOT]                # flip a byte in a staged copy; the next admit is rejected
 cleanroomd [--socket PATH] run STRATUM [--timeout S] -- CMD...  # as that agent, under its grant: exit = CMD's, 124 timeout, 126 denied
+cleanroomd [--socket PATH] probe [hunter|forensics]    # test the stratum's walls from inside, one receipt per wall: exit 0 all held, 1 one broken
 cleanroomd plan validate FILE                           # offline: boot order, or the problem (cycle witness); exit 0 valid, 1 invalid, 2 unreadable
 ```
 
@@ -134,6 +135,7 @@ cleanroomd plan validate FILE                           # offline: boot order, o
   | `acme-fs` (victim) | `/srv/acme-fs/{share,drop,logs}` read-write; `/opt/cleanroom/bin` read-only |
   | `scribe`, `containment` | no exec: every request is denied |
 
+- **Probe:** `cleanroomd probe [hunter|forensics]` tests those walls from inside the stratum, as its agent under its grant, one command and one signed receipt per wall: only `lo` in `/proc/net/dev`, `CapEff` all zero, `unshare -U` refused, nothing in the environment but `HOME`, `LANG`, `TMPDIR`, `PATH` and `PWD` (a leaked variable is named, its value never printed), a write under `/evidence` denied by the kernel, and the invoking user's `$HOME` absent. It prints `PASS`/`FAIL` per wall with the receipt number and exits 1 if any wall is broken.
 - **Tools:** `request_tool` for `yara`, `volatility3`, `tshark`, `file` or `binutils` from the pinned nixpkgs (`CLEANROOM_NIXPKGS`, else `flake.lock`) is auto-allowed; any other well-formed nix reference waits for a commander's signed `approve`; OCI sources are denied. A granted tool is built with `nix build --impure` and `NIXPKGS_ALLOW_UNFREE=1` (the pin marks volatility3 unfree), and its `bin` directories go first on the role's `PATH`. Hunter holds `yara` from startup, and the allowlist is pre-built in the background so later grants are instant and work offline.
 - **Approvals and members:** an `approve` must come from a human connection whose key signed the `ApprovalDecision`. Until someone is enrolled, any human key on the socket may approve, and the first `enroll` must be an admin enrolling their own key; after that only enrolled admins enroll or `revoke`, and only enrolled commanders and admins approve. A revoked key stops approving, enrolling and revoking at once and after restarts (enrollments and revocations are applied in order from `keys/members.ndjson`); a later enrollment reinstates it. The last admin cannot be revoked, so the list never empties back into bootstrap mode.
 - **Receipts:** `receipts.ndjson` holds one `Signed<Receipt>` per line (daemon key, `cleanroom/v1/receipt`); `seq` is the line number and `prev` the digest of the previous signed receipt. Every exec (allowed or denied), admission, tamper, detonation, tool grant, approval, enrollment, record update and reset is recorded. `verify_log` reports the first entry that fails its signature or its chain.
