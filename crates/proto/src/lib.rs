@@ -328,6 +328,13 @@ impl ScopeFlags {
         .map(|(name, _, _)| name)
         .collect()
     }
+
+    /// True when these flags would clear exfiltration that `current` holds as unknown or yes.
+    /// cleanroomd cannot measure exfiltration, so only a human may clear it.
+    #[must_use]
+    pub fn clears_exfiltration(&self, current: &Self) -> bool {
+        self.exfiltrated == Tri::No && current.exfiltrated != Tri::No
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

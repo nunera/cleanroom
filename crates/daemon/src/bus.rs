@@ -6,7 +6,8 @@
 use std::sync::{Arc, Mutex};
 
 use cleanroom_proto::{
-    Audience, BusBody, BusMessage, Envelope, Frame, Signed, ToolDecision, ToolRequest, WIRE_VERSION,
+    Audience, BusBody, BusMessage, Envelope, Frame, ScopeFlags, Signed, ToolDecision, ToolRequest,
+    WIRE_VERSION,
 };
 use tokio::sync::mpsc::{self, error::TrySendError};
 
@@ -131,6 +132,23 @@ impl Bus {
     /// Id of the latest incident record on the bus.
     pub(crate) fn incident_id(&self) -> Option<String> {
         lock(&self.inner).replay.incident_id()
+    }
+
+    /// Flags of the latest scope record on the bus for `asset_id`.
+    pub(crate) fn scope_flags(&self, asset_id: &str) -> Option<ScopeFlags> {
+        let inner = lock(&self.inner);
+        inner
+            .replay
+            .scopes
+            .iter()
+            .find(|(id, _)| id == asset_id)
+            .and_then(|(_, message)| {
+                if let BusBody::Scope(record) = &message.body.body {
+                    Some(record.flags)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Forget the incident, its scope records, and its open requests and proposals (reset).

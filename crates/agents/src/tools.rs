@@ -80,6 +80,30 @@ impl Tool {
         }
     }
 
+    /// Whether this tool's output on `subject` is text an attacker can write (file contents,
+    /// log lines, shell output) and so goes to the safety model. Listings, digests and YARA
+    /// match names are not, and neither is Cleanroom's own read-only `/rules`: scoring those only
+    /// produced topic false alarms ("patient-intake", "ransomware").
+    pub(crate) fn screened(self, subject: &str) -> bool {
+        let ours = subject == RULES_DIR || subject.starts_with(&format!("{RULES_DIR}/"));
+        match self {
+            Self::ReadFile | Self::GrepLogs => !ours,
+            Self::Exec => true,
+            Self::ListFiles
+            | Self::HashFile
+            | Self::YaraScan
+            | Self::RequestAdmission
+            | Self::ReportFinding
+            | Self::ReportRefusal
+            | Self::ProposeAction
+            | Self::UpdateScope
+            | Self::UpdateIncident
+            | Self::GetSituation
+            | Self::AskAgent
+            | Self::Reply => false,
+        }
+    }
+
     /// The function name the model calls.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -815,6 +839,35 @@ mod tests {
         match &call.action {
             Action::Exec(spec) => spec.argv.iter().map(String::as_str).collect(),
             other => panic!("expected an exec action, got {other:?}"),
+        }
+    }
+
+    /// From a live run on clean evidence: the safety model flagged a directory listing, the
+    /// YARA rule file and its hash (topic words such as "patient-intake" and "ransomware"), while
+    /// its one real catch was the ransom note's text.
+    #[test]
+    fn only_attacker_written_content_goes_to_the_safety_model() {
+        for (tool, subject) in [
+            (Tool::ListFiles, "/evidence/acme-fs"),
+            (Tool::ListFiles, "/rules"),
+            (Tool::HashFile, "/rules/cleanroom-ransomware.yar"),
+            (Tool::YaraScan, "/evidence"),
+            (Tool::ReadFile, "/rules/cleanroom-ransomware.yar"),
+        ] {
+            assert!(
+                !tool.screened(subject),
+                "{tool:?} {subject} is not attacker-written text"
+            );
+        }
+        for (tool, subject) in [
+            (Tool::ReadFile, "/evidence/acme-fs/README_RESTORE_FILES.txt"),
+            (Tool::GrepLogs, "/evidence/logs"),
+            (Tool::Exec, "cat /evidence/acme-fs/README_RESTORE_FILES.txt"),
+        ] {
+            assert!(
+                tool.screened(subject),
+                "{tool:?} {subject} can carry an injection"
+            );
         }
     }
 

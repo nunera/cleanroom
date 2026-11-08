@@ -150,6 +150,12 @@ impl Records {
                 ));
             }
         }
+        if candidate.flags.clears_exfiltration(&record.flags) {
+            return Err(format!(
+                "{} exfiltrated: cleanroomd cannot measure exfiltration, so an agent cannot clear it; keep it unknown (or yes with evidence) and the commander can decide no",
+                candidate.asset_id
+            ));
+        }
         *record = candidate;
         record.updated_by = Principal::Agent { role: Role::Scribe };
         at.clone_into(&mut record.updated_at);
@@ -269,6 +275,12 @@ fn apply_incident_fields(
         ));
     }
     for trigger in update.triggers {
+        // Awareness and discovery run from first knowledge, the detection; a determination is
+        // a decision, stamped when it is made.
+        let (stamp, from) = match trigger {
+            Trigger::Aware | Trigger::Discovered => (record.detected_at.clone(), " (detection)"),
+            Trigger::BreachDetermined => (at.to_owned(), ""),
+        };
         let (slot, clock) = match trigger {
             Trigger::Aware => (
                 &mut record.triggers.aware_at,
@@ -286,8 +298,8 @@ fn apply_incident_fields(
         if let Some(stamped) = slot {
             changes.push(format!("{clock} already started at {stamped}"));
         } else {
-            *slot = Some(at.to_owned());
-            changes.push(format!("{clock} started at {at}"));
+            changes.push(format!("{clock} started at {stamp}{from}"));
+            *slot = Some(stamp);
         }
     }
     if let Some(note) = update.timeline_note {
@@ -630,5 +642,107 @@ mod tests {
             records.view().contains("exfiltrated=yes"),
             "the finding is recorded"
         );
+    }
+
+    fn incident_update(args: &serde_json::Value) -> IncidentUpdate {
+        serde_json::from_value(args.clone()).expect("well-formed update_incident arguments")
+    }
+
+    /// A live run: cleanroomd detected the ransomware at 04:48, and Scribe recorded GDPR
+    /// awareness and HIPAA discovery when it got to them, 14 minutes later. The clocks run from
+    /// first knowledge, which is the detection; a later write must not push them back.
+    #[test]
+    fn awareness_and_discovery_clocks_start_at_detection() {
+        let detected = "2026-11-08T04:48:01Z";
+        let case = Case {
+            incident_id: "INC-20261108-044801".to_owned(),
+            brief: "Ransomware hit the acme-fs file share.".to_owned(),
+            declared_at: detected.to_owned(),
+            declared_by: Principal::System,
+        };
+        let mut records = Records::default();
+        records
+            .apply_incident(
+                &case,
+                incident_update(&json!({"title": "Ransomware on acme-fs", "severity": "high", "category": "ransomware", "summary": "encrypted share"})),
+                detected,
+            )
+            .expect("opens the record");
+
+        let written = "2026-11-08T05:02:22Z";
+        let (record, _) = records
+            .apply_incident(
+                &case,
+                incident_update(&json!({"triggers": ["aware", "discovered", "breach_determined"], "timeline_note": "payroll and patient intake copied out"})),
+                written,
+            )
+            .expect("records the triggers");
+
+        assert_eq!(
+            record.triggers.aware_at.as_deref(),
+            Some(detected),
+            "GDPR from detection"
+        );
+        assert_eq!(
+            record.triggers.discovered_at.as_deref(),
+            Some(detected),
+            "HIPAA from detection"
+        );
+        assert_eq!(
+            record.triggers.breach_determined_at.as_deref(),
+            Some(written),
+            "a determination is a decision, stamped when it is made"
+        );
+    }
+
+    /// A live guardrails-off run: the ransom note's "backup test" story made Scribe write
+    /// exfiltrated=no for payroll, which had been copied out. cleanroomd can't measure
+    /// exfiltration, so an agent alone may not clear it.
+    #[test]
+    fn scribe_cannot_clear_exfiltration_on_its_own() {
+        let mut payroll = new_scope("payroll".into(), "Payroll export".into(), AT);
+        payroll.flags = ScopeFlags {
+            locked: Tri::Yes,
+            exfiltrated: Tri::Unknown,
+            accessed: Tri::Yes,
+            destroyed: Tri::Unknown,
+            modified: Tri::Yes,
+        };
+        payroll.updated_by = Principal::System;
+        let mut vpn = new_scope("vpn-credentials".into(), "VPN credentials".into(), AT);
+        vpn.flags = ScopeFlags {
+            locked: Tri::No,
+            exfiltrated: Tri::No,
+            accessed: Tri::No,
+            destroyed: Tri::No,
+            modified: Tri::No,
+        };
+        vpn.updated_by = Principal::System;
+        let mut records = Records::with_scopes(BTreeMap::from([
+            ("payroll".to_owned(), payroll),
+            ("vpn-credentials".to_owned(), vpn),
+        ]));
+
+        let reason = records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "exfiltrated": "no"})),
+                AT,
+            )
+            .expect_err("unknown cannot become no on an agent's word");
+        assert!(reason.contains("exfiltrat"), "names the flag: {reason}");
+        assert!(records.view().contains("exfiltrated=unknown"), "unchanged");
+
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "vpn-credentials", "accessed": "unknown"})),
+                AT,
+            )
+            .expect("a baseline no that nobody touches is not a clearing");
+        records
+            .apply_scope(
+                update(&json!({"asset_id": "payroll", "exfiltrated": "yes", "evidence": ["/evidence/dropbox/payroll.csv"]})),
+                AT,
+            )
+            .expect("raising exfiltration is allowed");
     }
 }
