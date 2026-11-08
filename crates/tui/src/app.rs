@@ -206,7 +206,7 @@ pub(crate) struct App {
     session: Option<Session>,
     /// Source of "now".
     timebase: Timebase,
-    /// Root that `t` tampers with and re-admits.
+    /// Root that `t` tampers with and that `A` admits again.
     tamper_root: String,
     /// False once the commander quits.
     running: bool,
@@ -365,6 +365,15 @@ impl App {
                 self.request(
                     CoreRequest::Tamper { root: root.clone() },
                     SentRequest::Tamper { root },
+                );
+            }
+            // Shift+A: after a rejection cleanroomd discards the tampered copy, so this admission
+            // checks a clean one.
+            Key::Char('A') => {
+                let root = self.tamper_root.clone();
+                self.request(
+                    CoreRequest::Admit { root: root.clone() },
+                    SentRequest::Admit { root },
                 );
             }
             Key::Char('a') => self.decide(true),

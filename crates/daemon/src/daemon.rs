@@ -1,0 +1,1034 @@
+//! The daemon's shared state and its operations: every `request` op, checked publishes, and the
+//! bus messages cleanroomd signs itself.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context as _, Result, bail};
+use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
+use cleanroom_proto::{
+    Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
+    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal, Role,
+    Signed, ToolDecision, ToolRequest, ToolSource, domain,
+};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use tokio::task::spawn_blocking;
+
+use crate::bus::{Bus, Outbox, Subject};
+use crate::layout::Layout;
+use crate::members::Members;
+use crate::roots::{Admitted, Roots, Verdict};
+use crate::scenario::{self, Scenario};
+use crate::strata::{self, Captured, Launch};
+use crate::tools::{self, Granted, Grants, Policy};
+use crate::{keys, lock, now, receipts};
+
+/// The root every stratum runs on.
+const ROOT: &str = "debian";
+/// The scenario this daemon runs.
+const RANSOMWARE: &str = "ransomware";
+/// Longest the ransomware may run.
+const DETONATION_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// A connected client, as established by its `hello`.
+#[derive(Debug)]
+pub(crate) struct Peer {
+    /// Who it speaks for.
+    principal: Principal,
+    /// The key that signs its publishes (and a human's approvals and enrollments).
+    key: VerifyingKey,
+    /// `sha256:` of `key`.
+    key_id: KeyId,
+}
+
+impl Peer {
+    /// Check a `hello`: nobody speaks as cleanroomd, and a human names the key they present.
+    ///
+    /// # Errors
+    /// Fails on a malformed key, a `system` principal, or a human key id that is not the key's.
+    pub(crate) fn new(principal: Principal, public_key: &str) -> Result<Self> {
+        let key = verifying_key_from_hex(public_key).context("hello carries a malformed key")?;
+        let key_id = key_id(&key);
+        match &principal {
+            Principal::System => bail!("clients cannot speak as cleanroomd"),
+            Principal::Human { key_id: claimed } if *claimed != key_id => {
+                bail!("hello names human {claimed} but presents key {key_id}")
+            }
+            Principal::Human { .. } | Principal::Agent { .. } => {}
+        }
+        Ok(Self {
+            principal,
+            key,
+            key_id,
+        })
+    }
+
+    /// Short name for logs and status lines.
+    pub(crate) fn name(&self) -> String {
+        describe(&self.principal)
+    }
+
+    /// The agent role this connection speaks for, when it matches `claimed`.
+    ///
+    /// # Errors
+    /// Fails for humans and for agents claiming another role.
+    fn role(&self, claimed: Role) -> Result<Role> {
+        match self.principal {
+            Principal::Agent { role } if role == claimed => Ok(role),
+            Principal::Agent { role } => bail!(
+                "this connection speaks for {}, not {}",
+                strata::stratum_of(role),
+                strata::stratum_of(claimed)
+            ),
+            Principal::Human { .. } | Principal::System => {
+                bail!(
+                    "only agent runners call this; {} is not an agent",
+                    self.name()
+                )
+            }
+        }
+    }
+
+    /// Succeeds for humans.
+    ///
+    /// # Errors
+    /// Fails for agents.
+    fn human(&self, op: &str) -> Result<()> {
+        match self.principal {
+            Principal::Human { .. } => Ok(()),
+            Principal::Agent { .. } | Principal::System => {
+                bail!("{op} is for humans; {} cannot call it", self.name())
+            }
+        }
+    }
+}
+
+/// Everything the connections share.
+#[derive(Debug)]
+pub(crate) struct Daemon {
+    /// Paths.
+    layout: Layout,
+    /// Signs receipts and the daemon's own bus messages.
+    key: SigningKey,
+    /// Distinguishes this run's message ids from earlier runs.
+    session: String,
+    /// Next bus message number.
+    next_message: AtomicU64,
+    /// Subscribers and replay state.
+    bus: Bus,
+    /// The receipt log.
+    receipts: Mutex<receipts::Log>,
+    /// Admitted roots.
+    roots: Roots,
+    /// Tool admission policy.
+    policy: Policy,
+    /// Tools each role holds.
+    grants: Grants,
+    /// The acme-fs scenario.
+    scenario: Scenario,
+    /// Enrolled members.
+    members: Mutex<Members>,
+}
+
+impl Daemon {
+    /// Load keys, the receipt log, the scenario and the tool policy; seed the victim and publish
+    /// the baseline; start provisioning standing tool grants in the background.
+    ///
+    /// # Errors
+    /// Fails if a key, the receipt log, `scenario/assets.json`, the seed share or the nixpkgs
+    /// pin is unusable.
+    pub(crate) async fn start(layout: Layout) -> Result<Arc<Self>> {
+        let key = keys::load_or_create(&layout.keys().join("cleanroomd.key"))?;
+        let receipts = receipts::Log::open(&layout.receipts())?;
+        let assets = scenario::load_assets(&layout.assets())?;
+        let policy = Policy::load(&layout.repo)?;
+        let members = Members::load(&layout.keys().join("members.ndjson"))?;
+        let daemon = Arc::new(Self {
+            roots: Roots::new(layout.clone()),
+            layout,
+            session: session_tag(),
+            next_message: AtomicU64::new(1),
+            bus: Bus::default(),
+            receipts: Mutex::new(receipts),
+            policy,
+            grants: Grants::default(),
+            scenario: Scenario::new(assets),
+            members: Mutex::new(members),
+            key,
+        });
+        tracing::info!(
+            key = %key_id(&daemon.key.verifying_key()),
+            state = %daemon.layout.state.display(),
+            repo = %daemon.layout.repo.display(),
+            "cleanroomd starting"
+        );
+        daemon.restore(&Principal::System).await?;
+        tokio::spawn(Arc::clone(&daemon).provision());
+        Ok(daemon)
+    }
+
+    /// Register a client on the bus and queue the current state for it.
+    pub(crate) fn subscribe(&self, audiences: Vec<Audience>, outbox: Outbox) -> u64 {
+        self.bus.subscribe(audiences, outbox)
+    }
+
+    /// Remove a client from the bus.
+    pub(crate) fn unsubscribe(&self, id: u64) {
+        self.bus.unsubscribe(id);
+    }
+
+    /// Check a client's publish and fan it out, sender included.
+    pub(crate) fn accept_publish(&self, peer: &Peer, signed: Signed<BusMessage>) {
+        if let Err(error) = sign::verify(&signed, &peer.key, domain::BUS) {
+            tracing::warn!(peer = %peer.name(), "dropping a publish: {error}");
+            return;
+        }
+        if signed.body.from != peer.principal {
+            tracing::warn!(
+                peer = %peer.name(),
+                "dropping a publish that claims to be from {}",
+                describe(&signed.body.from)
+            );
+            return;
+        }
+        let verdict = may_publish(&peer.principal, &signed.body.body);
+        if let Some(action) = self.record_update(&signed.body.body) {
+            let outcome = match &verdict {
+                Ok(()) => Outcome::Allowed,
+                Err(reason) => Outcome::Denied {
+                    reason: (*reason).to_owned(),
+                },
+            };
+            if let Err(error) = self.receipt(peer.principal.clone(), action, outcome) {
+                tracing::error!("cannot record a record update: {error:#}");
+                return;
+            }
+        }
+        if let Err(reason) = verdict {
+            tracing::warn!(peer = %peer.name(), "dropping a publish: {reason}");
+            return;
+        }
+        self.bus.fan_out(signed);
+    }
+
+    /// Answer one request.
+    pub(crate) async fn handle(
+        self: &Arc<Self>,
+        peer: &Peer,
+        request: CoreRequest,
+    ) -> CoreResponse {
+        let op = op_name(&request);
+        tracing::info!(peer = %peer.name(), op, "request");
+        let result = match request {
+            CoreRequest::Exec(exec) => Box::pin(self.exec(peer, exec)).await,
+            CoreRequest::RequestTool(ask) => Box::pin(self.request_tool(peer, ask)).await,
+            CoreRequest::Approve(decision) => self.approve(peer, decision),
+            CoreRequest::Enroll(member) => self.enroll(peer, member),
+            CoreRequest::Detonate { scenario } => Box::pin(self.detonate(peer, &scenario)).await,
+            CoreRequest::Tamper { root } => self.tamper(peer, &root).await,
+            CoreRequest::Admit { root } => self.admit(peer, &root).await,
+            CoreRequest::VerifyLog => self.verify_log(peer),
+            CoreRequest::Reset => self.reset(peer).await,
+        };
+        result.unwrap_or_else(|error| {
+            tracing::warn!(peer = %peer.name(), op, "{error:#}");
+            CoreResponse::Error {
+                message: format!("{error:#}"),
+            }
+        })
+    }
+
+    /// Run a command in the caller's stratum under its grant.
+    ///
+    /// # Errors
+    /// Fails if the caller is not the agent it names, the command is empty, or the sandbox or
+    /// receipt log fails.
+    async fn exec(&self, peer: &Peer, request: ExecRequest) -> Result<CoreResponse> {
+        let role = peer.role(request.from)?;
+        if request.argv.is_empty() {
+            bail!("exec needs a program to run");
+        }
+        let actor = Principal::Agent { role };
+        let action = Action::Exec {
+            stratum: request.stratum.clone(),
+            argv: request.argv.clone(),
+        };
+        if let Some(reason) = strata::refusal(role, &request.stratum) {
+            return self.exec_result(
+                actor,
+                action,
+                ExecOutcome::Denied { reason },
+                Captured::default(),
+            );
+        }
+        let root = match self.launchable_root(&actor).await {
+            Ok(root) => root,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                return self.exec_result(
+                    actor,
+                    action,
+                    ExecOutcome::Denied { reason },
+                    Captured::default(),
+                );
+            }
+        };
+        let tools = self.grants.of(role);
+        let grant = strata::investigator(&self.layout, role, &root, &tools)?;
+        let bins: Vec<PathBuf> = tools.into_iter().flat_map(|tool| tool.bins).collect();
+        let launch = Launch {
+            rootfs: &root.rootfs,
+            grant: &grant,
+            bins: &bins,
+            argv: &request.argv,
+            timeout: Duration::from_millis(request.timeout_ms).min(strata::MAX_TIMEOUT),
+        };
+        let captured = strata::run(&launch).await?;
+        let outcome = strata::classify(strata::stratum_of(role), &captured);
+        self.exec_result(actor, action, outcome, captured)
+    }
+
+    /// Record an exec and build its response; a denial also goes on the bus as a status line.
+    ///
+    /// # Errors
+    /// Fails if the receipt cannot be written.
+    fn exec_result(
+        &self,
+        actor: Principal,
+        action: Action,
+        outcome: ExecOutcome,
+        captured: Captured,
+    ) -> Result<CoreResponse> {
+        let receipt_outcome = match &outcome {
+            ExecOutcome::Denied { reason } => Outcome::Denied {
+                reason: reason.clone(),
+            },
+            ExecOutcome::Exited { .. } | ExecOutcome::TimedOut => Outcome::Allowed,
+        };
+        let who = describe(&actor);
+        let command = match &action {
+            Action::Exec { argv, .. } => argv.join(" "),
+            Action::AdmitRoot { .. }
+            | Action::Write { .. }
+            | Action::ToolGrant { .. }
+            | Action::Approval { .. }
+            | Action::Enroll { .. }
+            | Action::RecordUpdate { .. }
+            | Action::Detonate { .. } => String::new(),
+        };
+        let seq = self.receipt(actor, action, receipt_outcome)?;
+        if let ExecOutcome::Denied { reason } = &outcome {
+            self.status(format!(
+                "OS denied {who}: `{command}`: {reason} (receipt #{seq})"
+            ));
+        }
+        Ok(CoreResponse::Exec(ExecResult {
+            outcome,
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+            truncated: captured.truncated,
+            receipt_seq: seq,
+        }))
+    }
+
+    /// The admitted root, admitting it first if this run has not, and re-checking its tree.
+    ///
+    /// # Errors
+    /// Fails if admission fails or rejects the root, or the tree changed since admission.
+    async fn launchable_root(&self, actor: &Principal) -> Result<Admitted> {
+        let root = match self.roots.admitted(ROOT) {
+            Some(root) => root,
+            None => match self.admit_root(actor, ROOT).await? {
+                Verdict::Admitted(root) => root,
+                Verdict::Rejected(mismatch) => bail!(
+                    "root {ROOT} failed admission: layer {} does not match its lock",
+                    mismatch.layer
+                ),
+            },
+        };
+        if !self.roots.intact(&root).await? {
+            self.status(format!(
+                "root {ROOT} changed on disk since admission (tree digest mismatch); launches refused until it is re-admitted"
+            ));
+            bail!("root {ROOT} changed on disk since admission; re-admit it");
+        }
+        Ok(root)
+    }
+
+    /// Admit a root, recording a receipt and a status line either way.
+    ///
+    /// # Errors
+    /// Fails if admission cannot run or the receipt cannot be written.
+    async fn admit_root(&self, actor: &Principal, name: &str) -> Result<Verdict> {
+        let verdict = self.roots.admit(name).await?;
+        match &verdict {
+            Verdict::Admitted(root) => {
+                let action = Action::AdmitRoot {
+                    name: name.to_owned(),
+                    manifest: root.manifest.clone(),
+                };
+                let seq = self.receipt(actor.clone(), action, Outcome::Allowed)?;
+                self.status(format!(
+                    "root {name} admitted: manifest {}, unpacked tree {} (receipt #{seq})",
+                    root.manifest, root.tree
+                ));
+            }
+            Verdict::Rejected(mismatch) => {
+                let reason = format!(
+                    "layer {} does not match its lock: expected {}, actual {}",
+                    mismatch.layer, mismatch.expected, mismatch.actual
+                );
+                let action = Action::AdmitRoot {
+                    name: name.to_owned(),
+                    manifest: mismatch.manifest.clone(),
+                };
+                let seq = self.receipt(
+                    actor.clone(),
+                    action,
+                    Outcome::Denied {
+                        reason: reason.clone(),
+                    },
+                )?;
+                self.status(format!("root {name} REJECTED: {reason} (receipt #{seq})"));
+            }
+        }
+        Ok(verdict)
+    }
+
+    /// `admit {root}`.
+    ///
+    /// # Errors
+    /// Fails for agents, or if admission cannot run.
+    async fn admit(&self, peer: &Peer, root: &str) -> Result<CoreResponse> {
+        peer.human("admit")?;
+        Ok(match self.admit_root(&peer.principal, root).await? {
+            Verdict::Admitted(admitted) => CoreResponse::Admitted {
+                root: root.to_owned(),
+                manifest: admitted.manifest,
+            },
+            Verdict::Rejected(mismatch) => CoreResponse::AdmitRejected {
+                root: root.to_owned(),
+                layer: mismatch.layer,
+                expected: mismatch.expected,
+                actual: mismatch.actual,
+            },
+        })
+    }
+
+    /// `tamper {root}`: corrupt a staged copy for the next admission to catch.
+    ///
+    /// # Errors
+    /// Fails for agents, or if the root cannot be staged or rewritten.
+    async fn tamper(&self, peer: &Peer, root: &str) -> Result<CoreResponse> {
+        peer.human("tamper")?;
+        let tampered = self.roots.tamper(root).await?;
+        let action = Action::Write {
+            stratum: "store".to_owned(),
+            path: tampered.path.display().to_string(),
+        };
+        let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
+        self.status(format!(
+            "{} flipped byte {} of layer {} in the staged copy of {root}; the next admission checks it (receipt #{seq})",
+            peer.name(),
+            tampered.offset,
+            tampered.layer
+        ));
+        Ok(CoreResponse::Ok)
+    }
+
+    /// `request_tool`: publish the request, decide it, and materialize it when allowed.
+    ///
+    /// # Errors
+    /// Fails if the caller is not the agent it names or the receipt cannot be written.
+    async fn request_tool(&self, peer: &Peer, request: ToolRequest) -> Result<CoreResponse> {
+        let role = peer.role(request.from)?;
+        let decision = strata::refusal(role, &request.stratum).map_or_else(
+            || self.policy.decide(&request),
+            |reason| ToolDecision::Denied { reason },
+        );
+        self.publish(BusBody::ToolRequest(request.clone()));
+        let decision = match decision {
+            ToolDecision::AutoAllowed { rule } => match self.grant_tool(&request).await {
+                Ok(()) => ToolDecision::AutoAllowed { rule },
+                Err(error) => ToolDecision::Denied {
+                    reason: format!("allowed by {rule}, but it could not be built: {error:#}"),
+                },
+            },
+            ToolDecision::Pending => {
+                self.status(format!(
+                    "{} asks for {}: outside policy, waiting for a commander's signature on {}",
+                    describe(&Principal::Agent { role }),
+                    request.tool,
+                    request.id
+                ));
+                return Ok(CoreResponse::Tool {
+                    request_id: request.id,
+                    decision: ToolDecision::Pending,
+                });
+            }
+            decided @ (ToolDecision::Approved { .. } | ToolDecision::Denied { .. }) => decided,
+        };
+        self.settle_tool(Principal::System, &request, &decision)?;
+        Ok(CoreResponse::Tool {
+            request_id: request.id,
+            decision,
+        })
+    }
+
+    /// Build a requested tool and add it to the requester's grant.
+    ///
+    /// # Errors
+    /// Fails for non-nix sources or a failed build.
+    async fn grant_tool(&self, request: &ToolRequest) -> Result<()> {
+        let ToolSource::Nix { flake_ref } = &request.source else {
+            bail!("only nix tool sources can be materialized");
+        };
+        let bins = tools::materialize(flake_ref).await?;
+        self.grants.add(
+            request.from,
+            Granted {
+                name: request.tool.clone(),
+                bins,
+                baseline: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record a final tool decision and publish it.
+    ///
+    /// # Errors
+    /// Fails if the receipt cannot be written.
+    fn settle_tool(
+        &self,
+        actor: Principal,
+        request: &ToolRequest,
+        decision: &ToolDecision,
+    ) -> Result<()> {
+        let outcome = match decision {
+            ToolDecision::AutoAllowed { .. } | ToolDecision::Approved { .. } => Outcome::Allowed,
+            ToolDecision::Denied { reason } => Outcome::Denied {
+                reason: reason.clone(),
+            },
+            ToolDecision::Pending => return Ok(()),
+        };
+        let action = Action::ToolGrant {
+            request_id: request.id.clone(),
+            tool: request.tool.clone(),
+        };
+        self.receipt(actor, action, outcome)?;
+        self.publish(BusBody::ToolDecision {
+            request_id: request.id.clone(),
+            decision: decision.clone(),
+        });
+        Ok(())
+    }
+
+    /// `approve`: a commander's signed decision on an open tool request or proposal.
+    ///
+    /// # Errors
+    /// Fails for agents, a signature that does not verify against this connection's key, an
+    /// unenrolled approver, or a subject that is not open.
+    fn approve(
+        self: &Arc<Self>,
+        peer: &Peer,
+        signed: Signed<ApprovalDecision>,
+    ) -> Result<CoreResponse> {
+        peer.human("approve")?;
+        sign::verify(&signed, &peer.key, domain::APPROVAL)
+            .context("the approval is not signed by this connection's key")?;
+        if !lock(&self.members).may_approve(&peer.key_id) {
+            bail!("{} is not an enrolled commander", peer.key_id);
+        }
+        let ApprovalDecision {
+            subject_id,
+            approved,
+            ..
+        } = signed.body;
+        let subject = self
+            .bus
+            .take_subject(&subject_id)
+            .with_context(|| format!("no open tool request or proposal is called {subject_id}"))?;
+        let outcome = if approved {
+            Outcome::Allowed
+        } else {
+            Outcome::Denied {
+                reason: format!("the commander rejected {subject_id}"),
+            }
+        };
+        let action = Action::Approval {
+            subject_id: subject_id.clone(),
+        };
+        let seq = self.receipt(peer.principal.clone(), action, outcome)?;
+        let verb = if approved { "approved" } else { "rejected" };
+        match subject {
+            Subject::Proposal { action } => {
+                self.publish(BusBody::Approval {
+                    subject_id: subject_id.clone(),
+                    approved,
+                });
+                self.status(format!(
+                    "{} {verb} proposal {subject_id}: {action} (receipt #{seq})",
+                    peer.name()
+                ));
+            }
+            Subject::Tool(request) => {
+                self.status(format!(
+                    "{} {verb} tool request {subject_id} ({}) (receipt #{seq})",
+                    peer.name(),
+                    request.tool
+                ));
+                let daemon = Arc::clone(self);
+                let commander = peer.key_id.clone();
+                let actor = peer.principal.clone();
+                tokio::spawn(async move {
+                    daemon
+                        .decide_tool(request, approved, commander, actor)
+                        .await;
+                });
+            }
+        }
+        Ok(CoreResponse::Ok)
+    }
+
+    /// Carry out a commander's decision on a tool request.
+    async fn decide_tool(
+        self: Arc<Self>,
+        request: ToolRequest,
+        approved: bool,
+        commander: KeyId,
+        actor: Principal,
+    ) {
+        let decision = if approved {
+            match self.grant_tool(&request).await {
+                Ok(()) => ToolDecision::Approved {
+                    approver: commander,
+                },
+                Err(error) => ToolDecision::Denied {
+                    reason: format!("approved, but it could not be built: {error:#}"),
+                },
+            }
+        } else {
+            ToolDecision::Denied {
+                reason: "denied by the commander".to_owned(),
+            }
+        };
+        if let Err(error) = self.settle_tool(actor, &request, &decision) {
+            tracing::error!("cannot record the decision on {}: {error:#}", request.id);
+        }
+    }
+
+    /// `enroll`: an admin-signed member record.
+    ///
+    /// # Errors
+    /// Fails for agents, a signature that does not verify against this connection's key, or an
+    /// enrollment the members policy refuses.
+    fn enroll(&self, peer: &Peer, signed: Signed<Member>) -> Result<CoreResponse> {
+        peer.human("enroll")?;
+        sign::verify(&signed, &peer.key, domain::ENROLL)
+            .context("the enrollment is not signed by this connection's key")?;
+        let member = signed.body.key_id.clone();
+        let role = match signed.body.role {
+            MemberRole::Admin => "admin",
+            MemberRole::Commander => "commander",
+            MemberRole::Responder => "responder",
+            MemberRole::Observer => "observer",
+        };
+        let label = format!("{} ({role})", signed.body.name);
+        let action = Action::Enroll {
+            member: member.clone(),
+        };
+        let enrolled = {
+            let mut members = lock(&self.members);
+            members.enroll(&peer.key_id, signed)
+        };
+        match enrolled {
+            Ok(()) => {
+                let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
+                self.status(format!("enrolled {label}: {member} (receipt #{seq})"));
+                Ok(CoreResponse::Ok)
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.receipt(peer.principal.clone(), action, Outcome::Denied { reason })?;
+                Err(error)
+            }
+        }
+    }
+
+    /// `detonate {scenario}`: run the ransomware in the victim stratum, then declare the
+    /// incident and start the agents.
+    ///
+    /// # Errors
+    /// Fails for agents, an unknown scenario, a share that was already detonated, a missing
+    /// ransomware binary, a root that cannot be admitted, or a failed run.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the scenario guard is held for the whole run so a reset cannot interleave with \
+                  a detonation. `allow`, not `expect`: nursery lints only run under the strict profile"
+    )]
+    async fn detonate(&self, peer: &Peer, name: &str) -> Result<CoreResponse> {
+        peer.human("detonate")?;
+        if name != RANSOMWARE {
+            bail!("unknown scenario {name}; this cleanroomd runs {RANSOMWARE}");
+        }
+        let mut incident = self.scenario.incident().await;
+        if let Some(id) = incident.as_ref() {
+            bail!("acme-fs was already detonated ({id}); reset first");
+        }
+        let ransom = scenario::find_ransom(&self.layout)?;
+        let root = self.launchable_root(&peer.principal).await?;
+        let action = Action::Detonate {
+            scenario: name.to_owned(),
+        };
+        let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
+        self.status(format!(
+            "{} detonated {name} in the acme-fs stratum: Debian root read-only, share read-write, no network (receipt #{seq})",
+            peer.name()
+        ));
+        let summary = self.run_ransomware(&root, &ransom).await?;
+        self.status(format!(
+            "ransomware finished in acme-fs: {} files locked, {} files copied into a staging directory, ransom note {}",
+            summary.locked.len(),
+            summary.exfiltrated.len(),
+            summary.note
+        ));
+        let id = self.declare(seq).await?;
+        *incident = Some(id);
+        Ok(CoreResponse::Ok)
+    }
+
+    /// Launch `cleanroom-ransom detonate` in the victim stratum and read its summary.
+    ///
+    /// # Errors
+    /// Fails if the binary cannot be installed, the sandbox fails, or the run does not succeed.
+    async fn run_ransomware(&self, root: &Admitted, ransom: &Path) -> Result<scenario::Summary> {
+        let layout = self.layout.clone();
+        let binary = ransom.to_owned();
+        spawn_blocking(move || scenario::install_ransom(&layout, &binary))
+            .await
+            .context("installing the ransomware panicked")??;
+        let grant = strata::victim(&self.layout, root)?;
+        let argv = scenario::detonation_argv();
+        let launch = Launch {
+            rootfs: &root.rootfs,
+            grant: &grant,
+            bins: &[],
+            argv: &argv,
+            timeout: DETONATION_TIMEOUT,
+        };
+        let captured = strata::run(&launch).await?;
+        let outcome = strata::classify(strata::VICTIM, &captured);
+        let receipt_outcome = match &outcome {
+            ExecOutcome::Exited { code: 0 } => Outcome::Allowed,
+            ExecOutcome::Exited { code } => Outcome::Denied {
+                reason: format!("exited {code}"),
+            },
+            ExecOutcome::TimedOut => Outcome::Denied {
+                reason: "timed out".to_owned(),
+            },
+            ExecOutcome::Denied { reason } => Outcome::Denied {
+                reason: reason.clone(),
+            },
+        };
+        let action = Action::Exec {
+            stratum: strata::VICTIM.to_owned(),
+            argv: argv.clone(),
+        };
+        let seq = self.receipt(Principal::System, action, receipt_outcome)?;
+        match outcome {
+            ExecOutcome::Exited { code: 0 } => scenario::parse_summary(&captured.stdout),
+            ExecOutcome::Exited { .. } | ExecOutcome::TimedOut | ExecOutcome::Denied { .. } => {
+                let detail = captured
+                    .stderr
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("no error output")
+                    .to_owned();
+                self.status(format!(
+                    "the ransomware run failed (receipt #{seq}): {detail}"
+                ));
+                bail!("the ransomware run failed: {detail}")
+            }
+        }
+    }
+
+    /// Compare the share with its seeding hashes, publish the changed assets' scope, open the
+    /// incident and start the agents. Returns the incident id.
+    ///
+    /// # Errors
+    /// Fails if the share cannot be read.
+    async fn declare(&self, receipt: u64) -> Result<String> {
+        let share = self.layout.share();
+        let baseline = self.scenario.baseline();
+        let integrity = spawn_blocking(move || scenario::check(&share, &baseline))
+            .await
+            .context("the integrity check panicked")??;
+        let at = now();
+        for record in scenario::affected(self.scenario.assets(), &integrity, &at) {
+            self.publish(BusBody::Scope(record));
+        }
+        let id = scenario::incident_id(&at);
+        self.publish(BusBody::Incident(scenario::incident(
+            &id, &at, &integrity, receipt,
+        )));
+        self.publish(BusBody::Investigate {
+            incident_id: id.clone(),
+            brief: scenario::brief(&at, &integrity),
+        });
+        Ok(id)
+    }
+
+    /// `verify_log`.
+    ///
+    /// # Errors
+    /// Fails for agents or if the log cannot be read.
+    fn verify_log(&self, peer: &Peer) -> Result<CoreResponse> {
+        peer.human("verify_log")?;
+        let report = lock(&self.receipts).verify(&self.key.verifying_key())?;
+        match report.first_break {
+            None => self.status(format!(
+                "receipt log verified: {} receipts, chain intact",
+                report.entries
+            )),
+            Some(entry) => self.status(format!(
+                "receipt log BROKEN at receipt {entry} of {}",
+                report.entries
+            )),
+        }
+        Ok(CoreResponse::LogVerified {
+            entries: report.entries,
+            first_break: report.first_break,
+        })
+    }
+
+    /// `reset`.
+    ///
+    /// # Errors
+    /// Fails for agents or if the victim cannot be restored.
+    async fn reset(&self, peer: &Peer) -> Result<CoreResponse> {
+        peer.human("reset")?;
+        self.restore(&peer.principal).await?;
+        Ok(CoreResponse::Ok)
+    }
+
+    /// Re-seed the victim, drop staged copies and incident grants, clear the incident, and
+    /// publish every asset's baseline.
+    ///
+    /// # Errors
+    /// Fails if the seed cannot be copied or the receipt cannot be written.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the scenario guard is held for the whole restore so a detonation cannot \
+                  interleave with it. `allow`, not `expect`: nursery lints only run under the strict profile"
+    )]
+    async fn restore(&self, actor: &Principal) -> Result<()> {
+        let mut incident = self.scenario.incident().await;
+        self.roots.discard_staging().await?;
+        let layout = self.layout.clone();
+        let baseline = spawn_blocking(move || scenario::reseed(&layout))
+            .await
+            .context("re-seeding panicked")??;
+        self.scenario.set_baseline(baseline);
+        self.grants.reset();
+        self.bus.clear_incident();
+        *incident = None;
+        let action = Action::Write {
+            stratum: strata::VICTIM.to_owned(),
+            path: format!(
+                "{} re-seeded from scenario/acme-fs; drop box, logs and scratch emptied",
+                strata::VICTIM_SHARE
+            ),
+        };
+        let seq = self.receipt(actor.clone(), action, Outcome::Allowed)?;
+        let at = now();
+        for asset in self.scenario.assets() {
+            self.publish(BusBody::Scope(scenario::baseline(asset, &at)));
+        }
+        self.status(format!(
+            "acme-fs restored to its seed: {} assets at baseline, no incident (receipt #{seq})",
+            self.scenario.assets().len()
+        ));
+        Ok(())
+    }
+
+    /// Standing grants (Hunter's YARA), then warm the Nix store with every allowlisted tool so
+    /// later grants are instant and work offline.
+    async fn provision(self: Arc<Self>) {
+        for (role, tool) in tools::BASELINE {
+            let flake_ref = self.policy.pinned(tool);
+            match tools::materialize(&flake_ref).await {
+                Ok(bins) => {
+                    self.grants.add(
+                        role,
+                        Granted {
+                            name: tool.to_owned(),
+                            bins,
+                            baseline: true,
+                        },
+                    );
+                    let action = Action::ToolGrant {
+                        request_id: format!("standing-{}-{tool}", strata::stratum_of(role)),
+                        tool: tool.to_owned(),
+                    };
+                    if let Err(error) = self.receipt(Principal::System, action, Outcome::Allowed) {
+                        tracing::error!("cannot record a standing grant: {error:#}");
+                    }
+                    tracing::info!(
+                        "{tool} granted to {} ({flake_ref})",
+                        strata::stratum_of(role)
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    "cannot provision {tool} for {}: {error:#}; it runs without {tool} until a tool request admits it",
+                    strata::stratum_of(role)
+                ),
+            }
+        }
+        for tool in tools::ALLOWLIST {
+            match tools::materialize(&self.policy.pinned(tool)).await {
+                Ok(_) => tracing::info!("{tool} is in the Nix store"),
+                Err(error) => tracing::warn!("cannot pre-build {tool}: {error:#}"),
+            }
+        }
+    }
+
+    /// The incident-record receipt for a `scope` or `incident` publish.
+    fn record_update(&self, body: &BusBody) -> Option<Action> {
+        match body {
+            BusBody::Incident(record) => Some(Action::RecordUpdate {
+                incident_id: record.id.clone(),
+                field: "incident".to_owned(),
+            }),
+            BusBody::Scope(record) => Some(Action::RecordUpdate {
+                incident_id: self.bus.incident_id().unwrap_or_else(|| "none".to_owned()),
+                field: format!("scope:{}", record.asset_id),
+            }),
+            BusBody::Chat { .. }
+            | BusBody::Finding { .. }
+            | BusBody::Proposal { .. }
+            | BusBody::Approval { .. }
+            | BusBody::ToolRequest(_)
+            | BusBody::ToolDecision { .. }
+            | BusBody::Trace { .. }
+            | BusBody::Refusal { .. }
+            | BusBody::Counters { .. }
+            | BusBody::SafetyVerdict { .. }
+            | BusBody::Route { .. }
+            | BusBody::Status { .. }
+            | BusBody::Investigate { .. }
+            | BusBody::AgentControl { .. } => None,
+        }
+    }
+
+    /// Sign `body` as cleanroomd and fan it out to everyone.
+    fn publish(&self, body: BusBody) {
+        let number = self.next_message.fetch_add(1, Ordering::Relaxed);
+        let message = BusMessage {
+            id: format!("cleanroomd-{}-{number}", self.session),
+            at: now(),
+            from: Principal::System,
+            to: Audience::All,
+            body,
+        };
+        match sign::sign(&self.key, domain::BUS, message) {
+            Ok(signed) => self.bus.fan_out(signed),
+            Err(error) => tracing::error!("cannot sign a bus message: {error}"),
+        }
+    }
+
+    /// Publish a status line for humans and log it.
+    fn status(&self, text: String) {
+        tracing::info!("{text}");
+        self.publish(BusBody::Status { text });
+    }
+
+    /// Append a receipt and return its sequence number.
+    ///
+    /// # Errors
+    /// Fails if the receipt cannot be signed or written.
+    fn receipt(&self, actor: Principal, action: Action, outcome: Outcome) -> Result<u64> {
+        lock(&self.receipts).append(&self.key, actor, action, outcome)
+    }
+}
+
+/// Whether `principal` may publish `body` (the bus side of the grants table).
+///
+/// Tool requests, tool decisions and approvals come only from cleanroomd (through
+/// `request_tool` and `approve`); `investigate` and `agent_control` only from humans; incident
+/// and scope records only from Scribe or a human; proposals only from Containment.
+///
+/// # Errors
+/// Returns the reason when the publish is not allowed.
+fn may_publish(principal: &Principal, body: &BusBody) -> Result<(), &'static str> {
+    let human = matches!(principal, Principal::Human { .. });
+    let agent = |wanted: Role| matches!(principal, Principal::Agent { role } if *role == wanted);
+    match body {
+        BusBody::ToolRequest(_) | BusBody::ToolDecision { .. } | BusBody::Approval { .. } => Err(
+            "only cleanroomd publishes tool requests, tool decisions and approvals; use the request_tool and approve operations",
+        ),
+        BusBody::Investigate { .. } | BusBody::AgentControl { .. } if !human => {
+            Err("only a human may start an investigation or toggle agent guardrails")
+        }
+        BusBody::Scope(_) | BusBody::Incident(_) if !human && !agent(Role::Scribe) => {
+            Err("only scribe or a human may update the incident and scope records")
+        }
+        BusBody::Proposal { .. } if !agent(Role::Containment) => {
+            Err("only containment proposes actions")
+        }
+        BusBody::Investigate { .. }
+        | BusBody::AgentControl { .. }
+        | BusBody::Scope(_)
+        | BusBody::Incident(_)
+        | BusBody::Proposal { .. }
+        | BusBody::Chat { .. }
+        | BusBody::Finding { .. }
+        | BusBody::Trace { .. }
+        | BusBody::Refusal { .. }
+        | BusBody::Counters { .. }
+        | BusBody::SafetyVerdict { .. }
+        | BusBody::Route { .. }
+        | BusBody::Status { .. } => Ok(()),
+    }
+}
+
+/// A principal for logs and status lines.
+fn describe(principal: &Principal) -> String {
+    match principal {
+        Principal::Agent { role } => strata::stratum_of(*role).to_owned(),
+        Principal::Human { key_id } => {
+            let short = key_id
+                .strip_prefix("sha256:")
+                .and_then(|hex| hex.get(..12))
+                .unwrap_or(key_id);
+            format!("commander {short}")
+        }
+        Principal::System => "cleanroomd".to_owned(),
+    }
+}
+
+/// The wire name of a request op.
+const fn op_name(request: &CoreRequest) -> &'static str {
+    match request {
+        CoreRequest::Exec(_) => "exec",
+        CoreRequest::RequestTool(_) => "request_tool",
+        CoreRequest::Approve(_) => "approve",
+        CoreRequest::Enroll(_) => "enroll",
+        CoreRequest::Detonate { .. } => "detonate",
+        CoreRequest::Tamper { .. } => "tamper",
+        CoreRequest::Admit { .. } => "admit",
+        CoreRequest::VerifyLog => "verify_log",
+        CoreRequest::Reset => "reset",
+    }
+}
+
+/// Process start time and pid, in hex.
+fn session_tag() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    format!("{millis:x}{:x}", std::process::id())
+}

@@ -8,18 +8,44 @@ Built at HackUTD 2026 (ZeroDay) for the NVIDIA and Winstead tracks.
 
 ## Status
 
-The shared wire contract (`crates/proto`, [docs/interfaces.md](docs/interfaces.md)), the Nemotron agent team (`crates/agents`) and the command center (`crates/tui`) are in place. The daemon `cleanroomd` (strata, grants, receipts, bus server, scenarios) is in progress.
+The full demo runs end to end on one Linux laptop:
+- **Admission:** the Debian root is admitted by digest. A tampered byte is rejected, naming the layer, and the clean copy is re-admitted.
+- **Detonation:** the canary ransomware locks the `acme-fs` share inside a sandbox, and the scope table turns red.
+- **Investigation:** Nemotron agents investigate inside bubblewrap strata.
+- **Injection:** with prompt guardrails off, the ransom note's injection talks Hunter and Forensics into `rm -rf /evidence/*`, and the kernel grant denies it, with a signed receipt.
+- **Records:** Scribe fills the incident record, scope and legal clocks. The receipt log verifies offline.
+
+Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/brev/`). Measured results are in [docs/nemotron-smoke.md](docs/nemotron-smoke.md).
+
+## Quick start
+
+```sh
+scripts/demo.sh                    # hosted Nemotron, guardrails on
+scripts/demo.sh --guardrails off   # show the kernel stopping what the model was talked into
+scripts/demo.sh --local            # route sensitive steps to Nemotron on Brev (run deploy/brev/tunnel.sh first)
+scripts/demo.sh --replay           # replay recorded model responses, no network
+```
+
+In the command center: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `crates/proto` | Wire types shared by the daemon, agents and TUI |
+| `crates/daemon` | `cleanroomd`: the OS core (root admission, bubblewrap strata and grants, tool admission, signed receipt log, bus server, scenario runner) |
 | `crates/agents` | `cleanroom-agents`: the Nemotron agent team runner (model router, roles, safety and sensitivity layers) |
 | `crates/tui` | `cleanroom-tui`: the ratatui incident command center, shipped as a static `.deb` |
+| `crates/ransom` | `cleanroom-ransom`: safe, reversible canary ransomware (static musl) |
+| `scenario/` | acme-fs seed share, `assets.json` and YARA rules (see `scenario/README.md`) |
+| `roots/` | Digest-pinned root locks |
+| `scripts/demo.sh` | One-command tmux demo: daemon, agents, TUI (`--local`, `--replay`, `--guardrails on\|off`) |
+| `scripts/launch-tui.sh` | Runs the TUI `.deb` inside the admitted Debian root |
 | `docs/interfaces.md` | Transport, signing, receipts, daemon operations, grants |
 | `docs/concept.md` | What we're building and why |
 | `docs/research/` | Research notes behind the design |
+| `deploy/brev/` | Self-hosted Nemotron on a Brev GPU (Lightning, Content Safety 3.5, Bolt behind one endpoint) and the laptop tunnel |
+| `docs/nemotron-smoke.md` | Measured hosted vs local model behavior: tool calls, latency, prompt injection, safety models |
 
 ## Develop
 
@@ -39,6 +65,32 @@ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 
 Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, NIM) to run Nemotron locally.
 
+## Daemon
+
+`cleanroomd` is the OS core. One Unix socket, `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock` (mode `0600`), carries the bus and the operations in [docs/interfaces.md](docs/interfaces.md). It runs rootless: run it inside `nix develop` (bubblewrap, skopeo, umoci) on a host that allows unprivileged user namespaces.
+
+```sh
+cleanroomd [--socket PATH] [--state DIR] [--repo DIR]   # serve until SIGINT/SIGTERM
+cleanroomd [--socket PATH] admit ROOT                   # ask the running daemon: exit 0 admitted, 1 rejected, 2 error
+```
+
+`--repo` is where `scenario/` and `roots/` live (default: the nearest ancestor of the binary that has both, else the current directory). State lives in `$XDG_STATE_HOME/cleanroom`: `store/oci`, `store/staging/<root>`, `store/roots/<root>/rootfs`, `keys/cleanroomd.key`, `keys/members.ndjson`, `run/acme-fs/{share,drop,logs}`, `run/scratch/<role>`, `run/bin` and `receipts.ndjson`.
+
+- **Bus:** the first frame must be `hello`. Every `publish` must verify against the connection's key and name the connection's principal; it then fans out to every matching subscriber, sender included. Tool requests, tool decisions and approvals come only from cleanroomd; `investigate` and `agent_control` only from humans; `scope` and `incident` only from Scribe or a human; `proposal` only from Containment. A new client first gets the latest incident, the latest scope per asset, open tool requests and proposals, and the latest counters.
+- **Roots:** a lock (`roots/<name>-*.lock.json`) pins one platform manifest digest. Admission fetches the image once with skopeo into `store/oci` (later admissions are offline), checks a staged copy (the manifest against the lock, every blob against the manifest), unpacks it with `umoci raw unpack --rootless`, and records a digest of the unpacked tree (path, mode, content) that every stratum launch re-checks. `tamper` flips one byte in the first layer of a staged copy; the next `admit` answers `admit_rejected` naming that layer and discards the copy, so the admission after it (or a `reset`) is clean again. Strata admit `debian` on first use.
+- **Strata:** bubblewrap with every namespace unshared (so no network), no capabilities and a cleared environment; the admitted root is read-only at `/`, with a fresh `/proc`, `/dev` and `/tmp`. Output is capped at 64 KiB per stream and timeouts at 5 minutes. A command whose stderr shows `Read-only file system` is `denied` (for example "evidence is mounted read_only for hunter"), with a receipt and a `status` line.
+
+  | Stratum | Grant |
+  | --- | --- |
+  | `hunter`, `forensics` | `/evidence/acme-fs`, `/evidence/dropbox`, `/evidence/logs` and `/rules` read-only; `/scratch` read-write; `/nix/store` read-only only when the role holds admitted tools |
+  | `acme-fs` (victim) | `/srv/acme-fs/{share,drop,logs}` read-write; `/opt/cleanroom/bin` read-only |
+  | `scribe`, `containment` | no exec: every request is denied |
+
+- **Tools:** `request_tool` for `yara`, `volatility3`, `tshark`, `file` or `binutils` from the pinned nixpkgs (`CLEANROOM_NIXPKGS`, else `flake.lock`) is auto-allowed; any other well-formed nix reference waits for a commander's signed `approve`; OCI sources are denied. A granted tool is built with `nix build --impure` and `NIXPKGS_ALLOW_UNFREE=1` (the pin marks volatility3 unfree), and its `bin` directories go first on the role's `PATH`. Hunter holds `yara` from startup, and the allowlist is pre-built in the background so later grants are instant and work offline.
+- **Approvals and members:** an `approve` must come from a human connection whose key signed the `ApprovalDecision`. Until someone is enrolled, any human key on the socket may approve, and the first `enroll` must be an admin enrolling their own key; after that only enrolled admins enroll and only enrolled commanders and admins approve.
+- **Receipts:** `receipts.ndjson` holds one `Signed<Receipt>` per line (daemon key, `cleanroom/v1/receipt`); `seq` is the line number and `prev` the digest of the previous signed receipt. Every exec (allowed or denied), admission, tamper, detonation, tool grant, approval, enrollment, record update and reset is recorded. `verify_log` reports the first entry that fails its signature or its chain.
+- **Scenario:** at startup and on `reset` the share is re-seeded from `scenario/acme-fs`, the drop box, logs and scratch are emptied, and every asset in `scenario/assets.json` is published with all flags `no`. `detonate {scenario: "ransomware"}` runs `cleanroom-ransom` (`CLEANROOM_RANSOM_BIN`, else the static build in `target/x86_64-unknown-linux-musl/{release,debug}`) in the `acme-fs` stratum, compares the share with its seeding hashes (changed assets become `locked`, `accessed` and `modified`; `exfiltrated` stays unknown for the agents), opens the incident (`detected`, `high`, `ransomware`) and publishes `investigate`.
+
 ## Agents
 
 `cleanroom-agents` connects to `cleanroomd` with one socket connection per role (Hunter, Forensics, Scribe, Containment), waits for an `investigate` bus event, and runs the team: Hunter and Forensics investigate concurrently inside their strata, their findings flow to Scribe, which keeps the incident and scope records, and Containment proposes actions for the commander to approve.
@@ -47,7 +99,8 @@ Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, N
 cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--once]
 ```
 
-- `--guardrails` picks the hardened or the naive prompts at start; `agent_control` bus events switch them at runtime. With guardrails on, Hunter and Forensics record each instruction they decline from untrusted data as a `refusal`. With guardrails off they get a shell (`exec`) instead, so the demo can show the stratum grant denying what the model was talked into (`trace.outcome` is `denied`).
+- `--guardrails` picks the hardened or the naive setup at start; `agent_control` bus events switch prompts and tools at runtime. With guardrails on, Hunter and Forensics use typed read-only tools, report findings as they go, and record each instruction they decline from untrusted data as a `refusal`. With guardrails off they run like a sloppy operator deployment: a "helpful sysadmin assistant" with only a shell (`exec`) and `report_finding`, handed the alert and told to read the notes on the share and handle them. Nothing names the injected instruction; the ransom note talks the model into it, and the stratum grant denies it (`trace.outcome` is `denied`).
+- Tool arguments are conformed before they are validated: numbers sent as text or fractions become integers (`"95%"`, `0.95` → 95), a single path where a list is expected becomes a list, enum values match case-insensitively, over-long free text is clipped, and options the read-only evidence tools don't have are ignored. Anything still invalid goes back to the model as an error it can fix. Halfway through its step budget, an agent that has not reported a finding is offered only its reporting tools, and again in its last two calls.
 - Every evidence-bearing tool output is scored by the Nemotron safety model (`safety_verdict`) before a model sees it; with guardrails on, unsafe output is wrapped in an untrusted-data envelope. Output with personal data or credentials moves the conversation to the local endpoint (`route`).
 - `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands).
 - Tool requests go through the daemon's `request_tool` operation only; the daemon publishes `tool_request` and `tool_decision`. YARA rules come from the read-only `/rules` mount.
@@ -67,7 +120,7 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 
 `cleanroom-tui` connects as the commander and renders only from bus events: incident header and legal notification clocks, scope of compromised data, live agent trace, approvals, timeline and comms.
 
-Keys: `d` detonate, `t` tamper then admit, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `?` help, `q` quit.
+Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `?` help, `q` quit.
 
 Flags: `--socket PATH`, `--record FILE` (save live events), `--replay FILE [--speed X]` (offline playback with a REPLAY badge; the demo fallback), `--tamper-root NAME` (default `debian`), `--scenario NAME` (default `ransomware`).
 

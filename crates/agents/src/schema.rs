@@ -1,13 +1,195 @@
-//! A JSON Schema subset validator for tool-call arguments.
+//! A JSON Schema subset for tool-call arguments: lenient conforming, then strict validation.
 //!
 //! The schemas the models see are the contract, so arguments are checked against exactly those
 //! schemas before the runner acts. Supported keywords: `type`, `enum`, `properties`, `required`,
 //! `additionalProperties: false`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`,
 //! `minimum`, `maximum` and `pattern`. A `null` for an optional property counts as absent,
 //! because models often send `null` for parameters they mean to leave out.
+//!
+//! Before validating, [`conform`] fixes the near misses models make that carry no ambiguity: a
+//! number sent as a string or a fraction, a single string where a list is expected, a list or
+//! free text longer than allowed, an enum value in the wrong case. Anything it cannot fix
+//! confidently is left for [`validate`] to reject with a message the model can act on.
 
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
+
+/// Bring `value` into the shape `schema` describes where the fix is unambiguous.
+pub(crate) fn conform(schema: &Value, value: &mut Value) {
+    let Some(kind) = schema.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    match kind {
+        "integer" => conform_integer(schema, value),
+        "boolean" => {
+            if let Some(flag) = value.as_str().and_then(parse_bool) {
+                *value = Value::Bool(flag);
+            }
+        }
+        "string" => conform_string(schema, value),
+        "array" => conform_array(schema, value),
+        "object" => {
+            if let (Some(properties), Some(fields)) = (
+                schema.get("properties").and_then(Value::as_object),
+                value.as_object_mut(),
+            ) {
+                for (name, field) in fields.iter_mut() {
+                    if let Some(property) = properties.get(name) {
+                        conform(property, field);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Numbers sent as floats or strings become integers; a percentage (bounds 0 and 100) also
+/// accepts a fraction (`0.85`) or a `%` suffix. Values outside the bounds are clamped.
+fn conform_integer(schema: &Value, value: &mut Value) {
+    let min = schema.get("minimum").and_then(Value::as_f64);
+    let max = schema.get("maximum").and_then(Value::as_f64);
+    let percent = min == Some(0.0) && max == Some(100.0);
+    let number = if value.is_i64() || value.is_u64() {
+        value.as_f64()
+    } else if let Some(float) = value.as_f64() {
+        Some(if percent && float <= 1.0 {
+            float * 100.0
+        } else {
+            float
+        })
+    } else if let Some(text) = value.as_str() {
+        parse_number(text, percent)
+    } else {
+        None
+    };
+    let Some(mut number) = number.filter(|number| number.is_finite()) else {
+        return;
+    };
+    if let Some(min) = min {
+        number = number.max(min);
+    }
+    if let Some(max) = max {
+        number = number.min(max);
+    }
+    if let Some(whole) = whole_to_i64(number.round()) {
+        *value = Value::Number(Number::from(whole));
+    }
+}
+
+/// `"95"`, `"95%"`, `"0.95"` (a fraction when `percent`), `" 12 "`.
+fn parse_number(text: &str, percent: bool) -> Option<f64> {
+    let text = text.trim();
+    let (digits, has_percent_sign) = text
+        .strip_suffix('%')
+        .map_or((text, false), |digits| (digits.trim_end(), true));
+    let number: f64 = digits.parse().ok()?;
+    let fraction = percent && !has_percent_sign && digits.contains('.') && number <= 1.0;
+    Some(if fraction { number * 100.0 } else { number })
+}
+
+/// A whole `f64` as `i64` when it fits; out-of-range values stay unconverted for validation to
+/// report (going through text avoids a silently saturating `as` cast).
+fn whole_to_i64(number: f64) -> Option<i64> {
+    format!("{number:.0}").parse().ok()
+}
+
+/// `"true"` / `"false"` in any case.
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" => Some(true),
+        "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Numbers become text, a list becomes one line, an object becomes its single text field or
+/// JSON, an enum value is matched case-insensitively, and free text is clipped to `maxLength`.
+fn conform_string(schema: &Value, value: &mut Value) {
+    if value.is_number() || value.is_boolean() {
+        *value = Value::String(value.to_string());
+    } else if let Some(items) = value.as_array() {
+        let parts: Vec<String> = items.iter().map(text_of).collect();
+        *value = Value::String(parts.join("; "));
+    } else if value.is_object() {
+        *value = Value::String(text_of(value));
+    }
+    let Some(text) = value.as_str() else {
+        return;
+    };
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        let lowered = text.trim().to_ascii_lowercase();
+        if let Some(canonical) = allowed
+            .iter()
+            .find(|option| option.as_str() == Some(lowered.as_str()))
+        {
+            *value = canonical.clone();
+        }
+        return;
+    }
+    let free_text = schema.get("pattern").is_none();
+    if let Some(max) = schema
+        .get("maxLength")
+        .and_then(Value::as_u64)
+        .and_then(|max| usize::try_from(max).ok())
+        && free_text
+        && text.chars().count() > max
+    {
+        let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+        clipped.push('…');
+        *value = Value::String(clipped);
+    }
+}
+
+/// One value as text: strings as they are, an object with a single text field as that text,
+/// anything else as compact JSON (so no detail is dropped).
+fn text_of(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    if let Some(fields) = value.as_object()
+        && fields.len() == 1
+        && let Some(text) = fields.values().next().and_then(Value::as_str)
+    {
+        return text.to_owned();
+    }
+    value.to_string()
+}
+
+/// A single value where a list is expected becomes a one-item list; items are conformed and the
+/// list is cut to `maxItems`.
+fn conform_array(schema: &Value, value: &mut Value) {
+    if !value.is_array() && !value.is_null() {
+        let single = std::mem::take(value);
+        *value = Value::Array(vec![single]);
+    }
+    let Some(items) = value.as_array_mut() else {
+        return;
+    };
+    if let Some(item_schema) = schema.get("items") {
+        for item in items.iter_mut() {
+            conform(item_schema, item);
+        }
+    }
+    if let Some(max) = schema
+        .get("maxItems")
+        .and_then(Value::as_u64)
+        .and_then(|max| usize::try_from(max).ok())
+    {
+        items.truncate(max);
+    }
+}
+
+/// Remove the top-level properties `schema` does not declare.
+pub(crate) fn drop_unknown(schema: &Value, value: &mut Value) {
+    let (Some(known), Some(fields)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object_mut(),
+    ) else {
+        return;
+    };
+    fields.retain(|name, _| known.contains_key(name));
+}
 
 /// Check `value` against `schema`.
 ///

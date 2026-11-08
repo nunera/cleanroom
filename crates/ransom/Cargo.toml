@@ -1,0 +1,30 @@
+[package]
+name = "cleanroom-ransom"
+description = "Safe, reversible canary ransomware for the Cleanroom acme-fs scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The binary runs inside the acme-fs stratum (a Debian root), so it is a static-pie musl build
+# with no shared-library dependencies. It has no network code. From the repo root:
+#
+#   nix develop --command nix shell --inputs-from . \
+#     nixpkgs#pkgsCross.musl64.buildPackages.rustc nixpkgs#pkgsCross.musl64.stdenv.cc \
+#     --command env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-cc \
+#     'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static' \
+#     cargo build --release -p cleanroom-ransom --target x86_64-unknown-linux-musl
+#
+# Output: target/x86_64-unknown-linux-musl/release/cleanroom-ransom
+
+[[bin]]
+name = "cleanroom-ransom"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+jiff = "0.2.40"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

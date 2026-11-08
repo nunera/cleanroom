@@ -284,6 +284,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cleanroom-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cleanroom-proto",
+ "ed25519-dalek",
+ "hex",
+ "humantime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
 name = "cleanroom-proto"
 version = "0.1.0"
 dependencies = [
@@ -292,6 +311,18 @@ dependencies = [
  "hex",
  "serde",
  "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "cleanroom-ransom"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "serde",
  "serde_json",
  "sha2",
 ]

@@ -28,7 +28,7 @@ pub(crate) struct Args {
     #[arg(long, value_name = "PATH")]
     pub(crate) socket: Option<PathBuf>,
 
-    /// Root that `t` tampers with and then tries to admit.
+    /// Root that `t` tampers with and tries to admit, and that `A` admits again.
     #[arg(long, value_name = "NAME", default_value = "debian")]
     pub(crate) tamper_root: String,
 
