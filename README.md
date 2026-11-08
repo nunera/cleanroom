@@ -32,6 +32,21 @@ Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/
 
 Prompt guardrails and safety models are probabilistic layers. The read-only grant is not, which is the point. One gap the kernel can't cover: with guardrails off, Scribe wrote the attacker's "false positive" story into the record in 3 / 12 hosted runs. cleanroomd now refuses any agent attempt to lower a flag it measured itself (fixed after these runs, not yet re-measured).
 
+## Screenshots
+
+Before detonation: every asset clean, legal clocks not started.
+
+![Command center before detonation](docs/screenshots/tui-before.png)
+
+About a minute after detonation (live run, guardrails off, hosted Nemotron):
+- The scope table is red.
+- GDPR, HIPAA and Texas clocks are running.
+- Containment's isolation proposal is waiting for a signature.
+- Scribe's attempt to lower a measured flag was refused ("cannot lower a measurement").
+- Both agents' `rm -rf /evidence/*` attempts were blocked by the OS (`by OS 2`).
+
+![Command center after detonation](docs/screenshots/tui-after.png)
+
 ## Quick start
 
 ```sh
