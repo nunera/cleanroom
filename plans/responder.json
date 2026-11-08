@@ -1,0 +1,30 @@
+{
+  "host": "cleanroom-responder",
+  "init": "dinit",
+  "services": [
+    {
+      "name": "cleanroomd",
+      "kind": "process",
+      "command": "cleanroomd",
+      "depends_on": []
+    },
+    {
+      "name": "admit-debian",
+      "kind": "oneshot",
+      "command": "cleanroomd admit debian",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "cleanroom-agents",
+      "kind": "process",
+      "command": "cleanroom-agents run --guardrails on",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "cleanroom-tui",
+      "kind": "process",
+      "command": "scripts/launch-tui.sh --no-build",
+      "depends_on": ["admit-debian"]
+    }
+  ]
+}

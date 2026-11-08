@@ -69,6 +69,8 @@ In the command center: `t` tamper (rejected), `A` admit clean root, `d` detonate
 | `crates/ransom` | `cleanroom-ransom`: safe, reversible canary ransomware (static musl) |
 | `scenario/` | acme-fs seed share, `assets.json` and YARA rules (see `scenario/README.md`) |
 | `roots/` | Digest-pinned root locks |
+| `plans/` | Declarative host plans: init choice (dinit or s6-rc) and the service graph; `responder.json` is valid, `cycle.json` shows a cycle witness |
+| `policy/egress.json` | Egress policy: deny by default; the model router's only endpoints |
 | `scripts/demo.sh` | One-command tmux demo: daemon, agents, TUI (`--local`, `--replay`, `--guardrails on\|off`) |
 | `scripts/launch-tui.sh` | Runs the TUI `.deb` inside the admitted Debian root |
 | `docs/interfaces.md` | Transport, signing, receipts, daemon operations, grants |
@@ -109,6 +111,7 @@ cleanroomd [--socket PATH] reset                        # re-seed the victim, cl
 cleanroomd [--socket PATH] detonate [SCENARIO]          # default ransomware; starts the investigation
 cleanroomd [--socket PATH] tamper [ROOT]                # flip a byte in a staged copy; the next admit is rejected
 cleanroomd [--socket PATH] run STRATUM [--timeout S] -- CMD...  # as that agent, under its grant: exit = CMD's, 124 timeout, 126 denied
+cleanroomd plan validate FILE                           # offline: boot order, or the problem (cycle witness); exit 0 valid, 1 invalid, 2 unreadable
 ```
 
 `--repo` is where `scenario/` and `roots/` live (default: the nearest ancestor of the binary that has both, else the current directory). State lives in `$XDG_STATE_HOME/cleanroom`: `store/oci`, `store/containers-policy.json`, `store/staging/<root>`, `store/roots/<root>/rootfs`, `keys/cleanroomd.key`, `keys/members.ndjson`, `run/acme-fs/{share,drop,logs}`, `run/scratch/<role>`, `run/bin` and `receipts.ndjson`.

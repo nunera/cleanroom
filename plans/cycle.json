@@ -1,0 +1,24 @@
+{
+  "host": "cleanroom-responder",
+  "init": "s6-rc",
+  "services": [
+    {
+      "name": "cleanroomd",
+      "kind": "process",
+      "command": "cleanroomd",
+      "depends_on": ["cleanroom-agents"]
+    },
+    {
+      "name": "cleanroom-agents",
+      "kind": "process",
+      "command": "cleanroom-agents run --guardrails on",
+      "depends_on": ["cleanroomd"]
+    },
+    {
+      "name": "cleanroom-tui",
+      "kind": "process",
+      "command": "scripts/launch-tui.sh --no-build",
+      "depends_on": ["cleanroomd"]
+    }
+  ]
+}
