@@ -16,6 +16,7 @@
 </p>
 
 <p align="center">
+  <a href="https://youtu.be/mHiA2bX0uxg">Demo video</a> ·
   <a href="#the-os">The OS</a> ·
   <a href="#nemotron-inside-the-os">Nemotron</a> ·
   <a href="#clean-the-lead-agent">Clean</a> ·
