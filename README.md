@@ -26,6 +26,17 @@ nix develop
 cargo check
 ```
 
+## Model access
+
+Nemotron credentials live outside the repo in `~/.config/cleanroom/nemotron.env` (mode `0600`):
+
+```sh
+NVIDIA_API_KEY=nvapi-...
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+```
+
+Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, NIM) to run Nemotron locally.
+
 ## Prior work
 
 Cleanroom rebuilds ideas from [MisaOS](https://github.com/nunera/misaos) (strict records, signed local admission of digest-pinned roots, sandboxed foreign roots, Nix packaging). The Cleanroom code itself is written at the event.
