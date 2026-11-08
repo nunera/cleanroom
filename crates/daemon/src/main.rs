@@ -17,6 +17,7 @@ mod daemon;
 mod keys;
 mod layout;
 mod members;
+mod plan;
 mod receipts;
 mod roots;
 mod scenario;
@@ -95,6 +96,23 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Work with declarative host plans offline (no daemon needed).
+    Plan {
+        /// What to do with the plan.
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+}
+
+/// `cleanroomd plan` actions.
+#[derive(Debug, Subcommand)]
+enum PlanAction {
+    /// Check a plan (unique names, declared dependencies, no cycles) and print its boot order.
+    /// Exits 0 valid, 1 invalid, 2 unreadable.
+    Validate {
+        /// The plan file, for example `plans/responder.json`.
+        file: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -138,21 +156,25 @@ async fn serve(cli: Cli) -> Result<()> {
     server::serve(daemon, listener, &socket).await
 }
 
-/// Run one client command against the daemon on `socket` (default: the usual path).
+/// Run one client command: against the daemon on `socket` (default: the usual path), or
+/// offline for `plan`.
 ///
 /// # Errors
 /// Fails if the socket path cannot be resolved or the daemon cannot answer.
 async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<ExitCode> {
-    let socket = match socket {
-        Some(socket) => socket,
-        None => layout::default_socket()?,
+    let socket = || match &socket {
+        Some(socket) => Ok(socket.clone()),
+        None => layout::default_socket(),
     };
     match command {
-        Command::Admit { root } => client::admit(&socket, &root).await,
-        Command::Verify => client::verify(&socket).await,
+        Command::Plan {
+            action: PlanAction::Validate { file },
+        } => Ok(plan::validate_file(&file)),
+        Command::Admit { root } => client::admit(&socket()?, &root).await,
+        Command::Verify => client::verify(&socket()?).await,
         Command::Reset => {
             client::simple(
-                &socket,
+                &socket()?,
                 CoreRequest::Reset,
                 "reset: victim re-seeded, incident closed",
             )
@@ -160,17 +182,17 @@ async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<Exi
         }
         Command::Detonate { scenario } => {
             let done = format!("detonated {scenario}; the investigation has started");
-            client::simple(&socket, CoreRequest::Detonate { scenario }, &done).await
+            client::simple(&socket()?, CoreRequest::Detonate { scenario }, &done).await
         }
         Command::Tamper { root } => {
             let done = format!("tampered a staged copy of {root}; the next admit is rejected");
-            client::simple(&socket, CoreRequest::Tamper { root }, &done).await
+            client::simple(&socket()?, CoreRequest::Tamper { root }, &done).await
         }
         Command::Run {
             stratum,
             timeout,
             argv,
-        } => client::run(&socket, &stratum, argv, Duration::from_secs(timeout)).await,
+        } => client::run(&socket()?, &stratum, argv, Duration::from_secs(timeout)).await,
     }
 }
 
