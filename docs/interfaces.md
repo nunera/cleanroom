@@ -31,7 +31,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 
 Every allowed or denied action appends a `Receipt` to a hash-chained log. `prev` is the digest of the previous signed receipt; the first entry uses `sha256:` followed by 64 zeros. `verify_log` walks the chain offline and reports the first break.
 
-Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`.
+Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enroll`, `revoke`, `record_update`, `detonate`, `evidence_seal`, `model_call`, `yara_rule`.
 
 ## Daemon operations (`request.op`)
 
@@ -39,11 +39,13 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 | --- | --- | --- |
 | `exec` | Agent runner | `exec` with outcome `exited` / `timed_out` / `denied` + `receipt_seq` |
 | `request_tool` | Agent runner | `tool` with decision `auto_allowed` / `approved` / `denied` / `pending` |
+| `model_call` | Agent runner | Body is `ModelCall {from, purpose, model, endpoint, request, response, replayed, latency_ms, reasoning?, reasoning_tokens?}`: one model call (agent step, chat turn or safety verdict) with `sha256:` digests of the exact request and response bytes, and the model's reasoning trace (up to 256 KiB) and reasoning-token count when it returned them. Sent on the connection of the role named in `from`. Response `ok`; the daemon chains a `model_call` receipt as that agent (with the trace's digest) and stores the trace in `reasoning.ndjson` |
+| `submit_rule` | Agent runner (Hunter, Forensics) | Body is `RuleSubmission {from, name, source}` (`name` matches `^[a-z0-9_-]{1,40}$`, source up to 16 KiB, an incident must be open). `ok` when the rule compiles, matches no clean seed file and matches some evidence, and is deployed to `/rules/agent-<name>.yar`; `error` with the reason otherwise. Either way a `yara_rule` receipt and a `status` line |
 | `approve` | TUI (commander) | Body is `Signed<ApprovalDecision {subject_id, approved, at}>` under `cleanroom/v1/approval`. Response `ok`, then a `tool_decision` or `approval` bus event |
 | `enroll` | TUI (admin) | `ok` or `error` |
 | `revoke` | TUI (admin) | Body is `Signed<Revocation>` under `cleanroom/v1/revoke`. `ok`, or `error` when the signer is not an enrolled admin, the key is not enrolled, or it is the last admin. A later `enroll` of the same key reinstates it |
 | `detonate` | TUI | `ok`; scenario progress arrives as bus events, then the daemon publishes `investigate`. Scenario names: `ransomware` (exfil/persistence are stretch) |
-| `tamper` | TUI (demo opener) | `ok`. `root` names an admitted root; the demo uses `debian` |
+| `tamper` | TUI (demo opener) | `ok`. `root` names a root with a lock (`debian`, `alpine`); the demo uses `debian` |
 | `admit` | TUI / CLI | `admitted` or `admit_rejected` (names the layer, expected and actual digest) |
 | `verify_log` | TUI | `log_verified { entries, first_break }` |
 | `reset` | TUI / CLI | `ok` |
@@ -67,12 +69,15 @@ The TUI renders state from these events alone; it never reads the agents' files.
 
 | Stratum | Root | Mounts | Network | Notes |
 | --- | --- | --- | --- | --- |
-| `hunter` | Debian root | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | logs, YARA |
-| `forensics` | Debian root + Nix tools | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
+| `hunter` | `debian` (Debian bookworm) | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | logs, YARA |
+| `forensics` | `alpine` (Alpine 3.21, busybox) + Nix tools | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
 | `scribe` | minimal | incident record `append_only` (through the daemon) | none | no shell tools |
 | `containment` | none | none | none | proposals only; commander must approve |
-| `acme-fs` | Debian root | company share `read_write` | none | victim; the scenario runs here |
+| `acme-fs` | `debian` | company share `read_write` | none | victim; the scenario runs here |
+| `rule-check` | `debian` + `yara` | clean seed, evidence and the candidate rule `read_only` | none | checks a submitted YARA rule |
 | model router | host process | none | egress to the model endpoint only | the only process with network |
+
+Each launch uses the stratum's root from the table (re-checking its tree digest) and admits it on first use. `CLEANROOM_ROOTS=stratum=root[,stratum=root...]` overrides the table for `hunter`, `forensics`, `acme-fs` and `rule-check`; cleanroomd refuses to start if a named root has no lock.
 
 ## Incident record and scope
 

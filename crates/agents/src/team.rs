@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use cleanroom_proto::{
-    Audience, BusBody, BusMessage, LlmMode, Principal, Role, ScopeRecord, Signed,
+    Audience, BusBody, BusMessage, CoreRequest, CoreResponse, LlmMode, ModelCall, Principal, Role,
+    ScopeRecord, Signed, Tri,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -25,8 +26,9 @@ use tokio::task::JoinHandle;
 use crate::agent::{Agent, Asker, Control, Desk, Note, Shared, on_off};
 use crate::config::{self, Settings};
 use crate::daemon::{Connection, Inbound};
+use crate::dataset::Dataset;
 use crate::lead::Lead;
-use crate::llm::Router;
+use crate::llm::{CallRecord, Router};
 use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::Counters;
@@ -37,6 +39,8 @@ use crate::{keys, text};
 
 /// How long to wait for `cleanroomd` to come up.
 const CONNECT_PATIENCE: Duration = Duration::from_mins(2);
+/// How long cleanroomd may take to chain one model-call receipt.
+const MODEL_CALL_WAIT: Duration = Duration::from_secs(10);
 /// How long Scribe keeps listening for the commander's decisions on proposals.
 const DECISION_WINDOW: Duration = Duration::from_mins(10);
 /// Notes Scribe takes into one conversation at most.
@@ -117,6 +121,35 @@ impl Crew {
     }
 }
 
+/// Chain every model call into cleanroomd's receipt log, over the connection of the role the
+/// call was for (cleanroomd checks the caller is that agent). A report that fails is logged; the
+/// investigation goes on.
+async fn forward_calls(crew: Arc<Crew>, mut calls: mpsc::UnboundedReceiver<CallRecord>) {
+    while let Some(call) = calls.recv().await {
+        let request = CoreRequest::ModelCall(ModelCall {
+            from: call.role,
+            purpose: call.purpose.to_owned(),
+            model: call.model,
+            endpoint: call.endpoint,
+            request: call.request,
+            response: call.response,
+            replayed: call.replayed,
+            latency_ms: call.latency_ms,
+            reasoning: call.reasoning,
+            reasoning_tokens: call.reasoning_tokens,
+        });
+        match crew
+            .connection(call.role)
+            .request(request, MODEL_CALL_WAIT)
+            .await
+        {
+            Ok(CoreResponse::Ok) => {}
+            Ok(other) => tracing::warn!("cleanroomd did not record a model call: {other:?}"),
+            Err(error) => tracing::warn!("cannot report a model call: {error:#}"),
+        }
+    }
+}
+
 /// Connect and serve until interrupted (or after one investigation with `--once`).
 ///
 /// # Errors
@@ -127,10 +160,12 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         Some(socket) => socket,
         None => config::default_socket()?,
     };
-    let router = Router::new(&settings)?;
+    let (calls_tx, calls) = mpsc::unbounded_channel();
+    let router = Router::new(&settings)?.with_call_log(calls_tx);
     let (inbound_tx, mut inbound) = mpsc::channel(256);
     let crew = Arc::new(Crew::connect(&socket, &settings.keys_dir, &inbound_tx).await?);
     drop(inbound_tx);
+    tokio::spawn(forward_calls(Arc::clone(&crew), calls));
     let (guardrails_tx, guardrails) = watch::channel(options.guardrails);
     let shared = Arc::new(Shared {
         router,
@@ -139,6 +174,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         guardrails,
         control: broadcast::channel(64).0,
         max_steps: options.max_steps,
+        dataset: Dataset::new(settings.dataset_dir),
         nixpkgs: settings.nixpkgs,
     });
     let team = crew.agent(Role::Scribe, &shared);
@@ -154,7 +190,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
     let mut seen = Seen::default();
     let mut assets = BTreeMap::new();
-    let mut running: Option<JoinHandle<()>> = None;
+    let mut running: Option<(JoinHandle<()>, String)> = None;
     let result = loop {
         tokio::select! {
             message = inbound.recv() => match message {
@@ -163,14 +199,21 @@ pub(crate) async fn run(options: Options) -> Result<()> {
                     let notable = situation::lock(&situation).observe(&message);
                     lead.hear(&message, notable);
                     consult(&crew, &shared, &situation, &message);
+                    if is_reset(&message)
+                        && let Some((previous, incident)) = running.take()
+                    {
+                        previous.abort();
+                        team.status(format!("acme-fs was reset: stopped the team on {incident}; it makes no more model calls for it")).await;
+                    }
                     if let Some(case) = dispatch(&shared, &guardrails_tx, &team, message, &mut assets).await {
-                        if let Some(previous) = running.take() {
+                        if let Some((previous, _)) = running.take() {
                             previous.abort();
                             team.status(format!("restarting the team for {}", case.incident_id)).await;
                         }
                         shared.router.restart_streams();
+                        let incident = case.incident_id.clone();
                         let task = investigate(Arc::clone(&shared), Arc::clone(&crew), case, assets.clone(), done_tx.clone());
-                        running = Some(tokio::spawn(task));
+                        running = Some((tokio::spawn(task), incident));
                     }
                 }
                 Some(Inbound::Event(_)) => {}
@@ -190,11 +233,26 @@ pub(crate) async fn run(options: Options) -> Result<()> {
             }
         }
     };
-    if let Some(investigation) = running {
+    if let Some((investigation, _)) = running {
         investigation.abort();
     }
     team.status("agents offline".to_owned()).await;
     result
+}
+
+/// Whether `message` is cleanroomd publishing an asset's baseline (every flag `no`), which it
+/// does only when the victim is reset and the incident closed.
+fn is_reset(message: &BusMessage) -> bool {
+    let BusBody::Scope(record) = &message.body else {
+        return false;
+    };
+    let no = |flag: Tri| flag == Tri::No;
+    message.from == Principal::System
+        && no(record.flags.locked)
+        && no(record.flags.exfiltrated)
+        && no(record.flags.accessed)
+        && no(record.flags.destroyed)
+        && no(record.flags.modified)
 }
 
 /// When `message` asks a specialist a question (chat to its role from the Lead or a human),
@@ -607,12 +665,13 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
     format!(
-        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; {}",
+        "agents online on {}: lead, hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop; reasoning budgets per policy/reasoning.json: {}; {}",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),
         router.egress(),
         shared.max_steps,
+        router.budgets().summary(),
         models(router)
     )
 }
@@ -654,5 +713,56 @@ impl Seen {
             self.ids.remove(&oldest);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cleanroom_proto::ScopeFlags;
+
+    use super::*;
+
+    fn scope(from: Principal, flag: Tri) -> BusMessage {
+        BusMessage {
+            id: "m".to_owned(),
+            at: "2026-11-08T12:00:00Z".to_owned(),
+            from: from.clone(),
+            to: Audience::All,
+            body: BusBody::Scope(ScopeRecord {
+                asset_id: "payroll".to_owned(),
+                name: "Payroll export".to_owned(),
+                data_classes: Vec::new(),
+                record_count: 1,
+                texas_residents: 1,
+                flags: ScopeFlags {
+                    locked: flag,
+                    exfiltrated: flag,
+                    accessed: flag,
+                    destroyed: flag,
+                    modified: flag,
+                },
+                encrypted_at_rest: false,
+                key_exposed: Tri::No,
+                confidence_pct: 100,
+                evidence: Vec::new(),
+                updated_by: from,
+                updated_at: "2026-11-08T12:00:00Z".to_owned(),
+            }),
+        }
+    }
+
+    /// A reset is the only time cleanroomd publishes an asset's baseline (every flag `no`); the
+    /// team must stop working the incident it closed instead of spending model calls on it.
+    #[test]
+    fn a_baseline_from_cleanroomd_means_the_incident_was_reset() {
+        assert!(is_reset(&scope(Principal::System, Tri::No)));
+        assert!(
+            !is_reset(&scope(Principal::System, Tri::Yes)),
+            "a measurement after a detonation is not a reset"
+        );
+        assert!(
+            !is_reset(&scope(Principal::Agent { role: Role::Scribe }, Tri::No)),
+            "only cleanroomd resets"
+        );
     }
 }

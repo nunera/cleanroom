@@ -192,20 +192,106 @@ pub struct ExecResult {
     pub receipt_seq: u64,
 }
 
+/// An agent runner reporting one model call, so cleanroomd can chain which model answered whom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCall {
+    pub from: Role,
+    /// `agent`, `chat` or `safety`.
+    pub purpose: String,
+    pub model: String,
+    /// The endpoint's base URL.
+    pub endpoint: String,
+    /// Digest of the request body sent.
+    pub request: Digest,
+    /// Digest of the response body received.
+    pub response: Digest,
+    /// The answer came from the replay store, not a live model.
+    pub replayed: bool,
+    pub latency_ms: u64,
+    /// The model's reasoning trace (`reasoning_content`), when it returned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Reasoning tokens the endpoint reported for the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
 // ---------- Receipts (hash-chained, signed action log) ----------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
-    AdmitRoot { name: String, manifest: Digest },
-    Exec { stratum: String, argv: Vec<String> },
-    Write { stratum: String, path: String },
-    ToolGrant { request_id: String, tool: String },
-    Approval { subject_id: String },
-    Enroll { member: KeyId },
-    Revoke { member: KeyId },
-    RecordUpdate { incident_id: String, field: String },
-    Detonate { scenario: String },
+    AdmitRoot {
+        name: String,
+        manifest: Digest,
+    },
+    Exec {
+        stratum: String,
+        argv: Vec<String>,
+    },
+    Write {
+        stratum: String,
+        path: String,
+    },
+    ToolGrant {
+        request_id: String,
+        tool: String,
+    },
+    Approval {
+        subject_id: String,
+    },
+    Enroll {
+        member: KeyId,
+    },
+    Revoke {
+        member: KeyId,
+    },
+    RecordUpdate {
+        incident_id: String,
+        field: String,
+    },
+    Detonate {
+        scenario: String,
+    },
+    /// cleanroomd hashed every evidence file (share, drop box, logs): at detection, and again
+    /// whenever an agent command left the evidence different from the last seal.
+    EvidenceSeal {
+        digest: Digest,
+        files: u64,
+    },
+    /// An agent's model call, as its runner reported it: the receipt binds the model and
+    /// endpoint to digests of the exact request and response bytes.
+    ModelCall {
+        purpose: String,
+        model: String,
+        endpoint: String,
+        request: Digest,
+        response: Digest,
+        replayed: bool,
+        /// Digest of the reasoning trace cleanroomd stored for this call (`reasoning.ndjson`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Digest>,
+        /// Reasoning tokens the endpoint reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u64>,
+    },
+    /// An agent's YARA rule, checked by cleanroomd: `allowed` when it was admitted into
+    /// `/rules`, `denied` with the reason otherwise.
+    YaraRule {
+        name: String,
+        digest: Digest,
+    },
+}
+
+/// An investigator submitting a YARA rule it wrote. cleanroomd admits it into `/rules` only if it
+/// compiles, matches no clean seed file and matches some evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSubmission {
+    pub from: Role,
+    /// Lowercase letters, digits, `-` and `_`; the rule lands at `/rules/agent-<name>.yar`.
+    pub name: String,
+    /// The rule source.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +612,10 @@ pub struct BusMessage {
 pub enum CoreRequest {
     Exec(ExecRequest),
     RequestTool(ToolRequest),
+    /// An agent runner reporting one model call for the receipt log.
+    ModelCall(ModelCall),
+    /// An investigator submitting a YARA rule it wrote.
+    SubmitRule(RuleSubmission),
     /// Commander approves or denies a pending tool request or containment proposal.
     Approve(Signed<ApprovalDecision>),
     Enroll(Signed<Member>),

@@ -18,8 +18,11 @@ mod keys;
 mod layout;
 mod members;
 mod plan;
+mod probe;
+mod reasoning;
 mod receipts;
 mod roots;
+mod rules;
 mod scenario;
 mod server;
 mod strata;
@@ -96,6 +99,24 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Test a stratum's walls from inside it (network, capabilities, nested user namespaces,
+    /// environment, read-only evidence, host home), one signed receipt per wall. Exits 0 when
+    /// every wall holds, 1 when one is broken.
+    Probe {
+        /// Agent stratum that runs commands: hunter or forensics.
+        #[arg(default_value = "hunter")]
+        stratum: String,
+    },
+    /// Show the Nemotron reasoning behind a `model_call` receipt, offline from the state
+    /// directory, and check it against the digest the daemon signed. Exits 0 when it matches, 1
+    /// when the stored trace was changed.
+    Reasoning {
+        /// The receipt number.
+        seq: u64,
+        /// State directory [default: `$XDG_STATE_HOME/cleanroom`, else `~/.local/state/cleanroom`].
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+    },
     /// Work with declarative host plans offline (no daemon needed).
     Plan {
         /// What to do with the plan.
@@ -170,6 +191,13 @@ async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<Exi
         Command::Plan {
             action: PlanAction::Validate { file },
         } => Ok(plan::validate_file(&file)),
+        Command::Reasoning { seq, state } => {
+            let state = match state {
+                Some(state) => state,
+                None => layout::default_state()?,
+            };
+            reasoning::command(&state, seq)
+        }
         Command::Admit { root } => client::admit(&socket()?, &root).await,
         Command::Verify => client::verify(&socket()?).await,
         Command::Reset => {
@@ -193,6 +221,7 @@ async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<Exi
             timeout,
             argv,
         } => client::run(&socket()?, &stratum, argv, Duration::from_secs(timeout)).await,
+        Command::Probe { stratum } => client::probe(&socket()?, &stratum).await,
     }
 }
 

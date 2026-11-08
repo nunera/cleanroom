@@ -14,10 +14,13 @@
 )]
 
 mod agent;
+mod budget;
 mod cache;
 mod config;
 mod daemon;
+mod dataset;
 mod egress;
+mod gym;
 mod keys;
 mod lead;
 mod llm;
@@ -53,6 +56,27 @@ struct Cli {
 enum Command {
     /// Connect to cleanroomd, wait for `investigate` events and work each incident.
     Run(RunArgs),
+    /// Export an incident's trainable model calls as NeMo Gym pivot rows
+    /// (`single_step_tool_use_with_argument_comparison`). Needs the incident to have run with
+    /// `CLEANROOM_LLM_CACHE=record`.
+    ExportGym(ExportArgs),
+}
+
+/// `export-gym` options.
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Incident id, for example `INC-20261108-112348`.
+    #[arg(long)]
+    incident: String,
+    /// Output JSONL path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Training tags directory [default: `$XDG_STATE_HOME/cleanroom/dataset`].
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+    /// Record cache directory [default: `$CLEANROOM_LLM_CACHE_DIR`, else `$XDG_CACHE_HOME/cleanroom/llm`].
+    #[arg(long)]
+    cache: Option<PathBuf>,
 }
 
 /// `run` options.
@@ -91,7 +115,10 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
-    let Command::Run(args) = Cli::parse().command;
+    let args = match Cli::parse().command {
+        Command::Run(args) => args,
+        Command::ExportGym(args) => return export_gym(args),
+    };
     let options = team::Options {
         guardrails: args.guardrails == Switch::On,
         max_steps: args.max_steps,
@@ -103,6 +130,43 @@ async fn main() -> ExitCode {
         Err(error) => {
             tracing::error!("{error:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `export-gym`: write the pivot rows and print what was written and skipped.
+fn export_gym(args: ExportArgs) -> ExitCode {
+    let paths = || -> anyhow::Result<(PathBuf, PathBuf)> {
+        let dataset = match args.dataset {
+            Some(dir) => dir,
+            None => config::xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/dataset"),
+        };
+        let cache = match args.cache {
+            Some(dir) => dir,
+            None => match std::env::var_os("CLEANROOM_LLM_CACHE_DIR").filter(|dir| !dir.is_empty())
+            {
+                Some(dir) => PathBuf::from(dir),
+                None => config::xdg_dir("XDG_CACHE_HOME", ".cache")?.join("cleanroom/llm"),
+            },
+        };
+        Ok((dataset, cache))
+    };
+    let result = paths()
+        .and_then(|(dataset, cache)| gym::export(&dataset, &cache, &args.incident, &args.out));
+    match result {
+        Ok(summary) => {
+            println!(
+                "{} pivot rows -> {} ({:?}); skipped model calls: {:?}",
+                summary.rows,
+                args.out.display(),
+                summary.actions,
+                summary.skipped
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!("{error:#}");
+            ExitCode::from(2)
         }
     }
 }

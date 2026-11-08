@@ -10,23 +10,29 @@ use anyhow::{Context as _, Result, bail};
 use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
 use cleanroom_proto::{
     Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
-    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal,
-    Revocation, Role, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource, domain,
+    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, ModelCall, Outcome, Principal,
+    Revocation, Role, RuleSubmission, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource,
+    domain,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use sha2::{Digest as _, Sha256};
 use tokio::task::spawn_blocking;
 
 use crate::bus::{Bus, Outbox, Subject};
 use crate::layout::Layout;
 use crate::members::Members;
-use crate::roots::{Admitted, Roots, Verdict};
+use crate::reasoning;
+use crate::roots::{self, Admitted, Roots, Verdict};
+use crate::rules;
 use crate::scenario::{self, Scenario};
-use crate::strata::{self, Captured, Launch};
+use crate::strata::{self, Captured, Launch, Placement};
 use crate::tools::{self, Granted, Grants, Policy};
 use crate::{keys, lock, now, receipts};
 
-/// The root every stratum runs on.
-const ROOT: &str = "debian";
+/// How long one scan of a submitted rule may run.
+const RULE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest reasoning trace stored per model call.
+const REASONING_MAX: usize = 256 * 1024;
 /// Longest the ransomware may run.
 const DETONATION_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -120,6 +126,8 @@ pub(crate) struct Daemon {
     receipts: Mutex<receipts::Log>,
     /// Admitted roots.
     roots: Roots,
+    /// Which root each stratum runs on.
+    placement: Placement,
     /// Tool admission policy.
     policy: Policy,
     /// Tools each role holds.
@@ -146,8 +154,14 @@ impl Daemon {
         let assets = scenario::load_assets(&layout.assets())?;
         let policy = Policy::load(&layout.repo)?;
         let members = Members::load(&layout.keys().join("members.ndjson"))?;
+        let placement = Placement::from_env()?;
+        for root in placement.roots() {
+            roots::check_lock(&layout, root)?;
+        }
+        tracing::info!(%placement, "strata roots");
         let daemon = Arc::new(Self {
             roots: Roots::new(layout.clone()),
+            placement,
             layout,
             session: session_tag(),
             next_message: AtomicU64::new(1),
@@ -255,13 +269,17 @@ impl Daemon {
         let result = match request {
             CoreRequest::Exec(exec) => Box::pin(self.exec(peer, exec)).await,
             CoreRequest::RequestTool(ask) => Box::pin(self.request_tool(peer, ask)).await,
+            CoreRequest::ModelCall(call) => self.model_call(peer, call),
+            CoreRequest::SubmitRule(submission) => {
+                Box::pin(self.submit_rule(peer, submission)).await
+            }
             CoreRequest::Approve(decision) => self.approve(peer, decision),
             CoreRequest::Enroll(member) => self.enroll(peer, member),
             CoreRequest::Revoke(revocation) => self.revoke(peer, revocation),
             CoreRequest::Detonate { scenario } => Box::pin(self.detonate(peer, &scenario)).await,
             CoreRequest::Tamper { root } => self.tamper(peer, &root).await,
             CoreRequest::Admit { root } => self.admit(peer, &root).await,
-            CoreRequest::VerifyLog => self.verify_log(peer),
+            CoreRequest::VerifyLog => self.verify_log(peer).await,
             CoreRequest::Reset => self.reset(peer).await,
         };
         result.unwrap_or_else(|error| {
@@ -270,6 +288,137 @@ impl Daemon {
                 message: format!("{error:#}"),
             }
         })
+    }
+
+    /// `model_call`: chain an agent's model call into the receipt log, as that agent. A
+    /// reasoning trace is stored in `reasoning.ndjson` under the receipt's number, and the
+    /// receipt carries its digest.
+    ///
+    /// # Errors
+    /// Fails if the caller is not the agent it names, the trace is too large, or the receipt or
+    /// trace cannot be written.
+    fn model_call(&self, peer: &Peer, call: ModelCall) -> Result<CoreResponse> {
+        let role = peer.role(call.from)?;
+        if call
+            .reasoning
+            .as_ref()
+            .is_some_and(|text| text.len() > REASONING_MAX)
+        {
+            bail!("a reasoning trace is at most {REASONING_MAX} bytes");
+        }
+        let actor = Principal::Agent { role };
+        let model = call.model.clone();
+        let action = Action::ModelCall {
+            purpose: call.purpose,
+            model: call.model,
+            endpoint: call.endpoint,
+            request: call.request,
+            response: call.response,
+            replayed: call.replayed,
+            reasoning: call.reasoning.as_deref().map(reasoning::digest),
+            reasoning_tokens: call.reasoning_tokens,
+        };
+        let seq = self.receipt(actor.clone(), action, Outcome::Allowed)?;
+        if let Some(text) = call.reasoning {
+            let trace = reasoning::Trace {
+                receipt: seq,
+                role: describe(&actor),
+                model,
+                tokens: call.reasoning_tokens,
+                text,
+            };
+            reasoning::append(&self.layout.reasoning(), &trace)?;
+        }
+        Ok(CoreResponse::Ok)
+    }
+
+    /// `submit_rule`: check an investigator's YARA rule in a sandbox (`yara` over the clean seed
+    /// files, then over the evidence) and admit it into `/rules` only if it compiles, matches no
+    /// clean file and matches some evidence. Either way the verdict is a receipt and a status
+    /// line; a rejection comes back as an error the agent can fix.
+    ///
+    /// # Errors
+    /// Fails for a caller that is not an investigator, a bad name or size, no open incident, a
+    /// rejected rule, or a sandbox or receipt failure.
+    async fn submit_rule(&self, peer: &Peer, submission: RuleSubmission) -> Result<CoreResponse> {
+        let role = peer.role(submission.from)?;
+        if !matches!(role, Role::Hunter | Role::Forensics) {
+            bail!("only hunter and forensics write detection rules");
+        }
+        rules::check_name(&submission.name).map_err(anyhow::Error::msg)?;
+        if submission.source.trim().is_empty() || submission.source.len() > rules::SOURCE_MAX {
+            bail!("a rule has 1 to {} bytes", rules::SOURCE_MAX);
+        }
+        if lock(&self.open_incident).is_none() {
+            bail!("no incident is open; detection rules are written for one");
+        }
+        let actor = Principal::Agent { role };
+        let root = self.launchable_root(&actor, strata::RULE_CHECK).await?;
+        let yara = self
+            .grants
+            .of(Role::Hunter)
+            .into_iter()
+            .find(|tool| tool.name == "yara")
+            .context("yara is not built yet; submit the rule again shortly")?;
+        let file = format!("agent-{}.yar", submission.name);
+        let check_dir = self.layout.rule_check();
+        let candidate = check_dir.join(&file);
+        drop(std::fs::remove_dir_all(&check_dir));
+        std::fs::create_dir_all(&check_dir)
+            .and_then(|()| std::fs::write(&candidate, &submission.source))
+            .with_context(|| format!("cannot stage {}", candidate.display()))?;
+        let grant = strata::rule_check(&self.layout, &root)?;
+        let rule = format!("{}/{file}", strata::RULE_CHECK_RULES);
+        let mut scans = Vec::with_capacity(2);
+        for target in [strata::RULE_CHECK_SEED, "/evidence"] {
+            let argv = ["yara", "-r", rule.as_str(), target].map(str::to_owned);
+            scans.push(
+                strata::run(&Launch {
+                    rootfs: &root.rootfs,
+                    grant: &grant,
+                    bins: &yara.bins,
+                    argv: &argv,
+                    timeout: RULE_CHECK_TIMEOUT,
+                })
+                .await?,
+            );
+        }
+        let who = describe(&actor);
+        let name = submission.name;
+        let action = Action::YaraRule {
+            name: name.clone(),
+            digest: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(submission.source.as_bytes()))
+            ),
+        };
+        match rules::judge(&scans[0], &scans[1]) {
+            Err(reason) => {
+                let seq = self.receipt(
+                    actor,
+                    action,
+                    Outcome::Denied {
+                        reason: reason.clone(),
+                    },
+                )?;
+                self.status(format!(
+                    "OS rejected {who}'s YARA rule {name}: {reason} (receipt #{seq})"
+                ));
+                bail!("rule rejected: {reason} (receipt #{seq}); fix it and submit it again")
+            }
+            Ok(hits) => {
+                let deployed = self.layout.rules().join(&file);
+                std::fs::copy(&candidate, &deployed)
+                    .with_context(|| format!("cannot deploy {}", deployed.display()))?;
+                let seq = self.receipt(actor, action, Outcome::Allowed)?;
+                self.status(format!(
+                    "{who}'s YARA rule {name} admitted to {}/{file}: it compiles, matches none of the clean files from before the attack, and matches {} evidence file(s) (receipt #{seq})",
+                    strata::RULES,
+                    hits.len()
+                ));
+                Ok(CoreResponse::Ok)
+            }
+        }
     }
 
     /// Run a command in the caller's stratum under its grant.
@@ -293,9 +442,10 @@ impl Daemon {
                 action,
                 ExecOutcome::Denied { reason },
                 Captured::default(),
+                None,
             );
         }
-        let root = match self.launchable_root(&actor).await {
+        let root = match self.launchable_root(&actor, &request.stratum).await {
             Ok(root) => root,
             Err(error) => {
                 let reason = format!("{error:#}");
@@ -304,6 +454,7 @@ impl Daemon {
                     action,
                     ExecOutcome::Denied { reason },
                     Captured::default(),
+                    None,
                 );
             }
         };
@@ -319,10 +470,14 @@ impl Daemon {
         };
         let captured = strata::run(&launch).await?;
         let outcome = strata::classify(strata::stratum_of(role), &captured);
-        self.exec_result(actor, action, outcome, captured)
+        let evidence = self
+            .recheck_evidence(&describe(&actor), &request.argv.join(" "))
+            .await;
+        self.exec_result(actor, action, outcome, captured, evidence)
     }
 
-    /// Record an exec and build its response; a denial also goes on the bus as a status line.
+    /// Record an exec and build its response; a denial also goes on the bus as a status line,
+    /// with `evidence` (what the post-command evidence check found) appended.
     ///
     /// # Errors
     /// Fails if the receipt cannot be written.
@@ -332,6 +487,7 @@ impl Daemon {
         action: Action,
         outcome: ExecOutcome,
         captured: Captured,
+        evidence: Option<String>,
     ) -> Result<CoreResponse> {
         let receipt_outcome = match &outcome {
             ExecOutcome::Denied { reason } => Outcome::Denied {
@@ -349,12 +505,16 @@ impl Daemon {
             | Action::Enroll { .. }
             | Action::Revoke { .. }
             | Action::RecordUpdate { .. }
-            | Action::Detonate { .. } => String::new(),
+            | Action::Detonate { .. }
+            | Action::EvidenceSeal { .. }
+            | Action::ModelCall { .. }
+            | Action::YaraRule { .. } => String::new(),
         };
         let seq = self.receipt(actor, action, receipt_outcome)?;
         if let ExecOutcome::Denied { reason } = &outcome {
+            let evidence = evidence.map_or_else(String::new, |note| format!("; {note}"));
             self.status(format!(
-                "OS denied {who}: `{command}`: {reason} (receipt #{seq})"
+                "OS denied {who}: `{command}`: {reason} (receipt #{seq}){evidence}"
             ));
         }
         Ok(CoreResponse::Exec(ExecResult {
@@ -366,26 +526,108 @@ impl Daemon {
         }))
     }
 
-    /// The admitted root, admitting it first if this run has not, and re-checking its tree.
+    /// The evidence directories under their investigator names (`/evidence/<label>`).
+    fn evidence_dirs(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("acme-fs", self.layout.share()),
+            ("dropbox", self.layout.dropbox()),
+            ("logs", self.layout.logs()),
+        ]
+    }
+
+    /// Hash every evidence file now.
     ///
     /// # Errors
-    /// Fails if admission fails or rejects the root, or the tree changed since admission.
-    async fn launchable_root(&self, actor: &Principal) -> Result<Admitted> {
-        let root = match self.roots.admitted(ROOT) {
+    /// Fails if an evidence directory cannot be read.
+    async fn seal_evidence(&self) -> Result<scenario::Seal> {
+        let dirs = self.evidence_dirs();
+        spawn_blocking(move || scenario::seal(&dirs))
+            .await
+            .context("sealing the evidence panicked")?
+    }
+
+    /// Write an evidence seal receipt for `seal` and make it the current seal.
+    ///
+    /// # Errors
+    /// Fails if the receipt cannot be written.
+    fn record_seal(&self, seal: scenario::Seal) -> Result<u64> {
+        let action = Action::EvidenceSeal {
+            digest: seal.digest.clone(),
+            files: u64::try_from(seal.len()).unwrap_or(u64::MAX),
+        };
+        let seq = self.receipt(Principal::System, action, Outcome::Allowed)?;
+        self.scenario.set_seal(Some((seal, seq)));
+        Ok(seq)
+    }
+
+    /// After `who` ran `command`: re-hash the evidence against the latest seal. A change is
+    /// sealed again with a new receipt and announced (the check only finds it; agents' strata
+    /// mount the evidence read-only, so it came from elsewhere); either way returns a note for a
+    /// denial's status line. `None` when no incident is sealed or the evidence cannot be read.
+    async fn recheck_evidence(&self, who: &str, command: &str) -> Option<String> {
+        let (sealed, seq) = self.scenario.seal()?;
+        let now = match self.seal_evidence().await {
+            Ok(now) => now,
+            Err(error) => {
+                tracing::warn!("cannot re-check the evidence after {who}'s command: {error:#}");
+                return None;
+            }
+        };
+        let changed = sealed.differences(&now);
+        if changed.is_empty() {
+            return Some(format!(
+                "evidence unchanged: still matches the seal from receipt #{seq}"
+            ));
+        }
+        let digest = now.digest.clone();
+        let changed = changed.join(", ");
+        match self.record_seal(now) {
+            Ok(new_seq) => {
+                self.status(format!(
+                    "EVIDENCE CHANGED since the seal from receipt #{seq}: {changed} under /evidence (found by the check after {who} ran `{command}`); resealed as {digest} (receipt #{new_seq})"
+                ));
+                Some(format!("evidence CHANGED since receipt #{seq}: {changed}"))
+            }
+            Err(error) => {
+                tracing::warn!("cannot record the changed evidence: {error:#}");
+                Some(format!("evidence CHANGED since receipt #{seq}: {changed}"))
+            }
+        }
+    }
+
+    /// The root `stratum` runs on.
+    ///
+    /// # Errors
+    /// Fails for a stratum that launches no commands.
+    fn root_of(&self, stratum: &str) -> Result<&str> {
+        self.placement
+            .root(stratum)
+            .with_context(|| format!("the {stratum} stratum launches no commands"))
+    }
+
+    /// The admitted root `stratum` runs on, admitting it first if this run has not, and
+    /// re-checking its tree.
+    ///
+    /// # Errors
+    /// Fails for a stratum that launches no commands, if admission fails or rejects the root,
+    /// or if the tree changed since admission.
+    async fn launchable_root(&self, actor: &Principal, stratum: &str) -> Result<Admitted> {
+        let name = self.root_of(stratum)?;
+        let root = match self.roots.admitted(name) {
             Some(root) => root,
-            None => match self.admit_root(actor, ROOT).await? {
+            None => match self.admit_root(actor, name).await? {
                 Verdict::Admitted(root) => root,
                 Verdict::Rejected(mismatch) => bail!(
-                    "root {ROOT} failed admission: layer {} does not match its lock",
+                    "root {name} failed admission: layer {} does not match its lock",
                     mismatch.layer
                 ),
             },
         };
         if !self.roots.intact(&root).await? {
             self.status(format!(
-                "root {ROOT} changed on disk since admission (tree digest mismatch); launches refused until it is re-admitted"
+                "root {name} changed on disk since admission (tree digest mismatch); launches refused until it is re-admitted"
             ));
-            bail!("root {ROOT} changed on disk since admission; re-admit it");
+            bail!("root {name} changed on disk since admission; re-admit it");
         }
         Ok(root)
     }
@@ -739,13 +981,16 @@ impl Daemon {
             bail!("acme-fs was already detonated ({id}); reset first");
         }
         let ransom = scenario::find_ransom(&self.layout)?;
-        let root = self.launchable_root(&peer.principal).await?;
+        let root_name = self.root_of(strata::VICTIM)?;
+        let root = self
+            .launchable_root(&peer.principal, strata::VICTIM)
+            .await?;
         let action = Action::Detonate {
             scenario: name.to_owned(),
         };
         let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
         self.status(format!(
-            "{} detonated {name} in the acme-fs stratum: Debian root read-only, share read-write, no network (receipt #{seq})",
+            "{} detonated {name} in the acme-fs stratum: {root_name} root read-only, share read-write, no network (receipt #{seq})",
             peer.name()
         ));
         let summary = self.run_ransomware(&root, &ransom, argv).await?;
@@ -827,11 +1072,22 @@ impl Daemon {
     /// Fails if the share cannot be read.
     async fn declare(&self, receipt: u64) -> Result<String> {
         let share = self.layout.share();
+        let drop_box = self.layout.dropbox();
         let baseline = self.scenario.baseline();
-        let integrity = spawn_blocking(move || scenario::check(&share, &baseline))
+        let integrity = spawn_blocking(move || scenario::check(&share, &drop_box, &baseline))
             .await
             .context("the integrity check panicked")??;
         let at = now();
+        let seal = self.seal_evidence().await?;
+        let (digest, files) = (seal.digest.clone(), seal.len());
+        let sealed = self.record_seal(seal)?;
+        self.scenario.set_detection_seal(self.scenario.seal());
+        self.status(format!(
+            "evidence sealed at detection: {digest} over {files} files in {}, {} and {} (receipt #{sealed}); every agent command is checked against it",
+            strata::EVIDENCE_SHARE,
+            strata::EVIDENCE_DROP,
+            strata::EVIDENCE_LOGS
+        ));
         let measured = scenario::affected(self.scenario.assets(), &integrity, &at);
         self.scenario.set_measured(&measured);
         for record in measured {
@@ -853,7 +1109,7 @@ impl Daemon {
     ///
     /// # Errors
     /// Fails for agents or if the log cannot be read.
-    fn verify_log(&self, peer: &Peer) -> Result<CoreResponse> {
+    async fn verify_log(&self, peer: &Peer) -> Result<CoreResponse> {
         peer.human("verify_log")?;
         let report = lock(&self.receipts).verify(&self.key.verifying_key())?;
         match report.first_break {
@@ -865,6 +1121,22 @@ impl Daemon {
                 "receipt log BROKEN at receipt {entry} of {}",
                 report.entries
             )),
+        }
+        if let Some((sealed, seq)) = self.scenario.detection_seal() {
+            let now = self.seal_evidence().await?;
+            let changed = sealed.differences(&now);
+            if changed.is_empty() {
+                self.status(format!(
+                    "evidence verified: {} files match the seal taken at detection (receipt #{seq}, {})",
+                    now.len(),
+                    sealed.digest
+                ));
+            } else {
+                self.status(format!(
+                    "evidence DIFFERS from the seal taken at detection (receipt #{seq}): {}",
+                    changed.join(", ")
+                ));
+            }
         }
         Ok(CoreResponse::LogVerified {
             entries: report.entries,
@@ -894,6 +1166,10 @@ impl Daemon {
     )]
     async fn restore(&self, actor: &Principal) -> Result<()> {
         let mut incident = self.scenario.incident().await;
+        // Before re-seeding: a command still running must not compare a fresh share with the
+        // old incident's seal.
+        self.scenario.set_seal(None);
+        self.scenario.set_detection_seal(None);
         self.roots.discard_staging().await?;
         let layout = self.layout.clone();
         let baseline = spawn_blocking(move || scenario::reseed(&layout))
@@ -1131,6 +1407,8 @@ const fn op_name(request: &CoreRequest) -> &'static str {
     match request {
         CoreRequest::Exec(_) => "exec",
         CoreRequest::RequestTool(_) => "request_tool",
+        CoreRequest::ModelCall(_) => "model_call",
+        CoreRequest::SubmitRule(_) => "submit_rule",
         CoreRequest::Approve(_) => "approve",
         CoreRequest::Enroll(_) => "enroll",
         CoreRequest::Revoke(_) => "revoke",

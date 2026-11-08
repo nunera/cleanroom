@@ -19,6 +19,8 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
 
+use crate::probe::Wall;
+
 /// How long to wait for the daemon's socket to accept connections.
 const CONNECT_PATIENCE: Duration = Duration::from_secs(30);
 /// How long an admission may take; the first one fetches the image.
@@ -27,6 +29,8 @@ const ADMIT_WAIT: Duration = Duration::from_mins(10);
 const QUICK_WAIT: Duration = Duration::from_mins(1);
 /// How long a detonation may take, including the root admission before it.
 const DETONATE_WAIT: Duration = Duration::from_mins(12);
+/// How long one probe command may run.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `cleanroomd admit <root>`: prints the verdict; exit 0 when admitted, 1 when rejected.
 ///
@@ -142,6 +146,57 @@ pub(crate) async fn run(
     Ok(ExitCode::from(exec_exit(&result.outcome)))
 }
 
+/// `cleanroomd probe [stratum]`: test every wall of `stratum` from inside it, as its agent, and
+/// print one line per wall with the receipt of the command that tested it. Exits 0 when every
+/// wall holds, 1 when one is broken.
+///
+/// # Errors
+/// Fails for a stratum that runs no commands, or if the daemon is unreachable or answers with an
+/// error.
+pub(crate) async fn probe(socket: &Path, stratum: &str) -> Result<ExitCode> {
+    if !matches!(stratum, "hunter" | "forensics") {
+        bail!(
+            "{stratum} runs no commands at all (every exec is denied); probe hunter or forensics"
+        );
+    }
+    let role = role_of(stratum)?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_owned());
+    let mut held = true;
+    for wall in Wall::ALL {
+        let request = CoreRequest::Exec(ExecRequest {
+            from: role,
+            stratum: stratum.to_owned(),
+            argv: wall.argv(&home),
+            timeout_ms: u64::try_from(PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        });
+        let CoreResponse::Exec(result) = ask(socket, Some(role), request, ADMIT_WAIT).await? else {
+            bail!("cleanroomd answered probe with something else");
+        };
+        let (mark, detail) = match wall.judge(&result) {
+            Ok(detail) => ("PASS", detail),
+            Err(detail) => {
+                held = false;
+                ("FAIL", detail)
+            }
+        };
+        say(&format!(
+            "{mark}  {:<30} {detail} (receipt #{})",
+            wall.name(),
+            result.receipt_seq
+        ))?;
+    }
+    say(if held {
+        "every wall of the stratum held; `cleanroomd verify` checks the receipts"
+    } else {
+        "a wall is BROKEN"
+    })?;
+    Ok(if held {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 /// The line and exit code for a `verify_log` answer.
 fn verified(entries: u64, first_break: Option<u64>) -> (String, u8) {
     match first_break {
@@ -189,6 +244,8 @@ const fn op_label(request: &CoreRequest) -> &'static str {
         CoreRequest::Tamper { .. } => "tamper",
         CoreRequest::Exec(_)
         | CoreRequest::RequestTool(_)
+        | CoreRequest::ModelCall(_)
+        | CoreRequest::SubmitRule(_)
         | CoreRequest::Approve(_)
         | CoreRequest::Enroll(_)
         | CoreRequest::Revoke(_)

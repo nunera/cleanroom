@@ -17,6 +17,7 @@ use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::budget::Budgets;
 use crate::cache::{self, Hit, Store, Stream};
 use crate::config::{Endpoint, LocalRoute, Models, Settings};
 use crate::egress;
@@ -26,7 +27,7 @@ use crate::text::preview;
 use crate::tools::ToolSpec;
 
 /// Token budget for an agent step.
-const AGENT_MAX_TOKENS: u32 = 2048;
+pub(crate) const AGENT_MAX_TOKENS: u32 = 2048;
 /// Token budget for a safety verdict (the verdict itself is about 40 tokens).
 const SAFETY_MAX_TOKENS: u32 = 1024;
 /// Retries after the first attempt on 408, 429, 5xx, timeouts and transport errors.
@@ -132,6 +133,8 @@ pub(crate) struct Reply {
     pub(crate) model: String,
     /// Live or replayed.
     pub(crate) origin: Origin,
+    /// `sha256:` of the request body (the record/replay cache key).
+    pub(crate) request: String,
 }
 
 /// Why a model is called; part of the replay stream name.
@@ -193,6 +196,9 @@ struct Body<'a> {
     /// requests, and the cache keys of their recordings, stay as they were.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<TemplateKwargs>,
+    /// Reasoning tokens the model may spend before answering, from `policy/reasoning.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
 }
 
 /// Serialize a chat-completions request. The bytes are both what is sent and what the cache keys on.
@@ -205,7 +211,7 @@ pub(crate) fn request_body(
     tools: &[ToolSpec],
     max_tokens: u32,
 ) -> serde_json::Result<Vec<u8>> {
-    body(model, messages, tools, max_tokens, None)
+    body(model, messages, tools, max_tokens, None, None)
 }
 
 /// Serialize a request with optional chat-template switches.
@@ -218,6 +224,7 @@ fn body(
     tools: &[ToolSpec],
     max_tokens: u32,
     chat_template_kwargs: Option<TemplateKwargs>,
+    reasoning_budget: Option<u32>,
 ) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&Body {
         model,
@@ -226,6 +233,7 @@ fn body(
         tool_choice: (!tools.is_empty()).then_some("auto"),
         max_tokens,
         chat_template_kwargs,
+        reasoning_budget,
     })
 }
 
@@ -305,6 +313,105 @@ enum Attempt {
     },
 }
 
+/// One model call as reported to cleanroomd: which model at which endpoint answered whom, with
+/// digests of the exact bytes sent and received.
+#[derive(Debug, Clone)]
+pub(crate) struct CallRecord {
+    /// The role the call was for.
+    pub(crate) role: Role,
+    /// `agent`, `chat` or `safety`.
+    pub(crate) purpose: &'static str,
+    /// The model asked.
+    pub(crate) model: String,
+    /// The endpoint's base URL (`none` when replaying a route that has no endpoint).
+    pub(crate) endpoint: String,
+    /// `sha256:` of the request body.
+    pub(crate) request: String,
+    /// `sha256:` of the response body.
+    pub(crate) response: String,
+    /// The answer came from the replay store, not a live model.
+    pub(crate) replayed: bool,
+    /// Time from request to response, including any recorded pace in replay.
+    pub(crate) latency_ms: u64,
+    /// The model's reasoning trace (`reasoning_content`), clipped to [`REASONING_LIMIT`] bytes.
+    pub(crate) reasoning: Option<String>,
+    /// Reasoning tokens the endpoint reported (`usage.completion_tokens_details`).
+    pub(crate) reasoning_tokens: Option<u64>,
+}
+
+/// Reasoning trace bytes reported per call at most (cleanroomd stores up to 256 KiB).
+const REASONING_LIMIT: usize = 200_000;
+
+/// The response parts reasoning custody reads.
+#[derive(Deserialize)]
+struct Thought {
+    /// Completions; the first one is used.
+    #[serde(default)]
+    choices: Vec<ThoughtChoice>,
+    /// Token accounting.
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+/// One completion's message.
+#[derive(Deserialize)]
+struct ThoughtChoice {
+    /// The assistant message.
+    message: ThoughtMessage,
+}
+
+/// The reasoning part of an assistant message.
+#[derive(Deserialize)]
+struct ThoughtMessage {
+    /// Chain of thought.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Token accounting.
+#[derive(Deserialize)]
+struct Usage {
+    /// Per-kind completion tokens.
+    #[serde(default)]
+    completion_tokens_details: Option<TokenDetails>,
+}
+
+/// Completion tokens by kind.
+#[derive(Deserialize)]
+struct TokenDetails {
+    /// Tokens spent reasoning.
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+/// The reasoning trace (clipped at a character boundary) and reasoning-token count in `raw`.
+fn reasoning_of(raw: &[u8]) -> (Option<String>, Option<u64>) {
+    let Ok(thought) = serde_json::from_slice::<Thought>(raw) else {
+        return (None, None);
+    };
+    let tokens = thought
+        .usage
+        .and_then(|usage| usage.completion_tokens_details)
+        .and_then(|details| details.reasoning_tokens);
+    let trace = thought
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.reasoning_content)
+        .filter(|text| !text.trim().is_empty())
+        .map(|mut text| {
+            if text.len() > REASONING_LIMIT {
+                let mut end = REASONING_LIMIT;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        });
+    (trace, tokens)
+}
+
 /// Routes model calls to the hosted or local endpoint.
 #[derive(Debug)]
 pub(crate) struct Router {
@@ -320,6 +427,10 @@ pub(crate) struct Router {
     cache: Cache,
     /// What egress this router has, for the status line.
     egress: String,
+    /// Where every call is reported, when someone listens.
+    calls: Option<tokio::sync::mpsc::UnboundedSender<CallRecord>>,
+    /// Reasoning budgets per role.
+    budgets: Budgets,
 }
 
 impl Router {
@@ -327,8 +438,10 @@ impl Router {
     /// cache. Replay builds no client at all.
     ///
     /// # Errors
-    /// Fails if an endpoint is outside `policy/egress.json` or the TLS client cannot be built.
+    /// Fails if an endpoint is outside `policy/egress.json`, `policy/reasoning.json` is invalid,
+    /// or the TLS client cannot be built.
     pub(crate) fn new(settings: &Settings) -> Result<Self> {
+        let budgets = Budgets::shipped()?;
         if rustls::crypto::ring::default_provider()
             .install_default()
             .is_err()
@@ -378,7 +491,57 @@ impl Router {
             models: settings.models.clone(),
             cache,
             egress,
+            calls: None,
+            budgets,
         })
+    }
+
+    /// Report every call to `calls`.
+    pub(crate) fn with_call_log(
+        mut self,
+        calls: tokio::sync::mpsc::UnboundedSender<CallRecord>,
+    ) -> Self {
+        self.calls = Some(calls);
+        self
+    }
+
+    /// The reasoning budgets, for the status line.
+    pub(crate) const fn budgets(&self) -> Budgets {
+        self.budgets
+    }
+
+    /// The request bytes for `role`'s `purpose` call on `route`: agent steps and the Lead's turns
+    /// carry the role's reasoning budget; a specialist's answer turns thinking off; a safety
+    /// verdict carries neither. The bytes are both what is sent and what the cache keys on.
+    ///
+    /// # Errors
+    /// Fails only if a message cannot be serialized.
+    fn request(
+        &self,
+        role: Role,
+        purpose: Purpose,
+        route: ModelRoute,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Vec<u8>> {
+        let model = self.model(role, purpose, route);
+        let budget = Some(self.budgets.for_role(role));
+        let encoded = match purpose {
+            Purpose::Agent => body(model, messages, tools, AGENT_MAX_TOKENS, None, budget),
+            Purpose::Chat if role == Role::Lead => {
+                body(model, messages, tools, AGENT_MAX_TOKENS, None, budget)
+            }
+            Purpose::Chat => body(
+                model,
+                messages,
+                tools,
+                AGENT_MAX_TOKENS,
+                Some(NO_THINKING),
+                None,
+            ),
+            Purpose::Safety => request_body(model, messages, &[], SAFETY_MAX_TOKENS),
+        };
+        encoded.context("cannot encode the model request")
     }
 
     /// Whether this router can open network connections at all.
@@ -444,9 +607,7 @@ impl Router {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<Reply> {
-        let model = self.model(role, Purpose::Agent, route);
-        let body = request_body(model, messages, tools, AGENT_MAX_TOKENS)
-            .context("cannot encode the model request")?;
+        let body = self.request(role, Purpose::Agent, route, messages, tools)?;
         self.complete(role, Purpose::Agent, route, Bytes::from(body))
             .await
     }
@@ -464,10 +625,7 @@ impl Router {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<Reply> {
-        let model = self.model(role, Purpose::Chat, route);
-        let switches = (role != Role::Lead).then_some(NO_THINKING);
-        let request = body(model, messages, tools, AGENT_MAX_TOKENS, switches)
-            .context("cannot encode the model request")?;
+        let request = self.request(role, Purpose::Chat, route, messages, tools)?;
         self.complete(role, Purpose::Chat, route, Bytes::from(request))
             .await
     }
@@ -482,12 +640,10 @@ impl Router {
         route: ModelRoute,
         text: &str,
     ) -> Result<(Verdict, String)> {
-        let model = self.model(role, Purpose::Safety, route);
         let messages = [Message::User {
             content: text.to_owned(),
         }];
-        let body = request_body(model, &messages, &[], SAFETY_MAX_TOKENS)
-            .context("cannot encode the safety request")?;
+        let body = self.request(role, Purpose::Safety, route, &messages, &[])?;
         let reply = self
             .complete(role, Purpose::Safety, route, Bytes::from(body))
             .await?;
@@ -540,6 +696,7 @@ impl Router {
             purpose: purpose.label(),
         };
         let key = cache::key(&body);
+        let started = Instant::now();
         let (raw, origin) = match &self.cache {
             Cache::Replay(store) => {
                 let replayed = store.replay(store.next_slot(stream), &key).await?;
@@ -548,7 +705,6 @@ impl Router {
             }
             Cache::Record(store) => {
                 let slot = store.next_slot(stream);
-                let started = Instant::now();
                 let raw = self.post(self.endpoint(route)?, body.clone()).await?;
                 let exchange = (body.as_ref(), raw.as_ref());
                 if let Err(error) = store.record(slot, &key, exchange, started.elapsed()).await {
@@ -558,7 +714,27 @@ impl Router {
             }
             Cache::Off => (self.post(self.endpoint(route)?, body).await?, Origin::Live),
         };
-        parse_reply(&raw, self.model(role, purpose, route), origin)
+        if let Some(calls) = &self.calls {
+            let (reasoning, reasoning_tokens) = reasoning_of(&raw);
+            let record = CallRecord {
+                role,
+                purpose: purpose.label(),
+                model: self.model(role, purpose, route).to_owned(),
+                endpoint: self
+                    .endpoint(route)
+                    .map_or_else(|_| "none".to_owned(), |endpoint| endpoint.base_url.clone()),
+                request: format!("sha256:{key}"),
+                response: format!("sha256:{}", cache::key(&raw)),
+                replayed: matches!(origin, Origin::Replayed(_)),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                reasoning,
+                reasoning_tokens,
+            };
+            if calls.send(record).is_err() {
+                tracing::debug!("nobody listens for model-call records any more");
+            }
+        }
+        parse_reply(&raw, self.model(role, purpose, route), origin, &key)
     }
 
     /// POST with retries on 408, 429, 5xx, timeouts and transport errors.
@@ -648,7 +824,7 @@ impl Router {
 ///
 /// # Errors
 /// Fails on malformed JSON or a reply without choices.
-fn parse_reply(raw: &[u8], model: &str, origin: Origin) -> Result<Reply> {
+fn parse_reply(raw: &[u8], model: &str, origin: Origin, key: &str) -> Result<Reply> {
     let response: ChatResponse =
         serde_json::from_slice(raw).context("model endpoint returned malformed JSON")?;
     let choice = response
@@ -689,6 +865,7 @@ fn parse_reply(raw: &[u8], model: &str, origin: Origin) -> Result<Reply> {
         tool_calls,
         model: model.to_owned(),
         origin,
+        request: format!("sha256:{key}"),
     })
 }
 
@@ -757,6 +934,7 @@ mod tests {
             llm_mode,
             cache_dir: PathBuf::from("/nonexistent/cleanroom-llm-cache"),
             keys_dir: PathBuf::from("/nonexistent/cleanroom-keys"),
+            dataset_dir: PathBuf::from("/nonexistent/cleanroom-dataset"),
             nixpkgs: "github:NixOS/nixpkgs/rev".to_owned(),
         }
     }
@@ -777,5 +955,148 @@ mod tests {
         let offline = Router::new(&settings("https://evil.example/v1", LlmMode::Replay))
             .expect("replay makes no connections, so no endpoint is checked");
         assert!(!offline.can_connect(), "replay builds no network client");
+    }
+
+    /// Every model call is reported with the model, the endpoint and digests of the exact bytes
+    /// sent and received, so cleanroomd can chain a receipt of which model said what. A replayed
+    /// answer says so.
+    #[tokio::test]
+    async fn every_model_call_is_reported_with_digests_of_what_was_sent_and_received() {
+        let dir = std::env::temp_dir().join(format!("cleanroom-llm-calls-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let mut settings = settings("https://integrate.api.nvidia.com/v1", LlmMode::Replay);
+        settings.cache_dir = dir.clone();
+        let messages = [Message::User {
+            content: "list /evidence".to_owned(),
+        }];
+        let model = settings.models.for_role(Role::Hunter).to_owned();
+        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new(&settings).expect("router").with_call_log(calls);
+        let body = router
+            .request(
+                Role::Hunter,
+                Purpose::Agent,
+                ModelRoute::Hosted,
+                &messages,
+                &[],
+            )
+            .expect("body");
+        let response: &[u8] =
+            br#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#;
+        let store = Store::new(dir.clone());
+        let slot = store.next_slot(Stream {
+            role: "hunter",
+            purpose: "agent",
+        });
+        store
+            .record(
+                slot,
+                &cache::key(&body),
+                (&body, response),
+                Duration::from_millis(5),
+            )
+            .await
+            .expect("record");
+
+        router
+            .chat(Role::Hunter, ModelRoute::Hosted, &messages, &[])
+            .await
+            .expect("replayed");
+
+        let call = reported.try_recv().expect("the call is reported");
+        assert_eq!(call.role, Role::Hunter);
+        assert_eq!(call.purpose, "agent");
+        assert_eq!(call.model, model);
+        assert_eq!(call.endpoint, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(call.request, format!("sha256:{}", cache::key(&body)));
+        assert_eq!(call.response, format!("sha256:{}", cache::key(response)));
+        assert!(call.replayed, "a replayed answer is not passed off as live");
+        assert!(reported.try_recv().is_err(), "one call, one report");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Nemotron returns its chain of thought beside the answer; the report carries it and the
+    /// reasoning-token count so cleanroomd can keep it under the call's receipt.
+    #[tokio::test]
+    async fn a_call_reports_the_reasoning_trace_and_its_token_count() {
+        let dir =
+            std::env::temp_dir().join(format!("cleanroom-llm-reasoning-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let mut settings = settings("https://integrate.api.nvidia.com/v1", LlmMode::Replay);
+        settings.cache_dir = dir.clone();
+        let messages = [Message::User {
+            content: "what happened on the share?".to_owned(),
+        }];
+        let model = settings.models.for_role(Role::Hunter).to_owned();
+        let body = request_body(&model, &messages, &[], AGENT_MAX_TOKENS).expect("body");
+        let response: &[u8] = br#"{"choices":[{"message":{"content":"ransomware","reasoning_content":"18 .locked files and a bitcoin note: encryption."},"finish_reason":"stop"}],"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":31}}}"#;
+        let store = Store::new(dir.clone());
+        let slot = store.next_slot(Stream {
+            role: "hunter",
+            purpose: "agent",
+        });
+        store
+            .record(
+                slot,
+                &cache::key(&body),
+                (&body, response),
+                Duration::from_millis(5),
+            )
+            .await
+            .expect("record");
+        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new(&settings).expect("router").with_call_log(calls);
+
+        router
+            .chat(Role::Hunter, ModelRoute::Hosted, &messages, &[])
+            .await
+            .expect("replayed");
+
+        let call = reported.try_recv().expect("the call is reported");
+        assert_eq!(
+            call.reasoning.as_deref(),
+            Some("18 .locked files and a bitcoin note: encryption.")
+        );
+        assert_eq!(call.reasoning_tokens, Some(31));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The OS sets how long each agent's Nemotron model may think: an agent step and the Lead's
+    /// turn carry the role's `reasoning_budget` from policy/reasoning.json; a specialist's answer
+    /// (thinking off) and a safety verdict carry none.
+    #[test]
+    fn requests_carry_the_roles_reasoning_budget() {
+        let router = Router::new(&settings(
+            "https://integrate.api.nvidia.com/v1",
+            LlmMode::Replay,
+        ))
+        .expect("router");
+        let budgets = crate::budget::Budgets::shipped().expect("policy");
+        let messages = [Message::User {
+            content: "list /evidence".to_owned(),
+        }];
+        let sent = |role, purpose| -> Value {
+            let bytes = router
+                .request(role, purpose, ModelRoute::Hosted, &messages, &[])
+                .expect("request");
+            serde_json::from_slice(&bytes).expect("json")
+        };
+
+        assert_eq!(
+            sent(Role::Hunter, Purpose::Agent)["reasoning_budget"],
+            budgets.for_role(Role::Hunter)
+        );
+        assert_eq!(
+            sent(Role::Lead, Purpose::Chat)["reasoning_budget"],
+            budgets.for_role(Role::Lead)
+        );
+        let answer = sent(Role::Hunter, Purpose::Chat);
+        assert!(answer.get("reasoning_budget").is_none());
+        assert_eq!(answer["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(
+            sent(Role::Hunter, Purpose::Safety)
+                .get("reasoning_budget")
+                .is_none()
+        );
     }
 }

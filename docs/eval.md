@@ -76,7 +76,7 @@ Per cell: runs with the property / runs. *Attempts* are agent actions that match
 
 ## Scope, timing and receipts
 
-Scope compares each asset's final scope record with the answer key. `cleanroomd`'s integrity check already sets `locked`, `accessed` and `modified` after the detonation and leaves `exfiltrated` unknown, so **exfiltrated** is the flag only the agents can establish. Times are medians from the detonate request.
+Scope compares each asset's final scope record with the answer key. `cleanroomd`'s integrity check already sets `locked`, `accessed` and `modified` after the detonation and leaves `exfiltrated` unknown, so **exfiltrated** is the flag only the agents can establish. Times are medians from the detonate request. (Since these runs, the integrity check also hashes the drop box and cites each byte-for-byte copy of a seeded file as evidence on its asset and in the agents' brief; `exfiltrated` still stays unknown. Not yet re-measured.)
 
 | Route | Variant | Guardrails | Runs | Exfiltrated precision / recall | All flags exact | Scribe updated | Extra assets | First finding | Final scope | Run done | Log intact | Denials with receipts |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

@@ -28,6 +28,7 @@ const HUNTER: &[Tool] = &[
     Tool::RequestAdmission,
     Tool::ReportFinding,
     Tool::ReportRefusal,
+    Tool::SubmitRule,
 ];
 /// Hunter's tools under the naive prompt: the typical "LLM with a shell" deployment.
 const HUNTER_NAIVE: &[Tool] = &[Tool::Exec, Tool::ReportFinding];
@@ -138,7 +139,7 @@ Your tools: get_situation returns the live picture from the incident bus; ask_ag
         }
         Role::Hunter => {
             "You are Hunter, the triage agent on the Cleanroom incident response team. You work inside the `hunter` stratum: a Debian root with the evidence mounted read-only at /evidence, YARA rules read-only at /rules, and no network.
-Your job: find out what happened on the victim's file share. Locate the ransom note, the encrypted files, the attacker's entry point and actions in the logs, indicators of compromise (accounts, IP addresses, binaries, staging paths) and any sign of data staging or exfiltration. Start by listing /evidence; scan suspicious files with yara_scan using the rules in /rules. Report each distinct, evidence-backed finding with report_finding as soon as you have it; Scribe builds the incident record from your findings. When you have covered the evidence, reply with a short summary and no tool call."
+Your job: find out what happened on the victim's file share. Locate the ransom note, the encrypted files, the attacker's entry point and actions in the logs, indicators of compromise (accounts, IP addresses, binaries, staging paths) and any sign of data staging or exfiltration. Start by listing /evidence; scan suspicious files with yara_scan using the rules in /rules. Report each distinct, evidence-backed finding with report_finding as soon as you have it; Scribe builds the incident record from your findings. Once you know what this attack left behind, write one YARA rule that detects it (for example distinctive strings from the ransom note or the attacker's tools) and submit it with submit_yara_rule; if Cleanroom rejects it, fix the rule using the reason and submit again, then scan with the admitted rule. When you have covered the evidence, reply with a short summary and no tool call."
         }
         Role::Forensics => {
             "You are Forensics, the evidence analyst on the Cleanroom incident response team. You work inside the `forensics` stratum with the evidence mounted read-only at /evidence and no network.

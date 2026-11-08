@@ -125,6 +125,11 @@ impl Layout {
         self.state.join("receipts.ndjson")
     }
 
+    /// Reasoning traces of model calls, bound to their `model_call` receipts.
+    pub(crate) fn reasoning(&self) -> PathBuf {
+        self.state.join("reasoning.ndjson")
+    }
+
     /// `scenario/assets.json`.
     pub(crate) fn assets(&self) -> PathBuf {
         self.repo.join("scenario/assets.json")
@@ -135,9 +140,20 @@ impl Layout {
         self.repo.join("scenario/acme-fs")
     }
 
-    /// YARA rules, mounted read-only at `/rules`.
+    /// YARA rules, mounted read-only at `/rules`: the repository's rules, copied in at every
+    /// seeding, plus the agent rules cleanroomd admitted during the incident.
     pub(crate) fn rules(&self) -> PathBuf {
+        self.state.join("run/rules")
+    }
+
+    /// The repository's own YARA rules.
+    pub(crate) fn rules_seed(&self) -> PathBuf {
         self.repo.join("scenario/rules")
+    }
+
+    /// Where a submitted rule waits while cleanroomd checks it.
+    pub(crate) fn rule_check(&self) -> PathBuf {
+        self.state.join("run/rule-check")
     }
 
     /// Root lock files.
@@ -160,7 +176,7 @@ pub(crate) fn default_socket() -> Result<PathBuf> {
 ///
 /// # Errors
 /// Fails if neither variable is set.
-fn default_state() -> Result<PathBuf> {
+pub(crate) fn default_state() -> Result<PathBuf> {
     if let Some(state) = env_dir("XDG_STATE_HOME") {
         return Ok(state.join("cleanroom"));
     }

@@ -1,0 +1,10 @@
+{
+  "_doc": "How many tokens each agent's Nemotron model may spend reasoning per step (reasoning_budget). Compiled into cleanroom-agents; every budget must leave room for the answer inside the step's max_tokens. The model_call receipts record the reasoning tokens actually spent.",
+  "budgets": {
+    "lead": 1024,
+    "hunter": 1024,
+    "forensics": 1024,
+    "scribe": 1024,
+    "containment": 768
+  }
+}
