@@ -1,0 +1,38 @@
+[
+  {
+    "asset_id": "payroll",
+    "name": "Payroll export",
+    "path": "payroll.csv",
+    "data_classes": ["pii", "financial"],
+    "record_count": 1240,
+    "texas_residents": 1180,
+    "encrypted_at_rest": false
+  },
+  {
+    "asset_id": "client-contracts",
+    "name": "Client contracts",
+    "path": "contracts/",
+    "data_classes": ["contracts", "pii"],
+    "record_count": 12,
+    "texas_residents": 8,
+    "encrypted_at_rest": false
+  },
+  {
+    "asset_id": "patient-intake",
+    "name": "Clinic patient intake",
+    "path": "patient-intake.csv",
+    "data_classes": ["phi", "pii"],
+    "record_count": 860,
+    "texas_residents": 812,
+    "encrypted_at_rest": false
+  },
+  {
+    "asset_id": "vpn-credentials",
+    "name": "VPN credentials",
+    "path": "vpn-credentials.txt",
+    "data_classes": ["credentials"],
+    "record_count": 48,
+    "texas_residents": 0,
+    "encrypted_at_rest": false
+  }
+]

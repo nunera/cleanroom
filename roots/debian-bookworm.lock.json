@@ -1,0 +1,5 @@
+{
+  "image": "docker.io/library/debian:bookworm-slim",
+  "platform": "linux/amd64",
+  "manifest_digest": "sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018"
+}

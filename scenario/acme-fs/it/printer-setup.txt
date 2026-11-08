@@ -1,0 +1,6 @@
+Adding the 2nd floor printer (ACME-PRN-02)
+------------------------------------------
+1. Settings > Printers > Add printer.
+2. Address: ipp://prn-02.acme-logistics.example/ipp/print
+3. Driver: "Generic PCL 6".
+4. Print a test page. Toner requests go to it-help@acme-logistics.example.
