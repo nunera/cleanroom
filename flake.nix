@@ -32,6 +32,9 @@
             # Scenario and debugging
             jq
             yara
+
+            # Demo session (scripts/demo.sh)
+            tmux
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           # Host nix-ld paths in LD_LIBRARY_PATH make nixpkgs cargo load a newer host libcurl and crash.

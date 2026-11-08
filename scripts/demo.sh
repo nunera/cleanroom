@@ -14,9 +14,9 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
-# Everything below needs the dev shell (cargo, bubblewrap, skopeo, umoci) and tmux.
+# Everything below needs the dev shell (cargo, bubblewrap, skopeo, umoci, tmux).
 if ! command -v bwrap >/dev/null || ! command -v tmux >/dev/null; then
-  exec nix develop "$repo" --command nix shell --inputs-from "$repo" nixpkgs#tmux --command "$0" "$@"
+  exec nix develop "$repo" --command "$0" "$@"
 fi
 
 session=cleanroom
