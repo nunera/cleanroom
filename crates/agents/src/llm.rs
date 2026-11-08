@@ -133,6 +133,8 @@ pub(crate) struct Reply {
     pub(crate) model: String,
     /// Live or replayed.
     pub(crate) origin: Origin,
+    /// `sha256:` of the request body (the record/replay cache key).
+    pub(crate) request: String,
 }
 
 /// Why a model is called; part of the replay stream name.
@@ -732,7 +734,7 @@ impl Router {
                 tracing::debug!("nobody listens for model-call records any more");
             }
         }
-        parse_reply(&raw, self.model(role, purpose, route), origin)
+        parse_reply(&raw, self.model(role, purpose, route), origin, &key)
     }
 
     /// POST with retries on 408, 429, 5xx, timeouts and transport errors.
@@ -822,7 +824,7 @@ impl Router {
 ///
 /// # Errors
 /// Fails on malformed JSON or a reply without choices.
-fn parse_reply(raw: &[u8], model: &str, origin: Origin) -> Result<Reply> {
+fn parse_reply(raw: &[u8], model: &str, origin: Origin, key: &str) -> Result<Reply> {
     let response: ChatResponse =
         serde_json::from_slice(raw).context("model endpoint returned malformed JSON")?;
     let choice = response
@@ -863,6 +865,7 @@ fn parse_reply(raw: &[u8], model: &str, origin: Origin) -> Result<Reply> {
         tool_calls,
         model: model.to_owned(),
         origin,
+        request: format!("sha256:{key}"),
     })
 }
 

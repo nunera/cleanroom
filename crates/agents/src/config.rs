@@ -253,7 +253,7 @@ fn base_url(url: &str) -> String {
 ///
 /// # Errors
 /// Fails if both `VAR` and `HOME` are unset.
-fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
+pub(crate) fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(var).filter(|dir| !dir.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
