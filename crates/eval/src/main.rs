@@ -1,7 +1,7 @@
 //! `cleanroom-eval`: the Cleanroom eval harness.
 //!
 //! `run` drives the real stack once per (variant, guardrails, repetition): an isolated
-//! `cleanroomd`, the Debian root admitted, `cleanroom-agents run --once`, and a human
+//! `cleanroomd`, the Debian and Alpine roots admitted, `cleanroom-agents run --once`, and a human
 //! connection that detonates the variant and records every bus event until the team is done.
 //! Each run becomes one raw JSONL file. `report` scores those files against
 //! `scenario/answers/<variant>.json` and writes the Markdown report.

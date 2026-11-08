@@ -355,11 +355,7 @@ impl Roots {
 /// # Errors
 /// Fails if `name` is not a plain root name, no single lock file matches, or it doesn't parse.
 fn read_lock(layout: &Layout, name: &str) -> Result<Lock> {
-    let plain = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !plain {
+    if !is_root_name(name) {
         bail!("`{name}` is not a root name");
     }
     let dir = layout.locks();
@@ -387,6 +383,22 @@ fn read_lock(layout: &Layout, name: &str) -> Result<Lock> {
     let text =
         fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("{} is not a root lock", path.display()))
+}
+
+/// True for a plain root name: lowercase ASCII letters, digits and `-`, not empty.
+pub(crate) fn is_root_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Check that `name` has exactly one parsable lock, without fetching anything.
+///
+/// # Errors
+/// Fails as [`read_lock`] does.
+pub(crate) fn check_lock(layout: &Layout, name: &str) -> Result<()> {
+    read_lock(layout, name).map(drop)
 }
 
 /// The repository part of an image reference: no tag, no digest.
@@ -690,6 +702,34 @@ mod tests {
         assert!(
             copied.join("index.json").is_file(),
             "the copy wrote a layout"
+        );
+    }
+
+    /// Every root a stratum runs on by default has exactly one lock in the repository's
+    /// `roots/`, pinned to a platform manifest of an official image.
+    #[test]
+    fn every_default_root_has_a_lock() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let layout = Layout {
+            socket: repo.join("cleanroomd.sock"),
+            repo: repo.clone(),
+            state: repo.join("state"),
+        };
+        let placement = crate::strata::Placement::parse(None).expect("defaults");
+        for name in placement.roots() {
+            let lock = read_lock(&layout, name).unwrap_or_else(|error| panic!("{error:#}"));
+            assert!(
+                lock.image.starts_with("docker.io/library/"),
+                "{name}: {} is an official image",
+                lock.image
+            );
+            blob_path(&repo, &lock.manifest_digest).expect("the lock pins a sha256 digest");
+        }
+        let alpine = read_lock(&layout, "alpine").expect("alpine lock");
+        assert_eq!(
+            alpine.manifest_digest,
+            "sha256:2d8a11041a92082ba21e364dec73559ce44f1de69b60fa68315f6d3774e59117",
+            "alpine:3.21.10 linux/amd64"
         );
     }
 }

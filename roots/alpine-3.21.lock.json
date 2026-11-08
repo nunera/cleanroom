@@ -1,0 +1,5 @@
+{
+  "image": "docker.io/library/alpine:3.21",
+  "platform": "linux/amd64",
+  "manifest_digest": "sha256:2d8a11041a92082ba21e364dec73559ce44f1de69b60fa68315f6d3774e59117"
+}

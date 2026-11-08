@@ -1,8 +1,8 @@
 //! One eval run, end to end, against the real stack.
 //!
 //! A fresh `cleanroomd` gets its own socket and state under the work directory (the OCI store
-//! is shared so the Debian image is fetched once). The harness connects as a human, admits
-//! `debian`, waits for Hunter's standing YARA grant, starts `cleanroom-agents run --once`,
+//! is shared so each image is fetched once). The harness connects as a human, admits `debian`
+//! and `alpine`, waits for Hunter's standing YARA grant, starts `cleanroom-agents run --once`,
 //! detonates the variant and records every bus event until the agents exit. It rejects every
 //! containment proposal and every tool request that waits for a commander, so no run stalls on
 //! a human. Afterwards it verifies the receipt log, hashes the evidence again and writes the
@@ -26,7 +26,7 @@ use crate::record::{self, End, Finish, Header, Llm, LogCheck, Route};
 
 /// How long the daemon may take to open its socket.
 const SOCKET_PATIENCE: Duration = Duration::from_mins(1);
-/// The first admission fetches the Debian image.
+/// The first admission of a root fetches its image.
 const ADMIT_WAIT: Duration = Duration::from_mins(15);
 /// How long to wait for Hunter's standing YARA grant.
 const YARA_PATIENCE: Duration = Duration::from_mins(5);
@@ -36,8 +36,8 @@ const ONLINE_PATIENCE: Duration = Duration::from_mins(3);
 const DETONATE_WAIT: Duration = Duration::from_mins(3);
 /// Events still arriving after the agents exit.
 const DRAIN: Duration = Duration::from_secs(2);
-/// The root every stratum runs on.
-const ROOT: &str = "debian";
+/// The roots the strata run on by default (Forensics on Alpine, the rest on Debian).
+const ROOTS: [&str; 2] = ["debian", "alpine"];
 /// The daemon's status line for a tool request that waits for a commander.
 const PENDING_TOOL: &str = "waiting for a commander's signature on ";
 
@@ -284,25 +284,28 @@ async fn drive(plan: &Plan, case: &Case, paths: &Paths) -> Result<Outcome> {
     })
 }
 
-/// Admit the Debian root.
+/// Admit every root the strata run on, before any agent needs one.
 ///
 /// # Errors
-/// Fails unless the daemon answers `admitted`.
+/// Fails unless the daemon answers `admitted` for each.
 async fn admit(link: &mut Link) -> Result<()> {
-    let request = CoreRequest::Admit {
-        root: ROOT.to_owned(),
-    };
-    match link.request(request, ADMIT_WAIT).await? {
-        CoreResponse::Admitted { .. } => Ok(()),
-        CoreResponse::AdmitRejected { layer, .. } => {
-            bail!("{ROOT} was rejected at layer {layer}")
+    for root in ROOTS {
+        let request = CoreRequest::Admit {
+            root: root.to_owned(),
+        };
+        match link.request(request, ADMIT_WAIT).await? {
+            CoreResponse::Admitted { .. } => {}
+            CoreResponse::AdmitRejected { layer, .. } => {
+                bail!("{root} was rejected at layer {layer}")
+            }
+            CoreResponse::Error { message } => bail!("admitting {root}: {message}"),
+            CoreResponse::Exec(_)
+            | CoreResponse::Tool { .. }
+            | CoreResponse::LogVerified { .. }
+            | CoreResponse::Ok => bail!("cleanroomd answered admit with something else"),
         }
-        CoreResponse::Error { message } => bail!("admitting {ROOT}: {message}"),
-        CoreResponse::Exec(_)
-        | CoreResponse::Tool { .. }
-        | CoreResponse::LogVerified { .. }
-        | CoreResponse::Ok => bail!("cleanroomd answered admit with something else"),
     }
+    Ok(())
 }
 
 /// Wait until `receipts` records Hunter's standing YARA grant; false if it never does.
