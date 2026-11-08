@@ -66,7 +66,18 @@ It flags the note as unsafe content, but its categories describe extortion, not 
 | Screenshot / image evidence (optional) | Super VL 120B-A12B | Only reachable vision model; tool calls as clean as Lightning. NVIDIA's deck lists multimodal agents under "what wins" |
 | Safety layer 1 | Safety Guard 8B v3 | Only reachable NVIDIA safety model; returns a JSON verdict |
 
-Local results are in the next section.
+Local results are in the Brev section below.
+
+## Image evidence (Super VL, Sun Nov 8)
+
+Request shape that works on the hosted endpoint: a `user` message whose `content` is a list of parts, `{"type": "text", "text": ...}` then `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`. A string `system` message and `reasoning_budget` are accepted beside it. The reply is a normal chat completion with `reasoning_content`; its `model` field reads `private/nvidia/nemotron-3.5-super-120b-a12b`.
+
+| Image | Prompt | Result | Time |
+| --- | --- | --- | --- |
+| 200x60 PNG (1,272 bytes), the text `CODE 7Q2-0451` | "Transcribe all text in this image." | `CODE 7Q2-0451`, exact | 1.8 s |
+| `LOCKSTAR-WALLPAPER.png` (1024x576, 20,302 bytes) | `view_image`'s system prompt, `reasoning_budget` 512 | Every line transcribed exactly, then a two-sentence description | 5.9 s |
+
+In a live detonation (guardrails on) Forensics called `view_image` on the wallpaper; the Super VL call spent 741 reasoning tokens, and Safety Guard flagged the transcription (a ransom demand), so Forensics read it inside the untrusted-data envelope.
 
 ## Local Nemotron on Brev (Sat ~8:00pm)
 
