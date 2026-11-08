@@ -265,16 +265,18 @@ scripts/demo.sh                       # hosted Nemotron, guardrails on
 scripts/demo.sh --guardrails off      # watch the kernel stop what the model was talked into
 scripts/demo.sh --memory-tiers        # agents page evidence in and out of their context
 scripts/demo.sh --local               # sensitive steps go to Nemotron on Brev (start deploy/brev/tunnel.sh first)
-scripts/demo.sh --replay              # replay recorded model answers, no network at all
+scripts/demo.sh --replay              # the recorded run in recordings/llm, no model network at all
 ```
 
-**3. Or just look around.** A recorded run plays back with no daemon and no network:
+The replay is the real system with only the model answers recorded: the daemon still runs every command, and the kernel still denies the wipe live. Each agent gets its recorded answers in order, so follow the beats in the order they were recorded (`scripts/demo.sh --help` lists them). `--record` makes a fresh one.
+
+**3. Or just look around.** The same run's screen plays back with no daemon and no network:
 
 ```sh
-nix develop -c cargo run --release -p cleanroom-tui -- --replay events.ndjson --speed 4
+nix develop -c cargo run --release -p cleanroom-tui -- --replay recordings/demo-events.ndjson --speed 4
 ```
 
-Record your own with `cleanroom-tui --record events.ndjson` during a live run. To leave the tmux session, press <kbd>Ctrl</kbd>+<kbd>b</kbd> and type `:kill-session`.
+Record your own screen with `cleanroom-tui --record events.ndjson` during a live run. To leave the tmux session, press <kbd>Ctrl</kbd>+<kbd>b</kbd> and type `:kill-session`.
 
 <details>
 <summary><b>Without a checkout</b></summary>
@@ -467,6 +469,7 @@ cleanroom/
 ├── plans/            declarative host plans (init choice and service graph)
 ├── policy/           egress.json and reasoning.json, compiled into the agents
 ├── deploy/brev/      Nemotron on our own Brev GPU, and the laptop tunnel
+├── recordings/       a recorded demo run: model answers for --replay, and its screen
 ├── scripts/          demo.sh, launch-tui.sh, lockstar-wallpaper.sh
 └── docs/             interfaces, eval, memory tiers, Nemotron measurements
 ```

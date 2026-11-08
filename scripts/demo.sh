@@ -4,11 +4,16 @@
 #   agents  cleanroom-agents run (the Nemotron team)
 #   tui     the command center .deb, launched from the admitted Debian root (scripts/launch-tui.sh)
 #
-#   scripts/demo.sh [--local] [--replay] [--guardrails on|off] [--memory-tiers]
+#   scripts/demo.sh [--local] [--replay | --record] [--guardrails on|off] [--memory-tiers]
 #
 #   --local         load ~/.config/cleanroom/local.env for the agents (local Nemotron on Brev;
 #                   start deploy/brev/tunnel.sh first)
-#   --replay        CLEANROOM_LLM_CACHE=replay: replay recorded model responses, no model network
+#   --replay        replay the recorded model answers in recordings/llm, no model network.
+#                   Guardrails default to off, as recorded. Follow the recorded beats in order:
+#                   t, Enter, A, Enter, d, Enter; then on F2 ask "What happened, and what should
+#                   I do first?", "What has Hunter found in the logs?", "Did anyone try to delete
+#                   the evidence?" and "@forensics did anything leave acme-fs?"; Esc, F1, a, v
+#   --record        record a fresh run into recordings/llm (the old one moves to recordings/llm.old)
 #   --guardrails    agent prompt guardrails at start (default on); g in the TUI toggles them live
 #   --memory-tiers  evidence pager: large evidence enters agent context as a handle, paged in
 #                   on demand (docs/memory-tiers.md)
@@ -25,20 +30,25 @@ session=cleanroom
 local_env=${XDG_CONFIG_HOME:-$HOME/.config}/cleanroom/local.env
 use_local=0
 replay=0
-guardrails=on
+record=0
+guardrails=
 memory_tiers=
 
 while (($#)); do
   case $1 in
     --local) use_local=1 ;;
     --replay) replay=1 ;;
+    --record) record=1 ;;
     --guardrails) guardrails=${2:?--guardrails needs on or off}; shift ;;
     --memory-tiers) memory_tiers=" --memory-tiers" ;;
-    -h | --help) sed -n '2,14s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,20s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) echo "demo: unknown flag $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
+((replay == 0 || record == 0)) || { echo "demo: --replay and --record don't mix" >&2; exit 2; }
+# A replay must run with the guardrails it was recorded with: the recording is guardrails off.
+[[ -n $guardrails ]] || { ((replay)) && guardrails=off || guardrails=on; }
 [[ $guardrails == on || $guardrails == off ]] || { echo "demo: --guardrails takes on or off" >&2; exit 2; }
 ((use_local == 0)) || [[ -r $local_env ]] || { echo "demo: --local needs $local_env" >&2; exit 1; }
 if tmux has-session -t "$session" 2>/dev/null; then
@@ -59,7 +69,12 @@ nix shell --inputs-from . \
 
 # The agents' window loads its model settings itself, so secrets never pass through tmux.
 agents="exec target/release/cleanroom-agents run --guardrails $guardrails$memory_tiers"
-((replay == 0)) || agents="export CLEANROOM_LLM_CACHE=replay; $agents"
+cache=$(printf %q "$repo/recordings/llm")
+((replay == 0)) || agents="export CLEANROOM_LLM_CACHE=replay CLEANROOM_LLM_CACHE_DIR=$cache; $agents"
+if ((record)); then
+  [[ ! -d $repo/recordings/llm ]] || { rm -rf "$repo/recordings/llm.old"; mv "$repo/recordings/llm" "$repo/recordings/llm.old"; }
+  agents="export CLEANROOM_LLM_CACHE=record CLEANROOM_LLM_CACHE_DIR=$cache; $agents"
+fi
 ((use_local == 0)) || agents="set -a; . $(printf %q "$local_env"); set +a; $agents"
 
 # Windows inherit this shell's PATH (dev shell + tmux) even when a tmux server already runs.

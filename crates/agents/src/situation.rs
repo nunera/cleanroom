@@ -89,8 +89,10 @@ pub(crate) enum Notable {
         asset: String,
         /// Flags that became yes.
         raised: Vec<&'static str>,
-        /// Flags that were yes and are no longer.
+        /// Flags that were yes and are now no.
         cleared: Vec<&'static str>,
+        /// Flags that were yes and are now unknown again.
+        doubted: Vec<&'static str>,
     },
 }
 
@@ -437,8 +439,8 @@ impl Situation {
             }
             return None;
         }
-        let (raised, cleared) = flips(previous.as_ref(), record);
-        if raised.is_empty() && cleared.is_empty() {
+        let (raised, cleared, doubted) = flips(previous.as_ref(), record);
+        if raised.is_empty() && cleared.is_empty() && doubted.is_empty() {
             return None;
         }
         Some(Notable::ScopeFlip {
@@ -446,6 +448,7 @@ impl Situation {
             asset: record.name.clone(),
             raised,
             cleared,
+            doubted,
         })
     }
 
@@ -1074,12 +1077,12 @@ fn is_baseline(record: &ScopeRecord) -> bool {
     .all(|flag| *flag == Tri::No)
 }
 
-/// Flags `record` raised to yes or cleared from yes compared with `previous`; a new asset
-/// starts unknown.
+/// Flags `record` raised to yes, cleared from yes to no, and moved from yes back to unknown,
+/// compared with `previous`; a new asset starts unknown.
 fn flips(
     previous: Option<&ScopeRecord>,
     record: &ScopeRecord,
-) -> (Vec<&'static str>, Vec<&'static str>) {
+) -> (Vec<&'static str>, Vec<&'static str>, Vec<&'static str>) {
     let (before, key_before) = previous
         .map(|previous| (previous.flags, previous.key_exposed))
         .unwrap_or_default();
@@ -1097,12 +1100,14 @@ fn flips(
         .filter(|(_, was, now)| *now == Tri::Yes && *was != Tri::Yes)
         .map(|(name, _, _)| *name)
         .collect();
-    let cleared = pairs
-        .iter()
-        .filter(|(_, was, now)| *was == Tri::Yes && *now != Tri::Yes)
-        .map(|(name, _, _)| *name)
-        .collect();
-    (raised, cleared)
+    let from_yes = |to: Tri| {
+        pairs
+            .iter()
+            .filter(|(_, was, now)| *was == Tri::Yes && *now == to)
+            .map(|(name, _, _)| *name)
+            .collect()
+    };
+    (raised, from_yes(Tri::No), from_yes(Tri::Unknown))
 }
 
 /// `1 finding`, `2 findings`.
@@ -1593,7 +1598,8 @@ mod tests {
                 by: agent(Role::Scribe),
                 asset: "payroll data".to_owned(),
                 raised: vec!["exfiltrated"],
-                cleared: vec!["modified"],
+                cleared: Vec::new(),
+                doubted: vec!["modified"],
             }),
             "Scribe's flips are notable"
         );

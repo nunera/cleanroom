@@ -114,8 +114,9 @@ impl Narrator {
                 asset,
                 raised,
                 cleared,
+                doubted,
             } => {
-                let change = scope_change(&asset, &raised, &cleared);
+                let change = scope_change(&asset, &raised, &cleared, &doubted);
                 let Some(line) = self.merge_scope(author(&by), change) else {
                     return;
                 };
@@ -308,22 +309,20 @@ fn proposals_line(actions: &[String]) -> String {
     )
 }
 
-/// One asset's flag changes: `Payroll export now exfiltrated, no longer modified`.
-fn scope_change(asset: &str, raised: &[&str], cleared: &[&str]) -> String {
-    let mut change = asset.to_owned();
+/// One asset's flag changes: `Payroll export now exfiltrated, no longer modified, accessed back
+/// to unknown`.
+fn scope_change(asset: &str, raised: &[&str], cleared: &[&str], doubted: &[&str]) -> String {
+    let mut parts = Vec::new();
     if !raised.is_empty() {
-        change.push_str(" now ");
-        change.push_str(&raised.join(" and "));
+        parts.push(format!("now {}", raised.join(" and ")));
     }
     if !cleared.is_empty() {
-        change.push_str(if raised.is_empty() {
-            " no longer "
-        } else {
-            ", no longer "
-        });
-        change.push_str(&cleared.join(" or "));
+        parts.push(format!("no longer {}", cleared.join(" or ")));
     }
-    change
+    if !doubted.is_empty() {
+        parts.push(format!("{} back to unknown", doubted.join(" and ")));
+    }
+    format!("{asset} {}", parts.join(", "))
 }
 
 /// Who changed a record, for the start of a sentence.
@@ -545,16 +544,25 @@ mod tests {
         let start = Instant::now();
         let mut narrator = Narrator::default();
         narrator.spoke(start);
-        let flip = |asset: &str, raised: Vec<&'static str>, cleared: Vec<&'static str>| {
+        let flip = |asset: &str,
+                    raised: Vec<&'static str>,
+                    cleared: Vec<&'static str>,
+                    doubted: Vec<&'static str>| {
             Notable::ScopeFlip {
                 by: Principal::Agent { role: Role::Scribe },
                 asset: asset.to_owned(),
                 raised,
                 cleared,
+                doubted,
             }
         };
         narrator.offer(
-            flip("Payroll export", vec!["exfiltrated"], vec!["modified"]),
+            flip(
+                "Payroll export",
+                vec!["exfiltrated"],
+                vec!["modified"],
+                Vec::new(),
+            ),
             start,
         );
         narrator.offer(
@@ -562,13 +570,23 @@ mod tests {
                 "Clinic patient intake",
                 vec!["exfiltrated", "accessed"],
                 Vec::new(),
+                Vec::new(),
+            ),
+            start,
+        );
+        narrator.offer(
+            flip(
+                "VPN credentials",
+                Vec::new(),
+                Vec::new(),
+                vec!["exfiltrated"],
             ),
             start,
         );
         assert_eq!(
             narrator.take(start + GAP).as_deref(),
             Some(
-                "Scribe updated the scope: Payroll export now exfiltrated, no longer modified; Clinic patient intake now exfiltrated and accessed."
+                "Scribe updated the scope: Payroll export now exfiltrated, no longer modified; Clinic patient intake now exfiltrated and accessed; VPN credentials exfiltrated back to unknown."
             ),
             "one line for Scribe's burst"
         );
