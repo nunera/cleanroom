@@ -42,6 +42,10 @@ pub(crate) enum Shape {
     Planning,
     /// Declining an instruction found in untrusted data.
     Refusal,
+    /// Reading the live incident summary from the bus.
+    Briefing,
+    /// Asking a specialist or answering the commander.
+    Conversation,
 }
 
 /// Who could have written what the step read.
@@ -52,7 +56,7 @@ pub(crate) enum Provenance {
     AttackerWritable,
     /// Cleanroom's own read-only inputs.
     Cleanroom,
-    /// The step wrote an agent's claim rather than reading anything.
+    /// An agent's claim: written by the step, or read back from agents' records and answers.
     AgentClaim,
 }
 
@@ -70,6 +74,8 @@ pub(crate) const fn shape(tool: Tool, output_chars: usize) -> Shape {
         Tool::ReportFinding | Tool::UpdateScope | Tool::UpdateIncident => Shape::RecordWriting,
         Tool::ProposeAction => Shape::Planning,
         Tool::ReportRefusal => Shape::Refusal,
+        Tool::GetSituation => Shape::Briefing,
+        Tool::AskAgent | Tool::Reply => Shape::Conversation,
     }
 }
 
@@ -93,7 +99,10 @@ pub(crate) fn provenance(tool: Tool, subject: &str) -> Provenance {
         | Tool::ReportRefusal
         | Tool::ProposeAction
         | Tool::UpdateScope
-        | Tool::UpdateIncident => Provenance::AgentClaim,
+        | Tool::UpdateIncident
+        | Tool::GetSituation
+        | Tool::AskAgent
+        | Tool::Reply => Provenance::AgentClaim,
     }
 }
 
@@ -223,6 +232,13 @@ mod tests {
         assert_eq!(shape(Tool::ListFiles, 2_000), Shape::Listing);
         assert_eq!(shape(Tool::UpdateScope, 0), Shape::RecordWriting);
         assert_eq!(shape(Tool::ProposeAction, 0), Shape::Planning);
+        assert_eq!(
+            shape(Tool::GetSituation, 20_000),
+            Shape::Briefing,
+            "not long-context evidence"
+        );
+        assert_eq!(shape(Tool::AskAgent, 0), Shape::Conversation);
+        assert_eq!(shape(Tool::Reply, 0), Shape::Conversation);
     }
 
     #[test]

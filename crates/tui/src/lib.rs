@@ -1,21 +1,27 @@
 //! Cleanroom incident command center.
 //!
 //! A ratatui console for the incident commander. It connects to `cleanroomd` over its Unix
-//! socket (see `docs/interfaces.md`), renders the incident, the scope of compromised data, the
-//! legal clocks and the agent bus purely from daemon frames, and sends signed approvals,
-//! publishes and requests back. `--replay` plays a recorded frame stream without a daemon.
+//! socket (see `docs/interfaces.md`) and renders everything purely from daemon frames: the
+//! **Cleanroom** screen (the conversation with the Lead agent, the team and the situation) and
+//! the **Controlroom** screen (pinned OS denials, legal clocks, scope, the agent trace,
+//! approvals, timeline and comms). It sends signed chat, approvals, enrollments, revocations and
+//! requests back. `--replay` plays a recorded frame stream without a daemon.
 //!
 //! [`state::State`] is the reducer and [`ui::render`] draws it; both are public so a recorded
 //! frame stream can be rendered offline.
 
+mod access;
 mod app;
 mod cli;
 mod clocks;
+mod denials;
 mod keystore;
 mod net;
 mod next;
 mod replay;
 pub mod state;
+mod team;
+mod theme;
 pub mod ui;
 
 use std::path::PathBuf;
@@ -23,6 +29,7 @@ use std::process::ExitCode;
 use std::{env, fmt, io};
 
 use clap::Parser as _;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tokio::sync::mpsc;
@@ -33,6 +40,7 @@ use crate::keystore::KeyError;
 use crate::net::Recorder;
 use crate::replay::ReplayError;
 use crate::state::State;
+use crate::theme::Colors;
 use crate::ui::View;
 
 /// Why the console could not start or had to stop.
@@ -155,6 +163,7 @@ fn start(args: Args) -> Result<(), StartError> {
 /// Fails when the key, socket, recording or terminal is unusable.
 async fn console(args: Args) -> Result<(), StartError> {
     let state = State::new(TimeZone::system());
+    let colors = Colors::from_env();
     let (inbound, frames) = mpsc::unbounded_channel();
     let app = if let Some(path) = &args.replay {
         let recording = replay::load(path)?;
@@ -163,7 +172,8 @@ async fn console(args: Args) -> Result<(), StartError> {
             .find_map(replay::stamp)
             .unwrap_or_else(Timestamp::now);
         tokio::spawn(replay::play(recording, args.speed, inbound));
-        App::replay(state, View::replay(args.speed), start, args.speed)
+        let view = View::replay(args.speed).with_colors(colors);
+        App::replay(state, view, start, args.speed)
     } else {
         let key = keystore::load_or_create(&keystore::commander_key_path()?)?;
         let socket = match args.socket {
@@ -181,13 +191,23 @@ async fn console(args: Args) -> Result<(), StartError> {
         let outbound = net::connect(&socket, &app::hello(&key), recorder, inbound)
             .await
             .map_err(|source| StartError::Connect { socket, source })?;
-        let view = View::live(args.scenarios);
+        let view = View::live(args.scenarios).with_colors(colors);
         App::live(state, view, Session::new(key, outbound), args.tamper_root)
     };
     let mut terminal = ratatui::try_init().map_err(StartError::Terminal)?;
-    let outcome = app::run(&mut terminal, app, frames).await;
+    // Bracketed paste delivers a pasted public key as one event instead of keystrokes, so a
+    // trailing newline in the clipboard cannot submit a half-filled form.
+    let pasting = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+    let outcome = match pasting {
+        Ok(()) => app::run(&mut terminal, app, frames).await,
+        Err(error) => Err(error),
+    };
+    let unpasted = crossterm::execute!(io::stdout(), DisableBracketedPaste);
     let restored = ratatui::try_restore();
-    outcome.and(restored).map_err(StartError::Terminal)
+    outcome
+        .and(unpasted)
+        .and(restored)
+        .map_err(StartError::Terminal)
 }
 
 /// `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock`.

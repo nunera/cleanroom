@@ -140,12 +140,21 @@ impl Connection {
     /// # Errors
     /// Fails if the message cannot be signed or written.
     pub(crate) async fn publish(&self, body: BusBody) -> Result<()> {
+        self.publish_to(Audience::All, body).await
+    }
+
+    /// Sign `body` with this role's key under the bus domain and publish it to `to`: one role,
+    /// the humans, or everyone.
+    ///
+    /// # Errors
+    /// Fails if the message cannot be signed or written.
+    pub(crate) async fn publish_to(&self, to: Audience, body: BusBody) -> Result<()> {
         let number = self.next_message.fetch_add(1, Ordering::Relaxed);
         let message = BusMessage {
             id: format!("{}-{}-{number}", roles::name(self.role), self.session),
             at: now(),
             from: Principal::Agent { role: self.role },
-            to: Audience::All,
+            to,
             body,
         };
         let signed = sign(&self.key, domain::BUS, message).context("cannot sign a bus message")?;

@@ -54,6 +54,13 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 
 **Tool requests:** agents send only the `request_tool` op. The daemon publishes the `tool_request` event and, when decided, the `tool_decision` event.
 
+**Conversation with the Lead agent.** `Role::Lead` is the commander's point of contact. It has no stratum and no exec. All of it rides on `chat`:
+- **Human → Lead:** `chat` from `Human` to `role: lead`. The Cleanroom screen sends every message this way.
+- **Lead → humans:** `chat` from `Agent{lead}` to `humans`. These are answers plus short narration of key events (detonation, OS block, finding, proposal waiting).
+- **Lead → specialist:** `chat` from `Agent{lead}` to `role: <hunter|forensics|scribe|containment>`, starting with the question.
+- **Specialist → Lead:** `chat` from `Agent{<role>}` to `role: lead`. A human may also message a specialist directly (`to: role: <role>`); the reply then goes to `humans`.
+- The command center renders these as a conversation and lights the Lead↔specialist link while a delegation is open.
+
 The TUI renders state from these events alone; it never reads the agents' files.
 
 ## Grants (per stratum)

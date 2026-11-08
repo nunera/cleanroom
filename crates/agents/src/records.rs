@@ -438,7 +438,7 @@ fn describe_incident(text: &mut String, record: &IncidentRecord) {
 }
 
 /// One-line description of a scope record.
-fn scope_line(record: &ScopeRecord) -> String {
+pub(crate) fn scope_line(record: &ScopeRecord) -> String {
     let classes: Vec<&str> = record
         .data_classes
         .iter()
@@ -469,7 +469,7 @@ fn scope_line(record: &ScopeRecord) -> String {
 }
 
 /// `a, b` or `none`.
-fn list_or_none(items: &[String]) -> String {
+pub(crate) fn list_or_none(items: &[String]) -> String {
     if items.is_empty() {
         "none".to_owned()
     } else {
@@ -499,7 +499,7 @@ const fn class_name(class: DataClass) -> &'static str {
 }
 
 /// Wire name of a [`Severity`].
-const fn severity_name(severity: Severity) -> &'static str {
+pub(crate) const fn severity_name(severity: Severity) -> &'static str {
     match severity {
         Severity::Low => "low",
         Severity::Moderate => "moderate",
@@ -509,7 +509,7 @@ const fn severity_name(severity: Severity) -> &'static str {
 }
 
 /// Wire name of an [`IncidentStatus`].
-const fn status_name(status: IncidentStatus) -> &'static str {
+pub(crate) const fn status_name(status: IncidentStatus) -> &'static str {
     match status {
         IncidentStatus::Detected => "detected",
         IncidentStatus::Analyzing => "analyzing",

@@ -1,4 +1,8 @@
 //! The controller: keys become signed requests and publishes; frames become state.
+//!
+//! Keys go to exactly one place. An open modal takes them first; otherwise the focus decides:
+//! with the message line focused every printable key is text (Esc leaves it), and with command
+//! focus the letters are commands. The Cleanroom screen opens with the message line focused.
 
 use std::collections::HashMap;
 use std::io;
@@ -7,7 +11,7 @@ use std::time::{Duration, Instant};
 use cleanroom_proto::sign::{self, key_id};
 use cleanroom_proto::{
     ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse, Envelope, Frame,
-    KeyId, Principal, Role, WIRE_VERSION, domain,
+    KeyId, Member, MemberRole, Principal, Revocation, Role, WIRE_VERSION, domain,
 };
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ed25519_dalek::SigningKey;
@@ -17,14 +21,20 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt as _;
 
+use crate::access::{MEMBER_ROLES, Standing};
 use crate::replay;
 use crate::state::{SentRequest, State, Tone};
-use crate::ui::{self, Link, Overlay, View};
+use crate::team;
+use crate::ui::{self, Field, Focus, Link, Overlay, Pane, Screen, View};
 
 /// Redraw often enough that second-resolution countdowns tick smoothly.
 const TICK: Duration = Duration::from_millis(250);
 /// Shown when a key would talk to cleanroomd during a replay.
 const REPLAY_ONLY: &str = "Replay: this console is playing a recording, so nothing was sent.";
+/// Conversation lines one PgUp/PgDn moves.
+const PAGE: usize = 10;
+/// Reason recorded when the commander revokes without typing one.
+const DEFAULT_REVOKE_REASON: &str = "revoked by the commander";
 
 /// Something for the controller from a background task.
 #[derive(Debug)]
@@ -51,10 +61,12 @@ impl Inbound {
     }
 }
 
-/// The first frame: this console's human principal, its key, and every audience.
+/// The first frame: this console's human principal, its key, and every audience, the Lead's
+/// included, so the whole conversation (and this console's own messages) comes back.
 pub(crate) fn hello(key: &SigningKey) -> Envelope {
     let public = key.verifying_key();
     let roles = [
+        Role::Lead,
         Role::Hunter,
         Role::Forensics,
         Role::Scribe,
@@ -76,10 +88,35 @@ pub(crate) fn hello(key: &SigningKey) -> Envelope {
     }
 }
 
+/// Who a typed message is for: `@hunter …` (or any prefix, `@h …`) goes to that agent, anything
+/// else to the Lead. Returns the role and the message without the address.
+///
+/// # Errors
+/// Names no agent, or has nothing after the address.
+pub(crate) fn address(text: &str) -> Result<(Role, &str), String> {
+    let Some(rest) = text.strip_prefix('@') else {
+        return Ok((Role::Lead, text));
+    };
+    let (name, message) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let role = team::mention(name).ok_or_else(|| {
+        format!(
+            "Nobody is called @{name}. Try @lead, @hunter, @forensics, @scribe or @containment."
+        )
+    })?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(format!(
+            "Write the message after @{}.",
+            team::title(role).to_lowercase()
+        ));
+    }
+    Ok((role, message))
+}
+
 /// The live connection: the commander key, the outbound queue and requests awaiting answers.
 #[derive(Debug)]
 pub(crate) struct Session {
-    /// Signs publishes and approvals.
+    /// Signs publishes, approvals, enrollments and revocations.
     key: SigningKey,
     /// `sha256:` of the public key.
     key_id: KeyId,
@@ -187,12 +224,30 @@ enum Key {
     Up,
     /// Arrow down.
     Down,
+    /// Arrow left.
+    Left,
+    /// Arrow right.
+    Right,
     /// Enter.
     Enter,
     /// Escape.
     Esc,
     /// Backspace.
     Backspace,
+    /// Tab.
+    Tab,
+    /// Shift+Tab.
+    BackTab,
+    /// Page up.
+    PageUp,
+    /// Page down.
+    PageDown,
+    /// End.
+    End,
+    /// F1: the Cleanroom screen.
+    F1,
+    /// F2: the Controlroom screen.
+    F2,
 }
 
 /// The console's controller.
@@ -271,7 +326,8 @@ impl App {
         }
     }
 
-    /// Fold a frame into state, and re-admit after a successful tamper.
+    /// Fold a frame into state, re-admit after a successful tamper, and clear the enroll form
+    /// once cleanroomd accepted the enrollment.
     fn on_frame(&mut self, envelope: Envelope) {
         if let Some(at) = replay::stamp(&envelope) {
             self.timebase.arrived(at);
@@ -285,24 +341,29 @@ impl App {
                 None
             }
         };
-        let readmit = if let (
-            Some(SentRequest::Tamper { root }),
+        let accepted = matches!(
+            &envelope.frame,
             Frame::Response {
                 response: CoreResponse::Ok,
                 ..
-            },
-        ) = (&sent, &envelope.frame)
-        {
-            Some(root.clone())
-        } else {
-            None
+            }
+        );
+        let readmit = match &sent {
+            Some(SentRequest::Tamper { root }) if accepted => Some(root.clone()),
+            Some(_) | None => None,
         };
+        let enrolled = accepted && matches!(sent, Some(SentRequest::Enroll { .. }));
         let now = self.timebase.now();
         self.state.apply(envelope, sent.as_ref(), now);
         self.view.selected = self
             .view
             .selected
             .min(self.state.queue.len().saturating_sub(1));
+        if enrolled {
+            self.view.access.key.clear();
+            self.view.access.name.clear();
+            self.view.access.field = Field::List;
+        }
         if let Some(root) = readmit {
             self.request(
                 CoreRequest::Admit { root: root.clone() },
@@ -315,16 +376,46 @@ impl App {
     fn on_terminal(&mut self, event: &Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(*key),
+            Event::Paste(text) => self.on_paste(text),
             Event::Key(_)
             | Event::FocusGained
             | Event::FocusLost
             | Event::Mouse(_)
-            | Event::Paste(_)
             | Event::Resize(..) => {}
         }
     }
 
-    /// Route a key press to the chat line, the open modal, or the command keys.
+    /// Pasted text goes to whatever text field has focus, one line of it.
+    fn on_paste(&mut self, text: &str) {
+        let line = text.lines().next().unwrap_or_default();
+        if let Some(field) = self.text_field() {
+            field.push_str(line);
+        }
+    }
+
+    /// The text being typed right now, if any.
+    fn text_field(&mut self) -> Option<&mut String> {
+        if self.view.admission_visible(&self.state) {
+            return None;
+        }
+        match self.view.overlay {
+            Overlay::Members => {
+                let form = &mut self.view.access;
+                if let Some(reason) = form.reason.as_mut() {
+                    return Some(reason);
+                }
+                match form.field {
+                    Field::Key => Some(&mut form.key),
+                    Field::Name => Some(&mut form.name),
+                    Field::List | Field::Role => None,
+                }
+            }
+            Overlay::None => (self.view.focus == Focus::Input).then_some(&mut self.view.draft),
+            Overlay::Help | Overlay::Detonate { .. } | Overlay::ConfirmReset => None,
+        }
+    }
+
+    /// Route a key press: modal first, then the screen switch, then the focus.
     fn on_key(&mut self, event: KeyEvent) {
         if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
             self.running = false;
@@ -333,9 +424,8 @@ impl App {
         let Some(key) = key(event.code) else {
             return;
         };
-        if self.view.chat.is_some() {
-            self.on_chat_key(key);
-        } else if key == Key::Char('q') {
+        let typing = self.view.focus == Focus::Input && self.view.overlay == Overlay::None;
+        if key == Key::Char('q') && !typing && self.view.overlay != Overlay::Members {
             self.running = false;
         } else if self.view.admission_visible(&self.state) {
             if matches!(key, Key::Enter | Key::Esc | Key::Char(' ')) {
@@ -343,7 +433,7 @@ impl App {
             }
         } else {
             match self.view.overlay {
-                Overlay::None => self.on_command_key(key),
+                Overlay::None => self.on_screen_key(key),
                 Overlay::Help => {
                     if matches!(key, Key::Esc | Key::Enter | Key::Char('?')) {
                         self.view.overlay = Overlay::None;
@@ -351,11 +441,100 @@ impl App {
                 }
                 Overlay::Detonate { cursor } => self.on_picker_key(key, cursor),
                 Overlay::ConfirmReset => self.on_confirm_key(key),
+                Overlay::Members => self.on_members_key(key),
             }
         }
     }
 
-    /// A key with no modal open.
+    /// A key with no modal open: screen switches work everywhere, the rest follows the focus.
+    fn on_screen_key(&mut self, key: Key) {
+        match key {
+            Key::Tab | Key::BackTab => self.view.show(match self.view.screen {
+                Screen::Cleanroom => Screen::Controlroom,
+                Screen::Controlroom => Screen::Cleanroom,
+            }),
+            Key::F1 => self.view.show(Screen::Cleanroom),
+            Key::F2 => self.view.show(Screen::Controlroom),
+            Key::PageUp if self.view.screen == Screen::Cleanroom => self.scroll_by(PAGE, true),
+            Key::PageDown if self.view.screen == Screen::Cleanroom => self.scroll_by(PAGE, false),
+            Key::End if self.view.screen == Screen::Cleanroom => self.view.scroll = 0,
+            Key::Char(_)
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::Enter
+            | Key::Esc
+            | Key::Backspace
+            | Key::PageUp
+            | Key::PageDown
+            | Key::End => match self.view.focus {
+                Focus::Input => self.on_input_key(key),
+                Focus::Keys => self.on_command_key(key),
+            },
+        }
+    }
+
+    /// Scroll the conversation back (`back`) or forward by `lines`.
+    fn scroll_by(&mut self, lines: usize, back: bool) {
+        let limit = self.view.scroll_limit.get();
+        self.view.scroll = if back {
+            self.view.scroll.saturating_add(lines).min(limit)
+        } else {
+            self.view.scroll.saturating_sub(lines)
+        };
+    }
+
+    /// Typing in the message line: every printable key is text.
+    fn on_input_key(&mut self, key: Key) {
+        match key {
+            Key::Char(typed) => self.view.draft.push(typed),
+            Key::Backspace => {
+                self.view.draft.pop();
+            }
+            Key::Enter => self.send_draft(),
+            Key::Esc => self.view.focus = Focus::Keys,
+            Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::Tab
+            | Key::BackTab
+            | Key::PageUp
+            | Key::PageDown
+            | Key::End
+            | Key::F1
+            | Key::F2 => {}
+        }
+    }
+
+    /// Send the draft to the Lead, or to the agent it names with `@`.
+    fn send_draft(&mut self) {
+        let text = self.view.draft.trim().to_owned();
+        if text.is_empty() {
+            if self.view.screen == Screen::Controlroom {
+                self.view.focus = Focus::Keys;
+            }
+            return;
+        }
+        match address(&text) {
+            Ok((role, message)) => {
+                let body = BusBody::Chat {
+                    text: message.to_owned(),
+                };
+                if self.publish(body, Audience::Role { role }) {
+                    self.view.draft.clear();
+                    self.view.scroll = 0;
+                    if self.view.screen == Screen::Controlroom {
+                        self.view.focus = Focus::Keys;
+                    }
+                }
+            }
+            Err(problem) => self.state.notify(Tone::Warn, problem),
+        }
+    }
+
+    /// A command key, with the message line unfocused.
     fn on_command_key(&mut self, key: Key) {
         match key {
             Key::Char('?') => self.view.overlay = Overlay::Help,
@@ -378,47 +557,70 @@ impl App {
             }
             Key::Char('a') => self.decide(true),
             Key::Char('x') => self.decide(false),
-            Key::Char('g') => self.publish(BusBody::AgentControl {
-                guardrails: !self.state.guardrails,
-            }),
+            Key::Char('g') => {
+                let body = BusBody::AgentControl {
+                    guardrails: !self.state.guardrails,
+                };
+                self.publish(body, Audience::All);
+            }
             Key::Char('i') => self.investigate(),
             Key::Char('v') => self.request(CoreRequest::VerifyLog, SentRequest::VerifyLog),
             Key::Char('r') => self.view.overlay = Overlay::ConfirmReset,
-            Key::Char('c' | '/') => self.view.chat = Some(String::new()),
-            Key::Up | Key::Char('k') => self.view.selected = self.view.selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => {
-                let last = self.state.queue.len().saturating_sub(1);
-                self.view.selected = (self.view.selected + 1).min(last);
+            Key::Char('m') => self.open_members(),
+            Key::Char('c' | '/') => self.view.focus = Focus::Input,
+            Key::Up | Key::Char('k') => self.select(true),
+            Key::Down | Key::Char('j') => self.select(false),
+            Key::Left | Key::Right if self.view.screen == Screen::Controlroom => {
+                self.view.pane = match self.view.pane {
+                    Pane::Approvals => Pane::Trace,
+                    Pane::Trace => Pane::Approvals,
+                };
             }
-            Key::Char(_) | Key::Enter | Key::Esc | Key::Backspace => {}
+            Key::Enter => match (self.view.screen, self.view.pane) {
+                (Screen::Cleanroom, _) => self.view.focus = Focus::Input,
+                (Screen::Controlroom, Pane::Trace) => {
+                    self.view.trace = match self.view.trace {
+                        Some(_) => None,
+                        None => self.state.activity.len().checked_sub(1),
+                    };
+                }
+                (Screen::Controlroom, Pane::Approvals) => {}
+            },
+            Key::Esc => self.view.trace = None,
+            Key::Char(_)
+            | Key::Left
+            | Key::Right
+            | Key::Backspace
+            | Key::Tab
+            | Key::BackTab
+            | Key::PageUp
+            | Key::PageDown
+            | Key::End
+            | Key::F1
+            | Key::F2 => {}
         }
     }
 
-    /// Typing a chat message.
-    fn on_chat_key(&mut self, key: Key) {
-        match key {
-            Key::Char(typed) => {
-                if let Some(text) = self.view.chat.as_mut() {
-                    text.push(typed);
-                }
-            }
-            Key::Backspace => {
-                if let Some(text) = self.view.chat.as_mut() {
-                    text.pop();
-                }
-            }
-            Key::Esc => self.view.chat = None,
-            Key::Enter => {
-                let text = self.view.chat.take().unwrap_or_default();
-                let text = text.trim();
-                if !text.is_empty() {
-                    self.publish(BusBody::Chat {
-                        text: text.to_owned(),
-                    });
-                }
-            }
-            Key::Up | Key::Down => {}
+    /// Move the selection up (`up`) or down: approvals, or a trace step in the Controlroom's
+    /// trace pane. Stepping down past the newest step follows the trace again.
+    fn select(&mut self, up: bool) {
+        if self.view.screen == Screen::Controlroom && self.view.pane == Pane::Trace {
+            let last = self.state.activity.len().checked_sub(1);
+            self.view.trace = match (self.view.trace, up) {
+                (None, true) => last,
+                (None, false) => None,
+                (Some(index), true) => Some(index.saturating_sub(1)),
+                (Some(index), false) if Some(index) >= last => None,
+                (Some(index), false) => Some(index + 1),
+            };
+            return;
         }
+        let last = self.state.queue.len().saturating_sub(1);
+        self.view.selected = if up {
+            self.view.selected.saturating_sub(1)
+        } else {
+            (self.view.selected + 1).min(last)
+        };
     }
 
     /// The scenario picker.
@@ -447,7 +649,17 @@ impl App {
                 }
             }
             Key::Esc => self.view.overlay = Overlay::None,
-            Key::Char(_) | Key::Backspace => {}
+            Key::Char(_)
+            | Key::Left
+            | Key::Right
+            | Key::Backspace
+            | Key::Tab
+            | Key::BackTab
+            | Key::PageUp
+            | Key::PageDown
+            | Key::End
+            | Key::F1
+            | Key::F2 => {}
         }
     }
 
@@ -459,7 +671,19 @@ impl App {
                 self.request(CoreRequest::Reset, SentRequest::Reset);
             }
             Key::Char('n' | 'N') | Key::Esc => self.view.overlay = Overlay::None,
-            Key::Char(_) | Key::Up | Key::Down | Key::Backspace => {}
+            Key::Char(_)
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::Backspace
+            | Key::Tab
+            | Key::BackTab
+            | Key::PageUp
+            | Key::PageDown
+            | Key::End
+            | Key::F1
+            | Key::F2 => {}
         }
     }
 
@@ -472,6 +696,225 @@ impl App {
                 .notify(Tone::Warn, "No scenarios configured; pass --scenario NAME.");
         } else {
             self.view.overlay = Overlay::Detonate { cursor: 0 };
+        }
+    }
+
+    /// Open access control with the member list focused.
+    fn open_members(&mut self) {
+        let rows = ui::listed_members(&self.state).len();
+        let form = &mut self.view.access;
+        form.field = Field::List;
+        form.reason = None;
+        form.selected = form.selected.min(rows);
+        self.view.overlay = Overlay::Members;
+    }
+
+    /// A key in the access-control overlay.
+    fn on_members_key(&mut self, key: Key) {
+        if let Some(reason) = self.view.access.reason.as_mut() {
+            match key {
+                Key::Char(typed) => reason.push(typed),
+                Key::Backspace => {
+                    reason.pop();
+                }
+                Key::Enter => self.revoke_selected(),
+                Key::Esc => self.view.access.reason = None,
+                Key::Up
+                | Key::Down
+                | Key::Left
+                | Key::Right
+                | Key::Tab
+                | Key::BackTab
+                | Key::PageUp
+                | Key::PageDown
+                | Key::End
+                | Key::F1
+                | Key::F2 => {}
+            }
+            return;
+        }
+        let field = self.view.access.field;
+        match (field, key) {
+            (_, Key::Esc) => self.view.overlay = Overlay::None,
+            (_, Key::Tab) | (Field::Key | Field::Name | Field::Role, Key::Down) => {
+                self.view.access.field = next_field(field, true);
+            }
+            (_, Key::BackTab) | (Field::Key | Field::Name | Field::Role, Key::Up) => {
+                self.view.access.field = next_field(field, false);
+            }
+            (Field::List, Key::Up | Key::Char('k')) => {
+                self.view.access.selected = self.view.access.selected.saturating_sub(1);
+            }
+            (Field::List, Key::Down | Key::Char('j')) => {
+                let rows = ui::listed_members(&self.state).len();
+                self.view.access.selected = (self.view.access.selected + 1).min(rows);
+            }
+            (Field::List, Key::Enter) => self.copy_member(),
+            (Field::List, Key::Char('r')) => self.ask_revoke_reason(),
+            (Field::Key, Key::Char(typed)) if !typed.is_whitespace() => {
+                self.view.access.key.push(typed);
+            }
+            (Field::Name, Key::Char(typed)) => self.view.access.name.push(typed),
+            (Field::Key, Key::Backspace) => {
+                self.view.access.key.pop();
+            }
+            (Field::Name, Key::Backspace) => {
+                self.view.access.name.pop();
+            }
+            (Field::Role, Key::Left | Key::Right | Key::Char(' ')) => {
+                self.view.access.role = cycle_role(self.view.access.role, key != Key::Left);
+            }
+            (Field::Key | Field::Name | Field::Role, Key::Enter) => self.enroll(),
+            (
+                Field::List | Field::Key | Field::Name | Field::Role,
+                Key::Char(_)
+                | Key::Left
+                | Key::Right
+                | Key::Backspace
+                | Key::PageUp
+                | Key::PageDown
+                | Key::End
+                | Key::F1
+                | Key::F2,
+            ) => {}
+        }
+    }
+
+    /// Copy the selected row into the enroll form: this console's own key, or a member this
+    /// console enrolled (to enroll a revoked key again).
+    fn copy_member(&mut self) {
+        let mine = self
+            .session
+            .as_ref()
+            .map(|session| hex::encode(session.key.verifying_key().as_bytes()));
+        let chosen = ui::selected_member(&self.state, &self.view.access).cloned();
+        let nobody_enrolled = self
+            .state
+            .roster
+            .all()
+            .iter()
+            .all(|member| member.standing == Standing::Revoked);
+        let form = &mut self.view.access;
+        let public_key = if form.selected == 0 {
+            if nobody_enrolled {
+                form.role = MemberRole::Admin;
+            }
+            mine
+        } else {
+            chosen.as_ref().and_then(|member| member.public_key.clone())
+        };
+        let Some(public_key) = public_key else {
+            self.state.notify(
+                Tone::Warn,
+                "Only keys this console enrolled can be copied; paste the member's public key.",
+            );
+            return;
+        };
+        form.key = public_key;
+        if let Some(member) = chosen {
+            form.name = member.name.unwrap_or_default();
+            form.role = member.role.unwrap_or(form.role);
+        }
+        form.field = if form.name.is_empty() {
+            Field::Name
+        } else {
+            Field::Role
+        };
+    }
+
+    /// Open the revoke prompt for the selected member, if it is enrolled.
+    fn ask_revoke_reason(&mut self) {
+        match ui::selected_member(&self.state, &self.view.access) {
+            Some(member) if member.standing == Standing::Enrolled => {
+                self.view.access.reason = Some(String::new());
+            }
+            Some(_) => self
+                .state
+                .notify(Tone::Quiet, "That key is already revoked."),
+            None => self.state.notify(
+                Tone::Warn,
+                "Nothing to revoke: this console has not seen that key enrolled.",
+            ),
+        }
+    }
+
+    /// Sign an enrollment of the form's key, name and role, and send it.
+    fn enroll(&mut self) {
+        let public_key = self.view.access.key.trim().to_lowercase();
+        let name = self.view.access.name.trim().to_owned();
+        let role = self.view.access.role;
+        let public = match sign::verifying_key_from_hex(&public_key) {
+            Ok(public) => public,
+            Err(error) => {
+                self.state.notify(
+                    Tone::Warn,
+                    format!("Paste the member's Ed25519 public key as 64 hex digits ({error})."),
+                );
+                self.view.access.field = Field::Key;
+                return;
+            }
+        };
+        if name.is_empty() {
+            self.state.notify(Tone::Warn, "Give the member a name.");
+            self.view.access.field = Field::Name;
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.state.notify(Tone::Warn, REPLAY_ONLY);
+            return;
+        };
+        let member = Member {
+            key_id: key_id(&public),
+            public_key: public_key.clone(),
+            name: name.clone(),
+            role,
+            enrolled_at: now_text(),
+        };
+        let key_id = member.key_id.clone();
+        match sign::sign(&session.key, domain::ENROLL, member) {
+            Ok(signed) => self.request(
+                CoreRequest::Enroll(signed),
+                SentRequest::Enroll {
+                    key_id,
+                    public_key,
+                    name,
+                    role,
+                },
+            ),
+            Err(error) => self
+                .state
+                .notify(Tone::Bad, format!("Could not sign the enrollment: {error}")),
+        }
+    }
+
+    /// Sign a revocation of the selected member with the typed reason, and send it.
+    fn revoke_selected(&mut self) {
+        let typed = self.view.access.reason.take().unwrap_or_default();
+        let reason = match typed.trim() {
+            "" => DEFAULT_REVOKE_REASON.to_owned(),
+            typed => typed.to_owned(),
+        };
+        let Some(member) = ui::selected_member(&self.state, &self.view.access) else {
+            return;
+        };
+        let (key_id, name) = (member.key_id.clone(), member.name.clone());
+        let Some(session) = &self.session else {
+            self.state.notify(Tone::Warn, REPLAY_ONLY);
+            return;
+        };
+        let revocation = Revocation {
+            key_id: key_id.clone(),
+            reason,
+            revoked_at: now_text(),
+        };
+        match sign::sign(&session.key, domain::REVOKE, revocation) {
+            Ok(signed) => self.request(
+                CoreRequest::Revoke(signed),
+                SentRequest::Revoke { key_id, name },
+            ),
+            Err(error) => self
+                .state
+                .notify(Tone::Bad, format!("Could not sign the revocation: {error}")),
         }
     }
 
@@ -528,7 +971,7 @@ impl App {
             incident.summary.clone()
         };
         let incident_id = incident.id.clone();
-        self.publish(BusBody::Investigate { incident_id, brief });
+        self.publish(BusBody::Investigate { incident_id, brief }, Audience::All);
     }
 
     /// Send a daemon request and remember it until its response arrives.
@@ -558,16 +1001,17 @@ impl App {
         }
     }
 
-    /// Sign and publish a bus message from the commander. It shows up when cleanroomd echoes it.
-    fn publish(&mut self, body: BusBody) {
+    /// Sign and publish a bus message from the commander to `to`; true when it was queued. It
+    /// shows up when cleanroomd echoes it.
+    fn publish(&mut self, body: BusBody, to: Audience) -> bool {
         if !self.view.connected() {
             self.state
                 .notify(Tone::Bad, "Not connected to cleanroomd; nothing was sent.");
-            return;
+            return false;
         }
         let Some(session) = self.session.as_mut() else {
             self.state.notify(Tone::Warn, REPLAY_ONLY);
-            return;
+            return false;
         };
         let message = BusMessage {
             id: session.message_id(),
@@ -575,22 +1019,51 @@ impl App {
             from: Principal::Human {
                 key_id: session.key_id.clone(),
             },
-            to: Audience::All,
+            to,
             body,
         };
         match sign::sign(&session.key, domain::BUS, message) {
             Ok(signed) => {
-                if !session.send(Frame::Publish(signed)) {
-                    self.view.link = Link::Live {
-                        down: Some("the connection writer stopped".to_owned()),
-                    };
+                if session.send(Frame::Publish(signed)) {
+                    return true;
                 }
+                self.view.link = Link::Live {
+                    down: Some("the connection writer stopped".to_owned()),
+                };
+                false
             }
-            Err(error) => self
-                .state
-                .notify(Tone::Bad, format!("Could not sign the message: {error}")),
+            Err(error) => {
+                self.state
+                    .notify(Tone::Bad, format!("Could not sign the message: {error}"));
+                false
+            }
         }
     }
+}
+
+/// The next (`forward`) or previous part of the access-control overlay.
+const fn next_field(field: Field, forward: bool) -> Field {
+    match (field, forward) {
+        (Field::List, true) | (Field::Name, false) => Field::Key,
+        (Field::Key, true) | (Field::Role, false) => Field::Name,
+        (Field::Name, true) | (Field::List, false) => Field::Role,
+        (Field::Role, true) | (Field::Key, false) => Field::List,
+    }
+}
+
+/// The next (`forward`) or previous member role.
+fn cycle_role(role: MemberRole, forward: bool) -> MemberRole {
+    let index = MEMBER_ROLES
+        .iter()
+        .position(|candidate| *candidate == role)
+        .unwrap_or(0);
+    let count = MEMBER_ROLES.len();
+    let next = if forward {
+        (index + 1) % count
+    } else {
+        (index + count - 1) % count
+    };
+    MEMBER_ROLES.get(next).copied().unwrap_or(role)
 }
 
 /// Map a crossterm key code to a [`Key`]; every other key does nothing in this console.
@@ -604,9 +1077,18 @@ const fn key(code: KeyCode) -> Option<Key> {
         KeyCode::Char(typed) => Some(Key::Char(typed)),
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
+        KeyCode::Left => Some(Key::Left),
+        KeyCode::Right => Some(Key::Right),
         KeyCode::Enter => Some(Key::Enter),
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Backspace => Some(Key::Backspace),
+        KeyCode::Tab => Some(Key::Tab),
+        KeyCode::BackTab => Some(Key::BackTab),
+        KeyCode::PageUp => Some(Key::PageUp),
+        KeyCode::PageDown => Some(Key::PageDown),
+        KeyCode::End => Some(Key::End),
+        KeyCode::F(1) => Some(Key::F1),
+        KeyCode::F(2) => Some(Key::F2),
         _ => None,
     }
 }
@@ -653,4 +1135,165 @@ pub(crate) async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use cleanroom_proto::{Signed, sign::generate_key};
+    use jiff::tz::TimeZone;
+    use tokio::sync::mpsc::{self, UnboundedReceiver};
+
+    use super::*;
+
+    /// A live console on a test channel, with Containment's proposal waiting for a signature.
+    fn console() -> (App, UnboundedReceiver<Envelope>) {
+        let (outbound, sent) = mpsc::unbounded_channel();
+        let key = generate_key().expect("test randomness");
+        let session = Session::new(key, outbound);
+        let mut app = App::live(
+            State::new(TimeZone::UTC),
+            View::live(vec!["ransomware".to_owned()]),
+            session,
+            "debian".to_owned(),
+        );
+        let proposal = BusMessage {
+            id: "m1".to_owned(),
+            at: "2026-11-08T04:40:00Z".to_owned(),
+            from: Principal::Agent {
+                role: Role::Containment,
+            },
+            to: Audience::All,
+            body: BusBody::Proposal {
+                proposal_id: "INC-7-proposal-1".to_owned(),
+                action: "isolate host acme-fs".to_owned(),
+                rationale: "ransomware on the share".to_owned(),
+            },
+        };
+        app.on_frame(Envelope {
+            v: WIRE_VERSION,
+            frame: Frame::Event(Signed {
+                domain: domain::BUS.to_owned(),
+                body: proposal,
+                signer: "sha256:00".to_owned(),
+                sig: "00".to_owned(),
+            }),
+        });
+        (app, sent)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for typed in text.chars() {
+            press(app, KeyCode::Char(typed));
+        }
+    }
+
+    /// Every frame the console queued so far.
+    fn drain(sent: &mut UnboundedReceiver<Envelope>) -> Vec<Frame> {
+        std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|envelope| envelope.frame)
+            .collect()
+    }
+
+    #[test]
+    fn typing_in_the_message_line_never_fires_a_command() {
+        let (mut app, mut sent) = console();
+        assert_eq!(
+            app.view.focus,
+            Focus::Input,
+            "Cleanroom opens on the message line"
+        );
+
+        type_text(&mut app, "approve? x d q");
+        assert!(
+            drain(&mut sent).is_empty(),
+            "no approval, detonation or quit"
+        );
+        assert!(app.running, "q was text");
+        assert_eq!(app.view.draft, "approve? x d q");
+
+        press(&mut app, KeyCode::Enter);
+        let frames = drain(&mut sent);
+        let [Frame::Publish(signed)] = frames.as_slice() else {
+            panic!("one publish, got {frames:?}");
+        };
+        assert_eq!(signed.body.to, Audience::Role { role: Role::Lead });
+        assert_eq!(
+            signed.body.body,
+            BusBody::Chat {
+                text: "approve? x d q".to_owned()
+            }
+        );
+        assert!(app.view.draft.is_empty(), "the line clears once sent");
+    }
+
+    #[test]
+    fn esc_leaves_the_line_and_the_keys_command_again() {
+        let (mut app, mut sent) = console();
+        type_text(&mut app, "draft");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view.focus, Focus::Keys);
+
+        press(&mut app, KeyCode::Char('a'));
+        let frames = drain(&mut sent);
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [Frame::Request {
+                    request: CoreRequest::Approve(_),
+                    ..
+                }]
+            ),
+            "a approves the waiting proposal: {frames:?}"
+        );
+        assert_eq!(app.view.draft, "draft", "the draft waits for the commander");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view.focus, Focus::Input, "Enter returns to the line");
+    }
+
+    #[test]
+    fn an_at_name_goes_to_that_specialist_and_a_typo_goes_nowhere() {
+        let (mut app, mut sent) = console();
+        type_text(&mut app, "@hunter what did the note ask for?");
+        press(&mut app, KeyCode::Enter);
+        let frames = drain(&mut sent);
+        let [Frame::Publish(signed)] = frames.as_slice() else {
+            panic!("one publish, got {frames:?}");
+        };
+        assert_eq!(signed.body.to, Audience::Role { role: Role::Hunter });
+        assert_eq!(
+            signed.body.body,
+            BusBody::Chat {
+                text: "what did the note ask for?".to_owned()
+            }
+        );
+
+        type_text(&mut app, "@zed hello");
+        press(&mut app, KeyCode::Enter);
+        assert!(drain(&mut sent).is_empty(), "nobody is called zed");
+        assert_eq!(app.view.draft, "@zed hello", "the draft is kept to fix");
+    }
+
+    #[test]
+    fn tab_switches_screens_from_either_focus() {
+        let (mut app, _sent) = console();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            (app.view.screen, app.view.focus),
+            (Screen::Controlroom, Focus::Keys)
+        );
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.view.focus, Focus::Input, "c opens the chat line");
+        type_text(&mut app, "t");
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(
+            (app.view.screen, app.view.focus),
+            (Screen::Cleanroom, Focus::Input)
+        );
+        assert_eq!(app.view.draft, "t", "t was typed, not a tamper");
+    }
 }

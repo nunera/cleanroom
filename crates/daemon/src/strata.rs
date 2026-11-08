@@ -80,6 +80,7 @@ pub(crate) const fn stratum_of(role: Role) -> &'static str {
         Role::Forensics => "forensics",
         Role::Scribe => "scribe",
         Role::Containment => "containment",
+        Role::Lead => "lead",
     }
 }
 
@@ -93,6 +94,7 @@ pub(crate) fn refusal(role: Role, stratum: &str) -> Option<String> {
         Role::Containment => {
             Some("containment has no exec: it has no root and can only propose actions".to_owned())
         }
+        Role::Lead => Some("lead has no exec: it only talks to humans and other agents".to_owned()),
         Role::Hunter | Role::Forensics if stratum != stratum_of(role) => Some(format!(
             "{} may only run commands in the {} stratum, not {stratum}",
             stratum_of(role),

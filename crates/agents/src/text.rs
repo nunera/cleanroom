@@ -1,6 +1,6 @@
-//! Text helpers for trace previews and model-bound output.
+//! Text helpers for trace previews, model-bound output and receipt citations.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 
 /// One-line preview: whitespace collapsed to single spaces, at most `max_chars` characters,
 /// with `…` when something was cut.
@@ -38,4 +38,22 @@ pub(crate) fn clip(mut text: String, max_chars: usize) -> String {
         }
     }
     text
+}
+
+/// Append formatted text to `text`. Writing to a `String` cannot fail.
+pub(crate) fn append(text: &mut String, args: fmt::Arguments<'_>) {
+    if let Err(error) = text.write_fmt(args) {
+        tracing::debug!(%error, "cannot format text");
+    }
+}
+
+/// Cite the receipt of a denied command at the end of a trace preview: ` (receipt #42)`.
+pub(crate) fn cite_receipt(text: &mut String, seq: u64) {
+    append(text, format_args!(" (receipt #{seq})"));
+}
+
+/// The receipt a preview cites with [`cite_receipt`].
+pub(crate) fn cited_receipt(text: &str) -> Option<u64> {
+    let (_, cited) = text.rsplit_once("(receipt #")?;
+    cited.split(')').next()?.parse().ok()
 }

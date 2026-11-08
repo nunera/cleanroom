@@ -1,6 +1,7 @@
-//! The egress policy, `policy/egress.json`: deny by default; the model router may reach only
-//! the declared model endpoints. It is compiled into this binary, so swapping a file at run time
-//! cannot widen it.
+//! The egress policy, `policy/egress.json`, compiled into this binary.
+//!
+//! Deny by default: the model router may reach only the declared model endpoints. Being compiled
+//! in, the policy cannot be widened by swapping a file at run time.
 //!
 //! Agent strata get no network at all (cleanroomd gives every stratum an empty network
 //! namespace), and in replay mode the router builds no network client, so this policy is the

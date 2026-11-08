@@ -4,7 +4,8 @@
 //! `investigate` bus event, and drives Hunter, Forensics, Scribe and Containment through
 //! tool-calling loops against Nemotron. Every tool runs in the role's stratum through the
 //! daemon, every publish is signed with the role's key, and every evidence-bearing tool output
-//! passes the sensitivity router and the safety model before a model sees it.
+//! passes the sensitivity router and the safety model before a model sees it. The Lead talks
+//! with the commander: it narrates key events, answers questions and asks the specialists.
 #![allow(
     clippy::redundant_pub_crate,
     reason = "binary crate: the strict profile denies rustc's `unreachable_pub`, which requires \
@@ -19,13 +20,16 @@ mod daemon;
 mod dataset;
 mod egress;
 mod keys;
+mod lead;
 mod llm;
+mod narration;
 mod records;
 mod repair;
 mod roles;
 mod safety;
 mod schema;
 mod sensitivity;
+mod situation;
 mod team;
 mod text;
 mod tools;

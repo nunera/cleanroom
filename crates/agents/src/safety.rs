@@ -15,7 +15,9 @@ pub(crate) struct Verdict {
     pub(crate) categories: Vec<String>,
 }
 
-/// Parse a safety model's reply. Safety Guard 8B v3 answers with JSON,
+/// Parse a safety model's reply.
+///
+/// Safety Guard 8B v3 answers with JSON,
 /// `{"User Safety": "unsafe", "Safety Categories": "Criminal Planning/Confessions, Fraud/Deception"}`;
 /// Content Safety 3.5 answers with lines, `User Safety: unsafe` / `Safety Categories: Illegal Activity`.
 ///
