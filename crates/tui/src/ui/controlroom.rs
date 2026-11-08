@@ -68,7 +68,7 @@ pub(super) fn render(
     ])
     .areas(lower);
     let [trace, talk] =
-        Layout::vertical([Constraint::Percentage(42), Constraint::Fill(1)]).areas(work);
+        Layout::vertical([Constraint::Percentage(55), Constraint::Fill(1)]).areas(work);
     render_trace(frame, trace, state, view);
     render_conversation(frame, talk, state, view, now);
     if side > 0 {

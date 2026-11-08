@@ -67,35 +67,9 @@ const ROLE_SLOT: u8 = 17;
 /// Number of slots.
 const SLOTS: usize = 22;
 
-/// The banner sky while something waits for a signature: amber in every theme.
-pub(crate) const SKY_WAITING: [Color; 6] = [
-    Color::Rgb(26, 18, 8),
-    Color::Rgb(46, 30, 10),
-    Color::Rgb(72, 46, 12),
-    Color::Rgb(104, 66, 14),
-    Color::Rgb(140, 90, 18),
-    Color::Rgb(178, 118, 26),
-];
-
-/// The banner sky after a breach: red in every theme.
-pub(crate) const SKY_BREACH: [Color; 6] = [
-    Color::Rgb(30, 6, 10),
-    Color::Rgb(56, 9, 14),
-    Color::Rgb(86, 13, 18),
-    Color::Rgb(118, 18, 22),
-    Color::Rgb(152, 26, 26),
-    Color::Rgb(186, 40, 30),
-];
-
-/// The banner sky after a breach with something waiting: red into an amber horizon.
-pub(crate) const SKY_BREACH_WAITING: [Color; 6] = [
-    Color::Rgb(30, 6, 10),
-    Color::Rgb(62, 10, 14),
-    Color::Rgb(100, 16, 18),
-    Color::Rgb(140, 34, 20),
-    Color::Rgb(176, 70, 22),
-    Color::Rgb(204, 112, 30),
-];
+/// How much of the alarm color tints each banner row, top to horizon (out of 256): a hint that
+/// gathers at the horizon, so the sky stays the theme's own.
+const ALARM_HINT: [u16; 6] = [0, 6, 12, 22, 36, 56];
 
 /// Glyph that stands for a role everywhere on screen.
 pub(crate) const fn glyph(role: Role) -> &'static str {
@@ -252,6 +226,17 @@ impl Theme {
     /// The color slot `color` stands for in this theme; real colors pass through.
     pub(crate) fn rgb(&self, color: Color) -> Color {
         lookup(&self.slots(), color)
+    }
+
+    /// The banner's sky under an alarm of `color` (red for a breach, amber while waiting): this
+    /// theme's clean sky with a hint of the alarm toward the horizon.
+    pub(crate) fn alarm_sky(&self, color: Color) -> [Color; 6] {
+        let alarm = self.rgb(color);
+        let mut sky = self.sky;
+        for (row, amount) in sky.iter_mut().zip(ALARM_HINT) {
+            *row = blend(*row, alarm, amount);
+        }
+        sky
     }
 
     /// Every slot's color, by slot number.

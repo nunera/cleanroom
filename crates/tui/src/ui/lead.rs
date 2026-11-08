@@ -712,10 +712,21 @@ pub(super) fn agent_card(
     top.extend(status_spans.into_iter().map(|span| on(card, span)));
     top.push(spaces(1, card));
     let blocked = status == Status::Blocked;
-    let last = desk.last.as_deref().unwrap_or(match role {
-        Role::Lead => "waiting for your question",
-        Role::Hunter | Role::Forensics | Role::Scribe | Role::Containment => "no activity yet",
-    });
+    let denied = state
+        .denials
+        .all()
+        .iter()
+        .rev()
+        .find(|denial| denial.role == Some(role))
+        .map(|denial| format!("✖ {} · {}", denial.command, denial.short_reason()));
+    let last = match (blocked, denied.as_deref(), desk.last.as_deref()) {
+        (true, Some(command), _) => command,
+        (_, _, Some(last)) => last,
+        (_, _, None) => match role {
+            Role::Lead => "waiting for your question",
+            Role::Hunter | Role::Forensics | Role::Scribe | Role::Containment => "no activity yet",
+        },
+    };
     let last = fit(last, width.saturating_sub(5));
     let last_color = if blocked {
         RED

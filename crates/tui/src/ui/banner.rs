@@ -15,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::state::{State, compromised};
-use crate::theme::{INK, RED, SKY_BREACH, SKY_BREACH_WAITING, SKY_WAITING, Theme};
+use crate::theme::{AMBER, INK, RED, Theme};
 
 /// Banner height in rows.
 pub(super) const HEIGHT: u16 = 6;
@@ -45,14 +45,13 @@ impl Sky {
         }
     }
 
-    /// One background per row, top to bottom: the theme's clean sky, or the shared amber and red
-    /// skies that mean the same thing in every theme.
-    pub(super) const fn gradient(self, theme: &Theme) -> [Color; 6] {
+    /// One background per row, top to bottom: the theme's sky, with a hint of amber toward the
+    /// horizon while waiting and of red after a breach.
+    pub(super) fn gradient(self, theme: &Theme) -> [Color; 6] {
         match self {
             Self::Calm => theme.sky,
-            Self::Waiting => SKY_WAITING,
-            Self::Breach => SKY_BREACH,
-            Self::BreachWaiting => SKY_BREACH_WAITING,
+            Self::Waiting => theme.alarm_sky(AMBER),
+            Self::Breach | Self::BreachWaiting => theme.alarm_sky(RED),
         }
     }
 }
@@ -113,8 +112,9 @@ const SCENE: [(Picture, (usize, usize)); 6] = [
 /// The ground along the bottom row, repeated.
 const HORIZON: [char; 12] = ['▁', '▁', '▂', '▁', '▁', '▁', '▃', '▂', '▁', '▁', '▂', '▁'];
 
-/// Draw the banner for `sky` into `area` (six rows). With a `clock` it moves: the drones drift on
-/// patrol, the radar sweeps, and on a breach the beacon on the mast blinks red.
+/// Draw the banner for `sky` into `area` (six rows): the theme's sky in every state. A breach
+/// lights the beacon on the mast and the horizon red; a signature waiting lights them amber. With
+/// a `clock` it moves: the drones drift on patrol, the radar sweeps and the beacon blinks.
 pub(super) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -161,21 +161,31 @@ pub(super) fn render(
             *cell = beam.get(frame_index).copied().unwrap_or('─');
         }
     }
+    let alarm = match sky {
+        Sky::Calm => None,
+        Sky::Waiting => Some(AMBER),
+        Sky::Breach | Sky::BreachWaiting => Some(RED),
+    };
+    let last = grid.len().saturating_sub(1);
     let lines: Vec<Line<'static>> = grid
         .into_iter()
         .zip(sky.gradient(theme))
-        .map(|(row, color)| {
-            Line::from(row.into_iter().collect::<String>()).style(Style::new().fg(INK).bg(color))
+        .enumerate()
+        .map(|(index, (row, color))| {
+            let ink = alarm.filter(|_| index == last).unwrap_or(INK);
+            Line::from(row.into_iter().collect::<String>()).style(Style::new().fg(ink).bg(color))
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
-    let breach = matches!(sky, Sky::Breach | Sky::BreachWaiting);
-    if breach && clock.is_some() && (millis / 500) % 2 == 0 {
+    let lit = clock.is_none() || (millis / 500) % 2 == 0;
+    if let Some(color) = alarm
+        && lit
+    {
         let x = area
             .x
             .saturating_add(u16::try_from(mast + 4).unwrap_or(u16::MAX));
         if let Some(cell) = frame.buffer_mut().cell_mut((x, area.y)) {
-            cell.set_symbol("●").set_fg(RED);
+            cell.set_symbol("●").set_fg(color);
         }
     }
 }

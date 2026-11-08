@@ -326,6 +326,11 @@ fn overview_page(state: &State, view: &View, now: Timestamp) -> Page {
                     now_panel,
                     &[("a/x", "Approve/Deny"), ("↑↓", "Select")],
                 ),
+                Panel::lines(
+                    "Incident timeline",
+                    strip_lines(state),
+                    &[("F4", "Open Record")],
+                ),
                 Panel::fill(
                     "Activity",
                     Body::Activity,
@@ -334,10 +339,11 @@ fn overview_page(state: &State, view: &View, now: Timestamp) -> Page {
             ],
             vec![
                 Panel::lines("Incident", incident_lines(state), &[("F4", "Open Record")]),
+                Panel::lines("Compromise", gauge_lines(state), &[("F3", "Open Scope")]),
                 Panel::lines("Assets", asset_lines(state), &[("F3", "Open Scope")]),
                 Panel::lines(
                     "Defense layers",
-                    layer_lines(state, true),
+                    layer_lines(state, false),
                     &[("F5", "Open Defense"), ("g", "Guardrails")],
                 ),
                 Panel::lines(
@@ -348,6 +354,114 @@ fn overview_page(state: &State, view: &View, now: Timestamp) -> Page {
             ],
         ],
     }
+}
+
+/// Assets compromised as a segmented gauge, one segment per asset in its state's color, with the
+/// count, records and Texans under it.
+fn gauge_lines(state: &State) -> Vec<Line<'static>> {
+    let total = state.scope.len();
+    if total == 0 {
+        return vec![empty("No assets reported yet.")];
+    }
+    let segment = (64 / total).clamp(4, 16);
+    let color = |asset: &ScopeRecord| {
+        let flags = asset.flags;
+        if compromised(flags) {
+            RED
+        } else if [
+            flags.locked,
+            flags.exfiltrated,
+            flags.accessed,
+            flags.destroyed,
+            flags.modified,
+        ]
+        .contains(&Tri::Unknown)
+        {
+            AMBER
+        } else {
+            OK
+        }
+    };
+    let row = || {
+        Line::from(
+            state
+                .scope
+                .iter()
+                .flat_map(|asset| {
+                    [
+                        Span::raw("█".repeat(segment.saturating_sub(1))).fg(color(asset)),
+                        Span::raw(" "),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let hit = state
+        .scope
+        .iter()
+        .filter(|asset| compromised(asset.flags))
+        .count();
+    let records: u64 = state.scope.iter().map(|asset| asset.record_count).sum();
+    let texans: u64 = state.scope.iter().map(|asset| asset.texas_residents).sum();
+    vec![
+        row(),
+        row(),
+        Line::from(vec![
+            Span::raw(format!("{hit}/{total} "))
+                .fg(if hit > 0 { RED } else { OK })
+                .bold(),
+            Span::raw("assets compromised").fg(TEXT),
+            Span::raw(format!(
+                " · {} records · {} Texans",
+                grouped(records),
+                grouped(texans)
+            ))
+            .fg(MUTED),
+        ]),
+    ]
+}
+
+/// The incident so far as a strip of markers: detonation, the first denial, the first finding
+/// and the first proposal, lit once they happened.
+fn strip_lines(state: &State) -> Vec<Line<'static>> {
+    let first = |tag: &str| {
+        state
+            .activity
+            .iter()
+            .find(|activity| activity.tag == tag)
+            .map(|activity| activity.at.clone())
+    };
+    let detonated = state
+        .activity
+        .iter()
+        .find(|activity| activity.tag == "STATUS" && activity.text.contains("detonated"))
+        .map(|activity| activity.at.clone());
+    let denial = state.denials.all().first().map(|denial| denial.at.clone());
+    let events = [
+        ("detonate", detonated, AMBER),
+        ("first denial", denial, RED),
+        ("findings", first("FINDING"), ACCENT),
+        ("proposal", first("PROPOSAL"), AMBER),
+    ];
+    let gap = 20;
+    let mut marks = Vec::new();
+    let mut labels = Vec::new();
+    let mut times = Vec::new();
+    for (index, (label, at, color)) in events.iter().enumerate() {
+        if index > 0 {
+            let lit = at.is_some();
+            marks.push(Span::raw("─".repeat(gap - 1)).fg(if lit { ACCENT } else { LINE }));
+        }
+        let (mark, mark_color) = if at.is_some() {
+            ("●", *color)
+        } else {
+            ("○", DIM)
+        };
+        marks.push(Span::raw(mark).fg(mark_color).bold());
+        labels.push(Span::raw(pad(label, gap)).fg(if at.is_some() { TEXT } else { DIM }));
+        times.push(Span::raw(pad(at.as_deref().unwrap_or("—"), gap)).fg(DIM));
+    }
+    vec![Line::from(marks), Line::from(labels), Line::from(times)]
 }
 
 /// What Cleanroom is and how to start, with the name in big type.
@@ -778,10 +892,15 @@ fn layer_lines(state: &State, linked: bool) -> Vec<Line<'static>> {
     let kernel = state.blocks();
     let max = safety.max(model).max(kernel).max(5);
     let layer = |label: &str, value: u64, color: Color| {
-        let mut spans = vec![Span::raw(pad(label, 16)).fg(MUTED)];
-        spans.extend(segments(value, max, 20, color));
-        spans.push(Span::raw(format!(" {value:>3}")).fg(color).bold());
-        Line::from(spans)
+        let filled = usize::try_from(value.min(max) * 20 / max.max(1)).unwrap_or(20);
+        let filled = if value > 0 { filled.max(1) } else { 0 };
+        Line::from(vec![
+            Span::raw("⛨ ").fg(color),
+            Span::raw(pad(label, 15)).fg(MUTED),
+            Span::raw("█".repeat(filled)).fg(color),
+            Span::raw("░".repeat(20 - filled)).fg(LINE),
+            Span::raw(format!(" {value:>3}")).fg(color).bold(),
+        ])
     };
     let guardrails = if state.guardrails {
         Span::raw("ON  hardened prompts").fg(OK).bold()
