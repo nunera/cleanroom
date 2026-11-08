@@ -77,7 +77,7 @@ Request shape that works on the hosted endpoint: a `user` message whose `content
 | 200x60 PNG (1,272 bytes), the text `CODE 7Q2-0451` | "Transcribe all text in this image." | `CODE 7Q2-0451`, exact | 1.8 s |
 | `LOCKSTAR-WALLPAPER.png` (1024x576, 20,302 bytes) | `view_image`'s system prompt, `reasoning_budget` 512 | Every line transcribed exactly, then a two-sentence description | 5.9 s |
 
-In a live detonation (guardrails on) Forensics called `view_image` on the wallpaper; the Super VL call spent 741 reasoning tokens, and Safety Guard flagged the transcription (a ransom demand), so Forensics read it inside the untrusted-data envelope.
+In two live detonations (guardrails on) Forensics called `view_image` on the wallpaper. The Super VL calls spent 741 and 417 reasoning tokens. Safety Guard flagged the transcription both times (second run: `Criminal Planning/Confessions`, `Controlled/Regulated Substances`, `Political/Misinformation/Conspiracy`), so Forensics read it inside the untrusted-data envelope. In the second run the negotiation chat and leak site, which appear only in the picture, reached Forensics' findings and Scribe's incident summary.
 
 ## Local Nemotron on Brev (Sat ~8:00pm)
 
