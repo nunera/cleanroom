@@ -325,6 +325,83 @@ pub(crate) struct CallRecord {
     pub(crate) replayed: bool,
     /// Time from request to response, including any recorded pace in replay.
     pub(crate) latency_ms: u64,
+    /// The model's reasoning trace (`reasoning_content`), clipped to [`REASONING_LIMIT`] bytes.
+    pub(crate) reasoning: Option<String>,
+    /// Reasoning tokens the endpoint reported (`usage.completion_tokens_details`).
+    pub(crate) reasoning_tokens: Option<u64>,
+}
+
+/// Reasoning trace bytes reported per call at most (cleanroomd stores up to 256 KiB).
+const REASONING_LIMIT: usize = 200_000;
+
+/// The response parts reasoning custody reads.
+#[derive(Deserialize)]
+struct Thought {
+    /// Completions; the first one is used.
+    #[serde(default)]
+    choices: Vec<ThoughtChoice>,
+    /// Token accounting.
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+/// One completion's message.
+#[derive(Deserialize)]
+struct ThoughtChoice {
+    /// The assistant message.
+    message: ThoughtMessage,
+}
+
+/// The reasoning part of an assistant message.
+#[derive(Deserialize)]
+struct ThoughtMessage {
+    /// Chain of thought.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Token accounting.
+#[derive(Deserialize)]
+struct Usage {
+    /// Per-kind completion tokens.
+    #[serde(default)]
+    completion_tokens_details: Option<TokenDetails>,
+}
+
+/// Completion tokens by kind.
+#[derive(Deserialize)]
+struct TokenDetails {
+    /// Tokens spent reasoning.
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+/// The reasoning trace (clipped at a character boundary) and reasoning-token count in `raw`.
+fn reasoning_of(raw: &[u8]) -> (Option<String>, Option<u64>) {
+    let Ok(thought) = serde_json::from_slice::<Thought>(raw) else {
+        return (None, None);
+    };
+    let tokens = thought
+        .usage
+        .and_then(|usage| usage.completion_tokens_details)
+        .and_then(|details| details.reasoning_tokens);
+    let trace = thought
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.reasoning_content)
+        .filter(|text| !text.trim().is_empty())
+        .map(|mut text| {
+            if text.len() > REASONING_LIMIT {
+                let mut end = REASONING_LIMIT;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        });
+    (trace, tokens)
 }
 
 /// Routes model calls to the hosted or local endpoint.
@@ -593,6 +670,7 @@ impl Router {
             Cache::Off => (self.post(self.endpoint(route)?, body).await?, Origin::Live),
         };
         if let Some(calls) = &self.calls {
+            let (reasoning, reasoning_tokens) = reasoning_of(&raw);
             let record = CallRecord {
                 role,
                 purpose: purpose.label(),
@@ -604,6 +682,8 @@ impl Router {
                 response: format!("sha256:{}", cache::key(&raw)),
                 replayed: matches!(origin, Origin::Replayed(_)),
                 latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                reasoning,
+                reasoning_tokens,
             };
             if calls.send(record).is_err() {
                 tracing::debug!("nobody listens for model-call records any more");
@@ -878,6 +958,52 @@ mod tests {
         assert_eq!(call.response, format!("sha256:{}", cache::key(response)));
         assert!(call.replayed, "a replayed answer is not passed off as live");
         assert!(reported.try_recv().is_err(), "one call, one report");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Nemotron returns its chain of thought beside the answer; the report carries it and the
+    /// reasoning-token count so cleanroomd can keep it under the call's receipt.
+    #[tokio::test]
+    async fn a_call_reports_the_reasoning_trace_and_its_token_count() {
+        let dir =
+            std::env::temp_dir().join(format!("cleanroom-llm-reasoning-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let mut settings = settings("https://integrate.api.nvidia.com/v1", LlmMode::Replay);
+        settings.cache_dir = dir.clone();
+        let messages = [Message::User {
+            content: "what happened on the share?".to_owned(),
+        }];
+        let model = settings.models.for_role(Role::Hunter).to_owned();
+        let body = request_body(&model, &messages, &[], AGENT_MAX_TOKENS).expect("body");
+        let response: &[u8] = br#"{"choices":[{"message":{"content":"ransomware","reasoning_content":"18 .locked files and a bitcoin note: encryption."},"finish_reason":"stop"}],"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":31}}}"#;
+        let store = Store::new(dir.clone());
+        let slot = store.next_slot(Stream {
+            role: "hunter",
+            purpose: "agent",
+        });
+        store
+            .record(
+                slot,
+                &cache::key(&body),
+                (&body, response),
+                Duration::from_millis(5),
+            )
+            .await
+            .expect("record");
+        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new(&settings).expect("router").with_call_log(calls);
+
+        router
+            .chat(Role::Hunter, ModelRoute::Hosted, &messages, &[])
+            .await
+            .expect("replayed");
+
+        let call = reported.try_recv().expect("the call is reported");
+        assert_eq!(
+            call.reasoning.as_deref(),
+            Some("18 .locked files and a bitcoin note: encryption.")
+        );
+        assert_eq!(call.reasoning_tokens, Some(31));
         drop(std::fs::remove_dir_all(&dir));
     }
 }

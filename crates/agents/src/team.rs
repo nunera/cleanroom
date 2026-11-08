@@ -135,6 +135,8 @@ async fn forward_calls(crew: Arc<Crew>, mut calls: mpsc::UnboundedReceiver<CallR
             response: call.response,
             replayed: call.replayed,
             latency_ms: call.latency_ms,
+            reasoning: call.reasoning,
+            reasoning_tokens: call.reasoning_tokens,
         });
         match crew
             .connection(call.role)

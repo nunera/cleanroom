@@ -208,6 +208,12 @@ pub struct ModelCall {
     /// The answer came from the replay store, not a live model.
     pub replayed: bool,
     pub latency_ms: u64,
+    /// The model's reasoning trace (`reasoning_content`), when it returned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Reasoning tokens the endpoint reported for the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 // ---------- Receipts (hash-chained, signed action log) ----------
@@ -262,6 +268,12 @@ pub enum Action {
         request: Digest,
         response: Digest,
         replayed: bool,
+        /// Digest of the reasoning trace cleanroomd stored for this call (`reasoning.ndjson`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Digest>,
+        /// Reasoning tokens the endpoint reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u64>,
     },
     /// An agent's YARA rule, checked by cleanroomd: `allowed` when it was admitted into
     /// `/rules`, `denied` with the reason otherwise.

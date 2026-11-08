@@ -125,6 +125,11 @@ impl Layout {
         self.state.join("receipts.ndjson")
     }
 
+    /// Reasoning traces of model calls, bound to their `model_call` receipts.
+    pub(crate) fn reasoning(&self) -> PathBuf {
+        self.state.join("reasoning.ndjson")
+    }
+
     /// `scenario/assets.json`.
     pub(crate) fn assets(&self) -> PathBuf {
         self.repo.join("scenario/assets.json")
@@ -171,7 +176,7 @@ pub(crate) fn default_socket() -> Result<PathBuf> {
 ///
 /// # Errors
 /// Fails if neither variable is set.
-fn default_state() -> Result<PathBuf> {
+pub(crate) fn default_state() -> Result<PathBuf> {
     if let Some(state) = env_dir("XDG_STATE_HOME") {
         return Ok(state.join("cleanroom"));
     }
