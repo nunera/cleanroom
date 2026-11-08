@@ -302,7 +302,7 @@ pub(crate) struct RefusalArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScopeUpdate {
-    /// Stable asset id, for example `payroll-2026q3`.
+    /// Asset id: a known scope record's, or a new one the evidence shows.
     pub(crate) asset_id: String,
     /// Human-readable name; required for a new record.
     pub(crate) name: Option<String>,
@@ -664,7 +664,7 @@ fn tri(description: &str) -> Value {
 fn scope_properties() -> Value {
     let count = json!({"type": "integer", "minimum": 0, "maximum": 1_000_000_000_000_u64});
     json!({
-        "asset_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "description": "Stable id, for example payroll-2026q3"},
+        "asset_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "description": "The asset_id of a scope record you were shown; a new id only for an asset the evidence shows"},
         "name": {"type": "string", "minLength": 1, "maxLength": 120},
         "data_classes": {
             "type": "array",
