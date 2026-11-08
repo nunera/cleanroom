@@ -7,7 +7,7 @@
 //! its asset `accessed`. `exfiltrated` stays unknown for the agents to establish: a copy on the
 //! host is not proof that it left.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,12 @@ pub(crate) struct Scenario {
     baseline: Mutex<BTreeMap<String, Digest>>,
     /// Flags the integrity check measured for the current incident, by asset id.
     measured: Mutex<BTreeMap<String, ScopeFlags>>,
+    /// The latest evidence seal and the receipt that recorded it: per-command checks compare
+    /// against it, so each change is announced once.
+    seal: Mutex<Option<(Seal, u64)>>,
+    /// The seal taken at detection: `verify_log` always compares against it, so a later reseal
+    /// never hides a change.
+    detection_seal: Mutex<Option<(Seal, u64)>>,
     /// The detonated incident's id; held across a whole detonation or reset.
     incident: tokio::sync::Mutex<Option<String>>,
 }
@@ -97,8 +103,30 @@ impl Scenario {
             assets,
             baseline: Mutex::default(),
             measured: Mutex::default(),
+            seal: Mutex::default(),
+            detection_seal: Mutex::default(),
             incident: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Replace the latest evidence seal (`None` after a reset).
+    pub(crate) fn set_seal(&self, seal: Option<(Seal, u64)>) {
+        *lock(&self.seal) = seal;
+    }
+
+    /// The latest evidence seal and its receipt.
+    pub(crate) fn seal(&self) -> Option<(Seal, u64)> {
+        lock(&self.seal).clone()
+    }
+
+    /// Replace the seal taken at detection (`None` after a reset).
+    pub(crate) fn set_detection_seal(&self, seal: Option<(Seal, u64)>) {
+        *lock(&self.detection_seal) = seal;
+    }
+
+    /// The seal taken at detection and its receipt.
+    pub(crate) fn detection_seal(&self) -> Option<(Seal, u64)> {
+        lock(&self.detection_seal).clone()
     }
 
     /// The assets.
@@ -271,6 +299,64 @@ fn fingerprint(share: &Path) -> Result<BTreeMap<String, Digest>> {
         );
     }
     Ok(files)
+}
+
+/// One digest over every evidence file, and the manifest behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seal {
+    /// `sha256:` over the manifest, one `<path>\0<file hash>\n` line per file in path order.
+    pub(crate) digest: Digest,
+    /// `<label>/<relative path>` → file hash.
+    files: BTreeMap<String, Digest>,
+}
+
+impl Seal {
+    /// Files under the seal.
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Every file that differs in `now`, in path order: `"<path> (changed|added|removed)"`.
+    pub(crate) fn differences(&self, now: &Self) -> Vec<String> {
+        let paths: BTreeSet<&String> = self.files.keys().chain(now.files.keys()).collect();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let how = match (self.files.get(path), now.files.get(path)) {
+                    (Some(sealed), Some(current)) if sealed == current => return None,
+                    (Some(_), Some(_)) => "changed",
+                    (Some(_), None) => "removed",
+                    (None, Some(_)) => "added",
+                    (None, None) => return None,
+                };
+                Some(format!("{path} ({how})"))
+            })
+            .collect()
+    }
+}
+
+/// Seal the evidence: hash every regular file under each `(label, dir)`.
+///
+/// # Errors
+/// Fails if a directory cannot be read.
+pub(crate) fn seal(dirs: &[(&str, PathBuf)]) -> Result<Seal> {
+    let mut files = BTreeMap::new();
+    for (label, dir) in dirs {
+        for (relative, digest) in fingerprint(dir)? {
+            files.insert(format!("{label}/{relative}"), digest);
+        }
+    }
+    let mut manifest = Sha256::new();
+    for (path, digest) in &files {
+        manifest.update(path.as_bytes());
+        manifest.update(b"\0");
+        manifest.update(digest.as_bytes());
+        manifest.update(b"\n");
+    }
+    Ok(Seal {
+        digest: format!("sha256:{}", hex::encode(manifest.finalize())),
+        files,
+    })
 }
 
 /// Regular files under `root` as `(share-relative path, full path)`.
@@ -883,5 +969,53 @@ mod tests {
         );
 
         assert!(records.is_empty(), "{records:?}");
+    }
+
+    fn evidence(victim: &Victim) -> Vec<(&'static str, PathBuf)> {
+        fs::create_dir_all(victim.root.join("logs")).expect("logs dir");
+        fs::write(
+            victim.root.join("logs/auth.log"),
+            "Accepted password for backup\n",
+        )
+        .expect("log");
+        vec![
+            ("acme-fs", victim.share()),
+            ("dropbox", victim.drop_box()),
+            ("logs", victim.root.join("logs")),
+        ]
+    }
+
+    /// The seal is one digest over every evidence file, so a single changed byte anywhere breaks
+    /// it, and the manifest names the file.
+    #[test]
+    fn the_seal_names_every_evidence_file_that_changed() {
+        let victim = Victim::new("seal");
+        let dirs = evidence(&victim);
+        let sealed = seal(&dirs).expect("seal");
+        assert_eq!(
+            seal(&dirs).expect("again").digest,
+            sealed.digest,
+            "the same tree seals the same"
+        );
+        assert!(sealed.differences(&seal(&dirs).expect("again")).is_empty());
+
+        fs::write(
+            victim.root.join("logs/auth.log"),
+            "Accepted password for backup!\n",
+        )
+        .expect("edit the log");
+        fs::write(victim.drop_box().join("loot.zip"), "zip").expect("add a file");
+        fs::remove_file(victim.share().join("vpn-credentials.txt")).expect("remove a file");
+        let now = seal(&dirs).expect("reseal");
+
+        assert_ne!(now.digest, sealed.digest);
+        assert_eq!(
+            sealed.differences(&now),
+            vec![
+                "acme-fs/vpn-credentials.txt (removed)".to_owned(),
+                "dropbox/loot.zip (added)".to_owned(),
+                "logs/auth.log (changed)".to_owned(),
+            ]
+        );
     }
 }
