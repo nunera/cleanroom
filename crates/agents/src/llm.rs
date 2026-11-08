@@ -17,6 +17,7 @@ use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::budget::Budgets;
 use crate::cache::{self, Hit, Store, Stream};
 use crate::config::{Endpoint, LocalRoute, Models, Settings};
 use crate::egress;
@@ -26,7 +27,7 @@ use crate::text::preview;
 use crate::tools::ToolSpec;
 
 /// Token budget for an agent step.
-const AGENT_MAX_TOKENS: u32 = 2048;
+pub(crate) const AGENT_MAX_TOKENS: u32 = 2048;
 /// Token budget for a safety verdict (the verdict itself is about 40 tokens).
 const SAFETY_MAX_TOKENS: u32 = 1024;
 /// Retries after the first attempt on 408, 429, 5xx, timeouts and transport errors.
@@ -193,6 +194,9 @@ struct Body<'a> {
     /// requests, and the cache keys of their recordings, stay as they were.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<TemplateKwargs>,
+    /// Reasoning tokens the model may spend before answering, from `policy/reasoning.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
 }
 
 /// Serialize a chat-completions request. The bytes are both what is sent and what the cache keys on.
@@ -205,7 +209,7 @@ pub(crate) fn request_body(
     tools: &[ToolSpec],
     max_tokens: u32,
 ) -> serde_json::Result<Vec<u8>> {
-    body(model, messages, tools, max_tokens, None)
+    body(model, messages, tools, max_tokens, None, None)
 }
 
 /// Serialize a request with optional chat-template switches.
@@ -218,6 +222,7 @@ fn body(
     tools: &[ToolSpec],
     max_tokens: u32,
     chat_template_kwargs: Option<TemplateKwargs>,
+    reasoning_budget: Option<u32>,
 ) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&Body {
         model,
@@ -226,6 +231,7 @@ fn body(
         tool_choice: (!tools.is_empty()).then_some("auto"),
         max_tokens,
         chat_template_kwargs,
+        reasoning_budget,
     })
 }
 
@@ -421,6 +427,8 @@ pub(crate) struct Router {
     egress: String,
     /// Where every call is reported, when someone listens.
     calls: Option<tokio::sync::mpsc::UnboundedSender<CallRecord>>,
+    /// Reasoning budgets per role.
+    budgets: Budgets,
 }
 
 impl Router {
@@ -428,8 +436,10 @@ impl Router {
     /// cache. Replay builds no client at all.
     ///
     /// # Errors
-    /// Fails if an endpoint is outside `policy/egress.json` or the TLS client cannot be built.
+    /// Fails if an endpoint is outside `policy/egress.json`, `policy/reasoning.json` is invalid,
+    /// or the TLS client cannot be built.
     pub(crate) fn new(settings: &Settings) -> Result<Self> {
+        let budgets = Budgets::shipped()?;
         if rustls::crypto::ring::default_provider()
             .install_default()
             .is_err()
@@ -480,6 +490,7 @@ impl Router {
             cache,
             egress,
             calls: None,
+            budgets,
         })
     }
 
@@ -490,6 +501,45 @@ impl Router {
     ) -> Self {
         self.calls = Some(calls);
         self
+    }
+
+    /// The reasoning budgets, for the status line.
+    pub(crate) const fn budgets(&self) -> Budgets {
+        self.budgets
+    }
+
+    /// The request bytes for `role`'s `purpose` call on `route`: agent steps and the Lead's turns
+    /// carry the role's reasoning budget; a specialist's answer turns thinking off; a safety
+    /// verdict carries neither. The bytes are both what is sent and what the cache keys on.
+    ///
+    /// # Errors
+    /// Fails only if a message cannot be serialized.
+    fn request(
+        &self,
+        role: Role,
+        purpose: Purpose,
+        route: ModelRoute,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Vec<u8>> {
+        let model = self.model(role, purpose, route);
+        let budget = Some(self.budgets.for_role(role));
+        let encoded = match purpose {
+            Purpose::Agent => body(model, messages, tools, AGENT_MAX_TOKENS, None, budget),
+            Purpose::Chat if role == Role::Lead => {
+                body(model, messages, tools, AGENT_MAX_TOKENS, None, budget)
+            }
+            Purpose::Chat => body(
+                model,
+                messages,
+                tools,
+                AGENT_MAX_TOKENS,
+                Some(NO_THINKING),
+                None,
+            ),
+            Purpose::Safety => request_body(model, messages, &[], SAFETY_MAX_TOKENS),
+        };
+        encoded.context("cannot encode the model request")
     }
 
     /// Whether this router can open network connections at all.
@@ -555,9 +605,7 @@ impl Router {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<Reply> {
-        let model = self.model(role, Purpose::Agent, route);
-        let body = request_body(model, messages, tools, AGENT_MAX_TOKENS)
-            .context("cannot encode the model request")?;
+        let body = self.request(role, Purpose::Agent, route, messages, tools)?;
         self.complete(role, Purpose::Agent, route, Bytes::from(body))
             .await
     }
@@ -575,10 +623,7 @@ impl Router {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<Reply> {
-        let model = self.model(role, Purpose::Chat, route);
-        let switches = (role != Role::Lead).then_some(NO_THINKING);
-        let request = body(model, messages, tools, AGENT_MAX_TOKENS, switches)
-            .context("cannot encode the model request")?;
+        let request = self.request(role, Purpose::Chat, route, messages, tools)?;
         self.complete(role, Purpose::Chat, route, Bytes::from(request))
             .await
     }
@@ -593,12 +638,10 @@ impl Router {
         route: ModelRoute,
         text: &str,
     ) -> Result<(Verdict, String)> {
-        let model = self.model(role, Purpose::Safety, route);
         let messages = [Message::User {
             content: text.to_owned(),
         }];
-        let body = request_body(model, &messages, &[], SAFETY_MAX_TOKENS)
-            .context("cannot encode the safety request")?;
+        let body = self.request(role, Purpose::Safety, route, &messages, &[])?;
         let reply = self
             .complete(role, Purpose::Safety, route, Bytes::from(body))
             .await?;
@@ -924,7 +967,17 @@ mod tests {
             content: "list /evidence".to_owned(),
         }];
         let model = settings.models.for_role(Role::Hunter).to_owned();
-        let body = request_body(&model, &messages, &[], AGENT_MAX_TOKENS).expect("body");
+        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new(&settings).expect("router").with_call_log(calls);
+        let body = router
+            .request(
+                Role::Hunter,
+                Purpose::Agent,
+                ModelRoute::Hosted,
+                &messages,
+                &[],
+            )
+            .expect("body");
         let response: &[u8] =
             br#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#;
         let store = Store::new(dir.clone());
@@ -941,8 +994,6 @@ mod tests {
             )
             .await
             .expect("record");
-        let (calls, mut reported) = tokio::sync::mpsc::unbounded_channel();
-        let router = Router::new(&settings).expect("router").with_call_log(calls);
 
         router
             .chat(Role::Hunter, ModelRoute::Hosted, &messages, &[])
@@ -1005,5 +1056,44 @@ mod tests {
         );
         assert_eq!(call.reasoning_tokens, Some(31));
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The OS sets how long each agent's Nemotron model may think: an agent step and the Lead's
+    /// turn carry the role's `reasoning_budget` from policy/reasoning.json; a specialist's answer
+    /// (thinking off) and a safety verdict carry none.
+    #[test]
+    fn requests_carry_the_roles_reasoning_budget() {
+        let router = Router::new(&settings(
+            "https://integrate.api.nvidia.com/v1",
+            LlmMode::Replay,
+        ))
+        .expect("router");
+        let budgets = crate::budget::Budgets::shipped().expect("policy");
+        let messages = [Message::User {
+            content: "list /evidence".to_owned(),
+        }];
+        let sent = |role, purpose| -> Value {
+            let bytes = router
+                .request(role, purpose, ModelRoute::Hosted, &messages, &[])
+                .expect("request");
+            serde_json::from_slice(&bytes).expect("json")
+        };
+
+        assert_eq!(
+            sent(Role::Hunter, Purpose::Agent)["reasoning_budget"],
+            budgets.for_role(Role::Hunter)
+        );
+        assert_eq!(
+            sent(Role::Lead, Purpose::Chat)["reasoning_budget"],
+            budgets.for_role(Role::Lead)
+        );
+        let answer = sent(Role::Hunter, Purpose::Chat);
+        assert!(answer.get("reasoning_budget").is_none());
+        assert_eq!(answer["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(
+            sent(Role::Hunter, Purpose::Safety)
+                .get("reasoning_budget")
+                .is_none()
+        );
     }
 }

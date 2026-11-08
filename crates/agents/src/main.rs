@@ -14,6 +14,7 @@
 )]
 
 mod agent;
+mod budget;
 mod cache;
 mod config;
 mod daemon;
