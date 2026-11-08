@@ -10,6 +10,7 @@
     reason = "wire contract; docs/interfaces.md documents fields and the names mirror JSON keys. \
               `allow`, not `expect`: missing_docs is only enabled under the strict Clippy profile"
 )]
+pub mod sign;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -423,6 +424,16 @@ pub enum BusBody {
     Status {
         text: String,
     },
+    /// Start (or restart) the agent team on an incident. Published by the daemon after a detonation, or by the TUI.
+    Investigate {
+        incident_id: String,
+        brief: String,
+    },
+    /// Commander toggles agent behavior. `guardrails: false` swaps the hardened system prompt for a naive one
+    /// so the demo can show the kernel grant blocking what the model was talked into.
+    AgentControl {
+        guardrails: bool,
+    },
 }
 
 /// Signed under [`domain::BUS`].
@@ -499,6 +510,8 @@ pub enum Frame {
     /// First frame from every client.
     Hello {
         principal: Principal,
+        /// Raw Ed25519 public key (lowercase hex) that signs this connection's `publish` frames.
+        public_key: String,
         subscribe: Vec<Audience>,
     },
     /// Client → daemon: publish to the bus.

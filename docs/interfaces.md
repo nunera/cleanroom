@@ -12,7 +12,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 
 - One Unix socket: `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock`, owned by `cleanroomd`, mode `0600`.
 - Newline-delimited JSON. One line = one `Envelope`: `{"v":1,"frame":"<kind>",...}`.
-- The first frame from every client is `hello`, naming its principal and the audiences it subscribes to.
+- The first frame from every client is `hello`, naming its principal, the raw Ed25519 public key that signs its `publish` frames, and the audiences it subscribes to.
 - `request` / `response` frames carry an `id` chosen by the client; the daemon answers with the same `id`.
 - `publish` frames go from clients to the daemon. The daemon checks the signature, appends a receipt if relevant, and fans the message out as `event` frames to subscribers.
 - Agent strata have no network and no access to the socket. The agent *runner* (outside the strata) holds the socket connection and calls `exec` on the agent's behalf; the daemon applies that role's grant.
@@ -23,6 +23,7 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 - Signed bytes: `domain + "\n" + hex(sha256(JCS(body)))`, where JCS is RFC 8785 canonical JSON. Domains are in `cleanroom_proto::domain`.
 - No floats on the wire (percentages are `u8`), so canonical JSON stays unambiguous.
 - Each agent role has its own key; humans have their own keys, enrolled by an admin (`Signed<Member>` under `cleanroom/v1/enroll`).
+- Use `cleanroom_proto::sign` (`sign`, `verify`, `digest_of`, `key_id`, `generate_key`, `signing_key_from_hex`, `verifying_key_from_hex`) on both sides so the bytes always match. `digest_of` is also how a receipt computes `prev`.
 
 ## Receipts
 
@@ -46,7 +47,7 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 
 ## Bus messages (`body.type`)
 
-`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step, for the live trace pane), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status`.
+`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step, for the live trace pane), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status`, `investigate` (starts the agent team on an incident; the daemon publishes it after a detonation, or the TUI does), `agent_control` (commander toggles `guardrails`; off swaps the hardened agent prompt for a naive one so the demo can show the kernel grant blocking what the model was talked into).
 
 The TUI renders state from these events alone; it never reads the agents' files.
 
@@ -72,7 +73,7 @@ The TUI renders state from these events alone; it never reads the agents' files.
 These were produced by serializing the Rust types and round-trip checked.
 
 ```json
-{"v":1,"frame":"hello","principal":{"kind":"agent","role":"hunter"},"subscribe":[{"kind":"all"}]}
+{"v":1,"frame":"hello","principal":{"kind":"agent","role":"hunter"},"public_key":"<64 hex>","subscribe":[{"kind":"all"}]}
 {"v":1,"frame":"request","id":7,"request":{"op":"exec","from":"hunter","stratum":"hunter","argv":["rm","-rf","/evidence"],"timeout_ms":10000}}
 {"v":1,"frame":"response","id":7,"response":{"result":"exec","outcome":{"kind":"denied","reason":"evidence is mounted read_only for hunter"},"stdout":"","stderr":"","truncated":false,"receipt_seq":42}}
 {"v":1,"frame":"publish","domain":"cleanroom/v1/bus","body":{"id":"msg-01","at":"2026-11-08T01:23:45Z","from":{"kind":"agent","role":"forensics"},"to":{"kind":"all"},"body":{"type":"tool_request","id":"tool-03","from":"forensics","stratum":"forensics","tool":"volatility3","source":{"kind":"nix","flake_ref":"github:NixOS/nixpkgs/<rev>#volatility3"},"reason":"memory image analysis"}},"signer":"sha256:<key>","sig":"<hex>"}
