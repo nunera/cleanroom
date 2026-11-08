@@ -11,7 +11,7 @@ use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
 use cleanroom_proto::{
     Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
     ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal,
-    Revocation, Role, Signed, ToolDecision, ToolRequest, ToolSource, domain,
+    Revocation, Role, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource, domain,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::task::spawn_blocking;
@@ -197,7 +197,13 @@ impl Daemon {
         }
         let body = &signed.body.body;
         let measured = if let BusBody::Scope(record) = body {
-            self.scenario.refusal(&peer.principal, record)
+            self.scenario.refusal(&peer.principal, record).or_else(|| {
+                exfiltration_refusal(
+                    &peer.principal,
+                    record,
+                    self.bus.scope_flags(&record.asset_id),
+                )
+            })
         } else {
             None
         };
@@ -1058,6 +1064,26 @@ fn may_publish(principal: &Principal, body: &BusBody) -> Result<(), &'static str
     }
 }
 
+/// Why an agent's scope `record` is refused because it would clear exfiltration that the bus
+/// holds as unknown or yes. cleanroomd cannot measure exfiltration, so only a human may say no.
+fn exfiltration_refusal(
+    principal: &Principal,
+    record: &ScopeRecord,
+    current: Option<cleanroom_proto::ScopeFlags>,
+) -> Option<String> {
+    if !matches!(principal, Principal::Agent { .. }) {
+        return None;
+    }
+    current
+        .filter(|current| record.flags.clears_exfiltration(current))
+        .map(|_| {
+            format!(
+                "{} exfiltrated: cleanroomd cannot measure exfiltration, so only a commander can clear it",
+                record.asset_id
+            )
+        })
+}
+
 /// Why an agent's record, proposal or finding is refused because it doesn't belong to the open
 /// incident: none is open (a reset cleared it), or an incident record names another incident.
 /// Humans may always write; chat, traces and status lines always flow.
@@ -1127,6 +1153,8 @@ fn session_tag() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use cleanroom_proto::{ScopeFlags, Tri};
 
     use super::*;
 
@@ -1212,6 +1240,44 @@ mod tests {
             stale_refusal(&agent(Role::Scribe), &scope(), Some("INC-2")),
             None,
             "scope records are accepted while an incident is open"
+        );
+    }
+
+    fn flags(exfiltrated: Tri) -> ScopeFlags {
+        ScopeFlags {
+            locked: Tri::Yes,
+            exfiltrated,
+            accessed: Tri::Yes,
+            destroyed: Tri::Unknown,
+            modified: Tri::Yes,
+        }
+    }
+
+    /// A live guardrails-off run: a fooled Scribe wrote exfiltrated=no for payroll, which had
+    /// been copied out. Exfiltration isn't measured, so an agent alone may not clear it.
+    #[test]
+    fn an_agent_cannot_clear_exfiltration_but_a_commander_can() {
+        let BusBody::Scope(mut record) = scope() else {
+            panic!("scope() is a scope record");
+        };
+        record.flags = flags(Tri::No);
+        let reason = exfiltration_refusal(&agent(Role::Scribe), &record, Some(flags(Tri::Unknown)))
+            .expect("unknown → no by an agent is refused");
+        assert!(
+            reason.contains("payroll") && reason.contains("exfiltrated"),
+            "{reason}"
+        );
+        let human = Principal::Human {
+            key_id: "sha256:commander".to_owned(),
+        };
+        assert_eq!(
+            exfiltration_refusal(&human, &record, Some(flags(Tri::Yes))),
+            None
+        );
+        assert_eq!(
+            exfiltration_refusal(&agent(Role::Scribe), &record, Some(flags(Tri::No))),
+            None,
+            "an asset that was never touched keeps its no"
         );
     }
 }
