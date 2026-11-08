@@ -16,6 +16,7 @@ mod agent;
 mod cache;
 mod config;
 mod daemon;
+mod egress;
 mod keys;
 mod llm;
 mod records;

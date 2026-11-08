@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::cache::{self, Hit, Store, Stream};
 use crate::config::{Endpoint, LocalRoute, Models, Settings};
+use crate::egress;
 use crate::roles;
 use crate::safety::{self, Verdict};
 use crate::text::preview;
@@ -267,8 +268,8 @@ enum Attempt {
 /// Routes model calls to the hosted or local endpoint.
 #[derive(Debug)]
 pub(crate) struct Router {
-    /// Shared HTTPS client.
-    http: reqwest::Client,
+    /// Shared HTTPS client; `None` in replay mode, which never connects.
+    http: Option<reqwest::Client>,
     /// Hosted API.
     hosted: Endpoint,
     /// Optional local route.
@@ -277,13 +278,16 @@ pub(crate) struct Router {
     models: Models,
     /// Record/replay store.
     cache: Cache,
+    /// What egress this router has, for the status line.
+    egress: String,
 }
 
 impl Router {
-    /// Build the HTTPS client and the cache.
+    /// Check the endpoints against the egress policy, then build the HTTPS client and the
+    /// cache. Replay builds no client at all.
     ///
     /// # Errors
-    /// Fails if the TLS client cannot be built.
+    /// Fails if an endpoint is outside `policy/egress.json` or the TLS client cannot be built.
     pub(crate) fn new(settings: &Settings) -> Result<Self> {
         if rustls::crypto::ring::default_provider()
             .install_default()
@@ -291,12 +295,37 @@ impl Router {
         {
             tracing::debug!("a rustls crypto provider was already installed");
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("cleanroom-agents/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("cannot build the HTTPS client")?;
+        let (http, egress) = if settings.llm_mode == LlmMode::Replay {
+            (
+                None,
+                "egress none (replay builds no network client)".to_owned(),
+            )
+        } else {
+            let policy = egress::Policy::shipped()?;
+            let mut allowed = Vec::new();
+            for endpoint in std::iter::once(&settings.hosted)
+                .chain(settings.local.as_ref().map(|local| &local.endpoint))
+            {
+                let why = policy
+                    .check(&endpoint.base_url)
+                    .map_err(anyhow::Error::msg)?;
+                allowed.push(format!("{} ({why})", endpoint.base_url));
+            }
+            // Redirects and proxy variables could carry a request past the policy.
+            let http = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .user_agent(concat!("cleanroom-agents/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .context("cannot build the HTTPS client")?;
+            let egress = format!(
+                "egress only {} per policy/egress.json",
+                allowed.join(" and ")
+            );
+            (Some(http), egress)
+        };
         let cache = match settings.llm_mode {
             LlmMode::Live => Cache::Off,
             LlmMode::Record => Cache::Record(Store::new(settings.cache_dir.clone())),
@@ -308,7 +337,19 @@ impl Router {
             local: settings.local.clone(),
             models: settings.models.clone(),
             cache,
+            egress,
         })
+    }
+
+    /// Whether this router can open network connections at all.
+    #[cfg(test)]
+    pub(crate) const fn can_connect(&self) -> bool {
+        self.http.is_some()
+    }
+
+    /// What egress this router has, for the status line.
+    pub(crate) fn egress(&self) -> &str {
+        &self.egress
     }
 
     /// Where responses come from, for counters and status labels.
@@ -490,8 +531,11 @@ impl Router {
     /// # Errors
     /// Fails on a request that cannot be built or a non-retryable HTTP status.
     async fn attempt(&self, url: &str, endpoint: &Endpoint, body: Bytes) -> Result<Attempt> {
-        let mut request = self
+        let http = self
             .http
+            .as_ref()
+            .context("replay mode has no network client")?;
+        let mut request = http
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .body(body);
@@ -625,4 +669,51 @@ fn chain(error: &dyn StdError) -> String {
         source = cause.source();
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn settings(hosted: &str, llm_mode: LlmMode) -> Settings {
+        let model = |name: &str| name.to_owned();
+        Settings {
+            hosted: Endpoint {
+                base_url: hosted.to_owned(),
+                api_key: None,
+            },
+            local: None,
+            models: Models {
+                hunter: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
+                forensics: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
+                scribe: model("nvidia/nemotron-3-ultra-550b-a55b"),
+                containment: model("nvidia/nemotron-3.5-lightning-30b-a3b"),
+                safety: model("nvidia/llama-3.1-nemotron-safety-guard-8b-v3"),
+            },
+            llm_mode,
+            cache_dir: PathBuf::from("/nonexistent/cleanroom-llm-cache"),
+            keys_dir: PathBuf::from("/nonexistent/cleanroom-keys"),
+            nixpkgs: "github:NixOS/nixpkgs/rev".to_owned(),
+        }
+    }
+
+    /// `NVIDIA_BASE_URL` comes from the environment; pointing it elsewhere must not move the
+    /// agents' evidence-bearing prompts off the declared endpoint.
+    #[test]
+    fn the_router_refuses_an_endpoint_the_egress_policy_denies() {
+        let error = Router::new(&settings("https://evil.example/v1", LlmMode::Live))
+            .expect_err("a live router to an undeclared endpoint is refused");
+        assert!(format!("{error:#}").contains("egress policy"), "{error:#}");
+
+        Router::new(&settings(
+            "https://integrate.api.nvidia.com/v1",
+            LlmMode::Live,
+        ))
+        .expect("the declared hosted endpoint is allowed");
+        let offline = Router::new(&settings("https://evil.example/v1", LlmMode::Replay))
+            .expect("replay makes no connections, so no endpoint is checked");
+        assert!(!offline.can_connect(), "replay builds no network client");
+    }
 }

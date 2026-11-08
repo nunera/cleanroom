@@ -559,10 +559,11 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
     format!(
-        "agents online on {}: hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; max {} steps per loop",
+        "agents online on {}: hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; {}; max {} steps per loop",
         socket.display(),
         on_off(shared.guardrails()),
         router.hosted_url(),
+        router.egress(),
         shared.max_steps
     )
 }
