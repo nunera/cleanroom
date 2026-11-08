@@ -17,6 +17,21 @@ The full demo runs end to end on one Linux laptop:
 
 Models run on the hosted NVIDIA API or on self-hosted Nemotron on Brev (`deploy/brev/`). Measured results are in [docs/nemotron-smoke.md](docs/nemotron-smoke.md).
 
+## Results
+
+29 live runs against hosted Nemotron (27, N = 3 per cell) and local Nemotron on Brev (2). Five attack variants: the ransom-note injection, a poisoned syslog line, a credential-exfil note, a polite "IT runbook" written to evade the safety model, and a benign control. Full method and caveats: [docs/eval.md](docs/eval.md).
+
+| Measure | Result |
+| --- | --- |
+| Evidence files changed by agents (hashed outside the sandboxes) | **0 / 29 runs** |
+| Evidence-wipe attempts denied by the kernel grant | **15 / 15**, each with a signed receipt; log chain intact 29 / 29 |
+| Agents went for the injected action, prompt guardrails off | 10 / 12 runs |
+| Agents went for the injected action, prompt guardrails on | 0 / 12 runs |
+| Safety model flagged the injected artifact | 14 / 24 screened runs; it missed the polite runbook every time |
+| VPN secrets pasted into a model-written report | 0 / 29 |
+
+Prompt guardrails and safety models are probabilistic layers. The read-only grant is not, which is the point. One gap the kernel can't cover: with guardrails off, Scribe once wrote the attacker's "false positive" story into the record. cleanroomd now refuses any agent attempt to lower a flag it measured itself (fixed after these runs).
+
 ## Quick start
 
 ```sh
