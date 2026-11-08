@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
-use cleanroom_proto::{ModelRoute, Role};
+use cleanroom_proto::{LlmMode, ModelRoute, Role};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cache::{self, Hit, Store, Stream};
-use crate::config::{CacheMode, Endpoint, LocalRoute, Models, Settings};
+use crate::config::{Endpoint, LocalRoute, Models, Settings};
 use crate::roles;
 use crate::safety::{self, Verdict};
 use crate::text::preview;
@@ -297,10 +297,10 @@ impl Router {
             .user_agent(concat!("cleanroom-agents/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("cannot build the HTTPS client")?;
-        let cache = match settings.cache_mode {
-            CacheMode::Off => Cache::Off,
-            CacheMode::Record => Cache::Record(Store::new(settings.cache_dir.clone())),
-            CacheMode::Replay => Cache::Replay(Store::new(settings.cache_dir.clone())),
+        let cache = match settings.llm_mode {
+            LlmMode::Live => Cache::Off,
+            LlmMode::Record => Cache::Record(Store::new(settings.cache_dir.clone())),
+            LlmMode::Replay => Cache::Replay(Store::new(settings.cache_dir.clone())),
         };
         Ok(Self {
             http,
@@ -311,12 +311,12 @@ impl Router {
         })
     }
 
-    /// The cache mode, for status labels.
-    pub(crate) const fn mode(&self) -> CacheMode {
+    /// Where responses come from, for counters and status labels.
+    pub(crate) const fn mode(&self) -> LlmMode {
         match self.cache {
-            Cache::Off => CacheMode::Off,
-            Cache::Record(_) => CacheMode::Record,
-            Cache::Replay(_) => CacheMode::Replay,
+            Cache::Off => LlmMode::Live,
+            Cache::Record(_) => LlmMode::Record,
+            Cache::Replay(_) => LlmMode::Replay,
         }
     }
 

@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use cleanroom_proto::Role;
+use cleanroom_proto::{LlmMode, Role};
 
 /// Hosted API used when `NVIDIA_BASE_URL` is unset.
 const DEFAULT_HOSTED_URL: &str = "https://integrate.api.nvidia.com/v1";
@@ -88,28 +88,6 @@ impl Models {
     }
 }
 
-/// `CLEANROOM_LLM_CACHE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheMode {
-    /// Live calls, nothing stored.
-    Off,
-    /// Live calls; every response is stored.
-    Record,
-    /// No network: responses come from the store.
-    Replay,
-}
-
-impl CacheMode {
-    /// The `llm=` token in status lines.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Off => "live",
-            Self::Record => "record",
-            Self::Replay => "replay",
-        }
-    }
-}
-
 /// Everything the runner reads from the environment.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
@@ -119,8 +97,8 @@ pub(crate) struct Settings {
     pub(crate) local: Option<LocalRoute>,
     /// Hosted models.
     pub(crate) models: Models,
-    /// Cache mode.
-    pub(crate) cache_mode: CacheMode,
+    /// `CLEANROOM_LLM_CACHE`: live (unset), record or replay.
+    pub(crate) llm_mode: LlmMode,
     /// Cache directory.
     pub(crate) cache_dir: PathBuf,
     /// Signing keys directory.
@@ -138,14 +116,14 @@ impl Settings {
     pub(crate) fn from_env() -> Result<Self> {
         let env =
             Env::load(&xdg_dir("XDG_CONFIG_HOME", ".config")?.join("cleanroom/nemotron.env"))?;
-        let cache_mode = match env.get("CLEANROOM_LLM_CACHE").as_deref() {
-            None | Some("off") => CacheMode::Off,
-            Some("record") => CacheMode::Record,
-            Some("replay") => CacheMode::Replay,
+        let llm_mode = match env.get("CLEANROOM_LLM_CACHE").as_deref() {
+            None | Some("off") => LlmMode::Live,
+            Some("record") => LlmMode::Record,
+            Some("replay") => LlmMode::Replay,
             Some(other) => bail!("CLEANROOM_LLM_CACHE must be record or replay, not `{other}`"),
         };
         let api_key = env.get("NVIDIA_API_KEY").map(ApiKey);
-        if api_key.is_none() && cache_mode != CacheMode::Replay {
+        if api_key.is_none() && llm_mode != LlmMode::Replay {
             bail!(
                 "NVIDIA_API_KEY is not set: put it in ~/.config/cleanroom/nemotron.env, or use CLEANROOM_LLM_CACHE=replay"
             );
@@ -181,7 +159,7 @@ impl Settings {
             hosted,
             local,
             models,
-            cache_mode,
+            llm_mode,
             cache_dir,
             keys_dir: xdg_dir("XDG_STATE_HOME", ".local/state")?.join("cleanroom/keys"),
             nixpkgs: env.model("CLEANROOM_NIXPKGS", DEFAULT_NIXPKGS),

@@ -12,7 +12,9 @@ This is the contract between the three parts of Cleanroom. The Rust source of tr
 
 - One Unix socket: `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock`, owned by `cleanroomd`, mode `0600`.
 - Newline-delimited JSON. One line = one `Envelope`: `{"v":1,"frame":"<kind>",...}`.
-- The first frame from every client is `hello`, naming its principal, the raw Ed25519 public key that signs its `publish` frames, and the audiences it subscribes to.
+- The first frame from every client is `hello`, naming its principal, the raw Ed25519 public key that signs its `publish` frames, and the audiences it subscribes to. There is no acknowledgement frame.
+- A subscriber receives every message whose `to` matches one of its audiences; messages addressed to `all` reach everyone.
+- **State on connect:** right after `hello`, the daemon replays the current state to that client as `event` frames: the latest `incident`, the latest `scope` per asset, open tool requests and proposals, and the latest `counters`. At startup and after `reset`, it publishes a baseline `scope` record for every asset with all flags `no`, so the command center can show the all-green "before" screen.
 - `request` / `response` frames carry an `id` chosen by the client; the daemon answers with the same `id`.
 - `publish` frames go from clients to the daemon. The daemon checks the signature, appends a receipt if relevant, and fans the message out as `event` frames to every matching subscriber, **including the sender** (the TUI renders only from events, so it relies on seeing its own chat and toggles echoed back).
 - Agent strata have no network and no access to the socket. The agent *runner* (outside the strata) holds the socket connection and calls `exec` on the agent's behalf; the daemon applies that role's grant.
@@ -47,7 +49,9 @@ Receipt actions: `admit_root`, `exec`, `write`, `tool_grant`, `approval`, `enrol
 
 ## Bus messages (`body.type`)
 
-`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step, for the live trace pane), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status`, `investigate` (starts the agent team on an incident; the daemon publishes it after a detonation, or the TUI does), `agent_control` (commander toggles `guardrails`; off swaps the hardened agent prompt for a naive one so the demo can show the kernel grant blocking what the model was talked into).
+`chat`, `finding`, `proposal`, `approval`, `tool_request`, `tool_decision`, `trace` (one agent loop step; `outcome` is set when the step ran a command, and `denied` means the grant blocked it), `refusal` (an agent declined an instruction found in untrusted data: blocked by the model), `counters` (running totals: blocked by model, blocked by OS, safety flags, guardrails on/off, LLM mode `live`/`record`/`replay`), `safety_verdict` (Nemotron safety model on an untrusted artifact), `route` (local vs hosted model decision), `scope` (a full `ScopeRecord`), `incident` (a full `IncidentRecord`), `status` (free text for humans), `investigate` (starts the agent team on an incident; the daemon publishes it after a detonation, or the TUI does), `agent_control` (commander toggles `guardrails`; off swaps the hardened agent prompt for a naive one so the demo can show the kernel grant blocking what the model was talked into).
+
+**Tool requests:** agents send only the `request_tool` op. The daemon publishes the `tool_request` event and, when decided, the `tool_decision` event.
 
 The TUI renders state from these events alone; it never reads the agents' files.
 
@@ -55,8 +59,8 @@ The TUI renders state from these events alone; it never reads the agents' files.
 
 | Stratum | Root | Mounts | Network | Notes |
 | --- | --- | --- | --- | --- |
-| `hunter` | Debian root | evidence `read_only`, scratch `read_write` | none | logs, YARA |
-| `forensics` | Debian root + Nix tools | evidence `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
+| `hunter` | Debian root | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | logs, YARA |
+| `forensics` | Debian root + Nix tools | evidence `read_only`, rules `/rules` `read_only`, scratch `read_write` | none | volatility3 / tshark via tool requests |
 | `scribe` | minimal | incident record `append_only` (through the daemon) | none | no shell tools |
 | `containment` | none | none | none | proposals only; commander must approve |
 | `acme-fs` | Debian root | company share `read_write` | none | victim; the scenario runs here |

@@ -64,38 +64,40 @@ pub(crate) fn envelope(source: &str, rating: &str, text: &str) -> String {
     )
 }
 
-/// Team-wide injection counters.
+/// Team-wide defense-in-depth counters, one per layer.
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
-    /// Tool outputs the safety model flagged while guardrails were on (and so were wrapped).
-    blocked_by_model: AtomicU32,
-    /// Exec calls the stratum grant denied.
-    blocked_by_os: AtomicU32,
-    /// Every unsafe verdict, guardrails on or off.
+    /// Layer 1: unsafe verdicts from the safety model, guardrails on or off.
     safety_flags: AtomicU32,
+    /// Layer 2: injected instructions an agent declined (`refusal` messages).
+    blocked_by_model: AtomicU32,
+    /// Layer 3: commands the stratum grant denied.
+    blocked_by_os: AtomicU32,
 }
 
-/// A consistent-enough copy of [`Counters`] for one status line.
+/// A consistent-enough copy of [`Counters`] for one `counters` message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Snapshot {
+    /// See [`Counters`].
+    pub(crate) safety_flags: u32,
     /// See [`Counters`].
     pub(crate) blocked_by_model: u32,
     /// See [`Counters`].
     pub(crate) blocked_by_os: u32,
-    /// See [`Counters`].
-    pub(crate) safety_flags: u32,
 }
 
 impl Counters {
-    /// Count an unsafe verdict; `acted` when guardrails wrapped the output.
-    pub(crate) fn flagged(&self, acted: bool) {
+    /// Count an unsafe safety verdict.
+    pub(crate) fn flagged(&self) {
         self.safety_flags.fetch_add(1, Ordering::Relaxed);
-        if acted {
-            self.blocked_by_model.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
-    /// Count an exec the grant denied.
+    /// Count an injected instruction an agent declined.
+    pub(crate) fn refused(&self) {
+        self.blocked_by_model.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a command the grant denied.
     pub(crate) fn denied_by_os(&self) {
         self.blocked_by_os.fetch_add(1, Ordering::Relaxed);
     }
@@ -103,9 +105,9 @@ impl Counters {
     /// Current values.
     pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
+            safety_flags: self.safety_flags.load(Ordering::Relaxed),
             blocked_by_model: self.blocked_by_model.load(Ordering::Relaxed),
             blocked_by_os: self.blocked_by_os.load(Ordering::Relaxed),
-            safety_flags: self.safety_flags.load(Ordering::Relaxed),
         }
     }
 }

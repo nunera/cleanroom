@@ -47,9 +47,11 @@ Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, N
 cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--once]
 ```
 
-- `--guardrails` picks the hardened or the naive prompts at start; `agent_control` bus events switch them at runtime. With guardrails off, Hunter and Forensics also get a shell (`exec`), so the demo can show the stratum grant denying what the model was talked into.
+- `--guardrails` picks the hardened or the naive prompts at start; `agent_control` bus events switch them at runtime. With guardrails on, Hunter and Forensics record each instruction they decline from untrusted data as a `refusal`. With guardrails off they get a shell (`exec`) instead, so the demo can show the stratum grant denying what the model was talked into (`trace.outcome` is `denied`).
 - Every evidence-bearing tool output is scored by the Nemotron safety model (`safety_verdict`) before a model sees it; with guardrails on, unsafe output is wrapped in an untrusted-data envelope. Output with personal data or credentials moves the conversation to the local endpoint (`route`).
-- Counters arrive as `status` lines containing `blocked_by_model=N blocked_by_os=N safety_flags=N guardrails=on|off llm=live|record|replay`.
+- `counters` is published at startup and whenever a count or the guardrails setting changes: `safety_flags` (layer 1, unsafe verdicts), `blocked_by_model` (layer 2, refusals), `blocked_by_os` (layer 3, denied commands).
+- Tool requests go through the daemon's `request_tool` operation only; the daemon publishes `tool_request` and `tool_decision`. YARA rules come from the read-only `/rules` mount.
+- Scribe starts from the scope records already on the bus (the daemon's baseline), so it updates those assets instead of inventing new ones.
 - Signing keys are created on first run in `$XDG_STATE_HOME/cleanroom/keys/<role>.key` (mode `0600`).
 
 | Variable | Meaning |

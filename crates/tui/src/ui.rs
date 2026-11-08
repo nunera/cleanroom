@@ -4,7 +4,7 @@
 //! key hints, big type for the tamper beat, and text next to every color so nothing depends on
 //! color alone.
 
-use cleanroom_proto::{DataClass, IncidentStatus, ScopeRecord, Severity, Tri};
+use cleanroom_proto::{DataClass, IncidentStatus, LlmMode, ScopeRecord, Severity, Tri};
 use jiff::fmt::strtime;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -246,31 +246,45 @@ fn status_line(state: &State) -> Line<'static> {
             Style::new().fg(Color::White).bg(RED).bold(),
         ),
     };
-    let (model, os, llm) = state.counters.as_ref().map_or_else(
-        || ("–".to_owned(), "–".to_owned(), None),
-        |counters| {
-            (
-                counters.blocked_by_model.to_string(),
-                counters.blocked_by_os.to_string(),
-                counters.llm.clone(),
-            )
-        },
-    );
-    let mut spans = vec![
-        guardrails,
-        Span::raw(" "),
-        log,
-        Span::raw("  Blocked by model ").fg(GRAY),
-        Span::styled(model, Style::new().fg(Color::White).bold()),
-        Span::raw("  by OS ").fg(GRAY),
-        Span::styled(os, Style::new().fg(BRIGHT_RED).bold()),
-    ];
-    if let Some(llm) = llm {
-        let color = if llm == "live" { GRAY } else { AMBER };
-        spans.push(Span::raw("  LLM ").fg(GRAY));
-        spans.push(Span::styled(llm, Style::new().fg(color).bold()));
+    let mut spans = vec![guardrails, Span::raw(" "), log];
+    match state.counters {
+        None => spans.push(Span::raw("  Blocked by model –  by OS –").fg(GRAY)),
+        Some(counters) => {
+            spans.extend([
+                Span::raw("  Blocked by model ").fg(GRAY),
+                Span::styled(
+                    counters.blocked_by_model.to_string(),
+                    Style::new().fg(Color::White).bold(),
+                ),
+                Span::raw("  by OS ").fg(GRAY),
+                Span::styled(
+                    counters.blocked_by_os.to_string(),
+                    Style::new().fg(BRIGHT_RED).bold(),
+                ),
+                Span::raw("  Safety flags ").fg(GRAY),
+                Span::styled(
+                    counters.safety_flags.to_string(),
+                    Style::new().fg(AMBER).bold(),
+                ),
+                Span::raw("  "),
+                llm_badge(counters.llm),
+            ]);
+        }
     }
     Line::from(spans)
+}
+
+/// Where the agents' model responses come from. A replay is labelled loudly: the demo must
+/// never pass recorded model output off as live.
+fn llm_badge(llm: LlmMode) -> Span<'static> {
+    match llm {
+        LlmMode::Live => Span::raw("LLM live").fg(GRAY),
+        LlmMode::Record => Span::styled("LLM live, recording", Style::new().fg(AMBER).bold()),
+        LlmMode::Replay => Span::styled(
+            " LLM REPLAY ",
+            Style::new().fg(Color::Black).bg(AMBER).bold(),
+        ),
+    }
 }
 
 /// LIVE / DISCONNECTED / REPLAY badge.

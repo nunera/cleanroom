@@ -1,27 +1,27 @@
 //! Lifecycle: connect one socket per role, wait for `investigate`, run the team, and react to
-//! `agent_control`, `tool_decision` and `approval` events.
+//! `agent_control`, `tool_decision`, `approval` and `scope` events.
 //!
 //! Hunter and Forensics investigate concurrently. Their findings flow to Scribe, which keeps the
 //! incident and scope records. When both are done, Containment proposes actions, and Scribe
 //! records the commander's decisions on them while they arrive.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use cleanroom_proto::{BusBody, BusMessage, Principal, Role, Signed};
+use cleanroom_proto::{BusBody, BusMessage, LlmMode, Principal, Role, ScopeRecord, Signed};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, Control, Desk, Note, Shared, on_off};
-use crate::config::{self, CacheMode, Settings};
+use crate::config::{self, Settings};
 use crate::daemon::{Connection, Inbound};
 use crate::llm::Router;
-use crate::records::Case;
+use crate::records::{Case, Records};
 use crate::roles;
 use crate::safety::Counters;
 use crate::sensitivity::Detector;
@@ -128,23 +128,24 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     });
     let lead = crew.agent(Role::Scribe, &shared);
     lead.status(online_line(&shared, &socket)).await;
-    lead.counters_status().await;
+    lead.publish_counters().await;
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
     let mut seen = Seen::default();
+    let mut assets = BTreeMap::new();
     let mut running: Option<JoinHandle<()>> = None;
     let result = loop {
         tokio::select! {
             message = inbound.recv() => match message {
                 Some(Inbound::Event(event)) if seen.first(&event) => {
                     let body = event.body;
-                    if let Some(case) = dispatch(&shared, &guardrails_tx, &lead, body).await {
+                    if let Some(case) = dispatch(&shared, &guardrails_tx, &lead, body, &mut assets).await {
                         if let Some(previous) = running.take() {
                             previous.abort();
                             lead.status(format!("restarting the team for {}", case.incident_id)).await;
                         }
                         shared.router.restart_streams();
-                        let task = investigate(Arc::clone(&shared), Arc::clone(&crew), case, done_tx.clone());
+                        let task = investigate(Arc::clone(&shared), Arc::clone(&crew), case, assets.clone(), done_tx.clone());
                         running = Some(tokio::spawn(task));
                     }
                 }
@@ -172,12 +173,14 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     result
 }
 
-/// React to one bus event. Returns the case to investigate for `investigate`.
+/// React to one bus event; `assets` mirrors the latest scope record per asset. Returns the case
+/// to investigate for `investigate`.
 async fn dispatch(
     shared: &Shared,
     guardrails: &watch::Sender<bool>,
     lead: &Agent,
     message: BusMessage,
+    assets: &mut BTreeMap<String, ScopeRecord>,
 ) -> Option<Case> {
     let trusted = matches!(message.from, Principal::System | Principal::Human { .. });
     match message.body {
@@ -197,7 +200,7 @@ async fn dispatch(
                 on_off(enabled)
             ))
             .await;
-            lead.counters_status().await;
+            lead.publish_counters().await;
             None
         }
         BusBody::ToolDecision {
@@ -233,14 +236,19 @@ async fn dispatch(
             tracing::warn!("ignoring a control message from an agent principal");
             None
         }
+        BusBody::Scope(record) => {
+            assets.insert(record.asset_id.clone(), record);
+            None
+        }
         BusBody::Chat { .. }
         | BusBody::Finding { .. }
         | BusBody::Proposal { .. }
         | BusBody::ToolRequest(_)
         | BusBody::Trace { .. }
+        | BusBody::Refusal { .. }
+        | BusBody::Counters { .. }
         | BusBody::SafetyVerdict { .. }
         | BusBody::Route { .. }
-        | BusBody::Scope(_)
         | BusBody::Incident(_)
         | BusBody::Status { .. } => None,
     }
@@ -253,11 +261,12 @@ fn notify(shared: &Shared, control: Control) {
     }
 }
 
-/// Run the whole team on one incident.
+/// Run the whole team on one incident; Scribe starts from the known `assets`.
 async fn investigate(
     shared: Arc<Shared>,
     crew: Arc<Crew>,
     case: Case,
+    assets: BTreeMap<String, ScopeRecord>,
     done: mpsc::UnboundedSender<()>,
 ) {
     let case = Arc::new(case);
@@ -271,19 +280,18 @@ async fn investigate(
     let decisions = shared.control.subscribe();
     let (notes_tx, notes_rx) = mpsc::unbounded_channel();
     let (record, field) = tokio::join!(
-        keep_record(&scribe, Arc::clone(&case), notes_rx),
+        keep_record(&scribe, Arc::clone(&case), assets, notes_rx),
         field_work(&shared, &crew, &case, notes_tx, decisions),
     );
     scribe
         .status(format!(
-            "investigation {} finished: {} findings, {} proposals, {} scope records",
+            "investigation {} finished: {} findings, {} proposals, {} scope updates",
             case.incident_id,
             field.findings,
             field.proposals,
-            record.records.scope_count()
+            record.records.scope_updates()
         ))
         .await;
-    scribe.counters_status().await;
     if done.send(()).is_err() {
         tracing::debug!("runner stopped before the investigation finished");
     }
@@ -394,9 +402,11 @@ async fn await_decisions(
 async fn keep_record(
     scribe: &Agent,
     case: Arc<Case>,
+    assets: BTreeMap<String, ScopeRecord>,
     mut notes: mpsc::UnboundedReceiver<Note>,
 ) -> Desk {
     let mut desk = Desk::new(Arc::clone(&case), None);
+    desk.records = Records::with_scopes(assets);
     scribe.converse(&mut desk, opening_task(&case)).await;
     while let Some(first) = notes.recv().await {
         let mut batch = vec![first];
@@ -526,12 +536,12 @@ fn online_line(shared: &Shared, socket: &Path) -> String {
         .local_model()
         .map_or_else(|| "none".to_owned(), |model| format!("local {model}"));
     let llm = match (router.mode(), router.cache_dir()) {
-        (CacheMode::Replay, Some(dir)) => format!(
+        (LlmMode::Replay, Some(dir)) => format!(
             "LLM REPLAY: answers come from recorded responses in {}, not a live model",
             dir.display()
         ),
-        (CacheMode::Record, Some(dir)) => format!("live, recording to {}", dir.display()),
-        (CacheMode::Off | CacheMode::Record | CacheMode::Replay, _) => "live".to_owned(),
+        (LlmMode::Record, Some(dir)) => format!("live, recording to {}", dir.display()),
+        (LlmMode::Live | LlmMode::Record | LlmMode::Replay, _) => "live".to_owned(),
     };
     format!(
         "agents online on {}: hunter, forensics, scribe, containment; guardrails {}; hosted {}; local route {local}; llm {llm}; max {} steps per loop",

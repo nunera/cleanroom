@@ -29,21 +29,32 @@ pub(crate) struct Case {
 pub(crate) struct Records {
     /// The incident record, once opened.
     incident: Option<IncidentRecord>,
-    /// Scope records by asset id.
+    /// Scope records by asset id, starting from the assets already on the bus.
     scopes: BTreeMap<String, ScopeRecord>,
+    /// Scope updates Scribe made in this investigation.
+    scope_updates: usize,
     /// Containment proposals the commander approved.
     approved: HashSet<String>,
 }
 
 impl Records {
+    /// Records that start from the known scope records (the daemon's baseline or earlier
+    /// updates), so Scribe updates those assets instead of inventing new ids.
+    pub(crate) fn with_scopes(scopes: BTreeMap<String, ScopeRecord>) -> Self {
+        Self {
+            scopes,
+            ..Self::default()
+        }
+    }
+
     /// Remember that the commander approved `proposal_id`.
     pub(crate) fn approve(&mut self, proposal_id: String) {
         self.approved.insert(proposal_id);
     }
 
-    /// How many scope records exist.
-    pub(crate) fn scope_count(&self) -> usize {
-        self.scopes.len()
+    /// How many scope updates Scribe made.
+    pub(crate) const fn scope_updates(&self) -> usize {
+        self.scope_updates
     }
 
     /// Open or update the incident record. Returns the full record to publish and a result
@@ -105,7 +116,9 @@ impl Records {
                 .or_insert_with(|| new_scope(asset_id, name, at))
         };
         apply_scope_fields(record, update);
+        record.updated_by = Principal::Agent { role: Role::Scribe };
         at.clone_into(&mut record.updated_at);
+        self.scope_updates += 1;
         let summary = scope_line(record);
         Ok((record.clone(), format!("saved scope record {summary}")))
     }

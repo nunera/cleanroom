@@ -7,9 +7,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use cleanroom_proto::{
-    BusBody, BusMessage, CoreResponse, Envelope, ExecResult, Frame, IncidentRecord, IncidentStatus,
-    KeyId, ModelRoute, Principal, Role, ScopeRecord, ToolDecision, ToolRequest, ToolSource, Tri,
-    Triggers, WIRE_VERSION,
+    BusBody, BusMessage, CoreResponse, Envelope, ExecOutcome, ExecResult, Frame, IncidentRecord,
+    IncidentStatus, KeyId, LlmMode, ModelRoute, Principal, Role, ScopeRecord, ToolDecision,
+    ToolRequest, ToolSource, Tri, Triggers, WIRE_VERSION,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -163,17 +163,17 @@ pub(crate) struct QueueItem {
     pub(crate) sent: Option<bool>,
 }
 
-/// Team-wide counters the agent runtime publishes in `status` text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Team-wide totals from the agent runtime's latest `counters` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Counters {
-    /// Injected instructions stopped by the model layer while guardrails were on.
+    /// Injected instructions stopped by the model layer.
     pub(crate) blocked_by_model: u32,
     /// Actions the kernel grant denied.
     pub(crate) blocked_by_os: u32,
     /// Every unsafe safety verdict, guardrails on or off.
     pub(crate) safety_flags: u32,
-    /// Where model calls come from: `live`, `record` or `replay`.
-    pub(crate) llm: Option<String>,
+    /// Where model responses come from; `replay` must be visible on screen.
+    pub(crate) llm: LlmMode,
 }
 
 /// Result of the last `verify_log`.
@@ -377,6 +377,11 @@ impl State {
     }
 
     /// Apply a bus message.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat arm per bus message type reads clearer than splitting the dispatch. \
+                  `allow`, not `expect`: the lint only runs under the strict profile"
+    )]
     fn apply_message(&mut self, message: BusMessage) {
         let origin = Origin {
             at: self.time_label(&message.at),
@@ -391,10 +396,10 @@ impl State {
                 summary,
                 evidence,
                 confidence_pct,
-            } => self.log(
-                &origin,
-                finding_entry(&summary, evidence.len(), confidence_pct),
-            ),
+            } => {
+                let text = format!("{summary} ({confidence_pct}%, {} evidence)", evidence.len());
+                self.log(&origin, Entry::new("FINDING", Tone::Warn, text));
+            }
             BusBody::Proposal {
                 proposal_id,
                 action,
@@ -422,7 +427,33 @@ impl State {
                 tool,
                 args,
                 result_preview,
-            } => self.log(&origin, trace_entry(step, &tool, &args, &result_preview)),
+                outcome,
+            } => self.log(
+                &origin,
+                trace_entry(step, &tool, &args, &result_preview, outcome.as_ref()),
+            ),
+            BusBody::Refusal {
+                artifact,
+                instruction,
+            } => {
+                let text = format!("blocked by the model: \"{instruction}\" in {artifact}");
+                self.log(&origin, Entry::new("REFUSED", Tone::Good, text));
+            }
+            BusBody::Counters {
+                blocked_by_model,
+                blocked_by_os,
+                safety_flags,
+                guardrails,
+                llm,
+            } => {
+                self.counters = Some(Counters {
+                    blocked_by_model,
+                    blocked_by_os,
+                    safety_flags,
+                    llm,
+                });
+                self.guardrails = guardrails;
+            }
             BusBody::SafetyVerdict {
                 artifact,
                 model,
@@ -432,7 +463,7 @@ impl State {
             BusBody::Route { route, reason } => self.log(&origin, route_entry(route, &reason)),
             BusBody::Scope(record) => self.scope_update(&origin, record),
             BusBody::Incident(record) => self.incident_update(&origin, record),
-            BusBody::Status { text } => self.status(&origin, text),
+            BusBody::Status { text } => self.log(&origin, Entry::new("STATUS", Tone::Plain, text)),
             BusBody::Investigate { incident_id, brief } => {
                 let text = format!("{incident_id}: {brief}");
                 self.log(&origin, Entry::new("INVESTIGATE", Tone::Plain, text));
@@ -564,10 +595,11 @@ impl State {
     }
 
     /// Forget everything about the previous run. Guardrails and identity survive: they belong to
-    /// the agents and this console, not to the incident.
+    /// the agents and this console, not to the incident. Scope survives too: cleanroomd
+    /// republishes every asset's all-`no` baseline on reset, possibly before its `ok`, and those
+    /// records replace the old ones by asset id.
     fn clear(&mut self) {
         self.incident = None;
-        self.scope.clear();
         self.activity.clear();
         self.chat.clear();
         self.queue.clear();
@@ -578,10 +610,12 @@ impl State {
         self.investigating = None;
     }
 
-    /// A `tool_request` message.
+    /// A `tool_request` message. cleanroomd publishes it, so the queue and the agent pane credit
+    /// the requesting role named inside the request.
     fn tool_request(&mut self, origin: &Origin, request: ToolRequest) {
         let ToolRequest {
             id,
+            from,
             tool,
             source,
             reason,
@@ -597,8 +631,12 @@ impl State {
             source,
             reason,
         };
-        self.enqueue(id, origin.who.clone(), ask);
-        self.log(origin, Entry::new("TOOL REQUEST", Tone::Warn, text));
+        let requester = Origin {
+            at: origin.at.clone(),
+            who: Who::Agent(from),
+        };
+        self.enqueue(id, requester.who.clone(), ask);
+        self.log(&requester, Entry::new("TOOL REQUEST", Tone::Warn, text));
     }
 
     /// A `tool_decision` message or `tool` response. Anything but `pending` settles the request.
@@ -666,18 +704,6 @@ impl State {
             self.log(origin, Entry::new("LEGAL CLOCK", Tone::Warn, text));
         }
         self.incident = Some(record);
-    }
-
-    /// A `status` message: agent-runtime counters, or plain status text.
-    fn status(&mut self, origin: &Origin, text: String) {
-        if let Some((counters, guardrails)) = parse_counters(&text) {
-            self.counters = Some(counters);
-            if let Some(guardrails) = guardrails {
-                self.guardrails = guardrails;
-            }
-        } else {
-            self.log(origin, Entry::new("STATUS", Tone::Plain, text));
-        }
     }
 
     /// Add an approval subject unless it is already queued or decided.
@@ -773,20 +799,6 @@ pub(crate) const fn status_word(status: IncidentStatus) -> &'static str {
     }
 }
 
-/// A finding; `refused:` findings are agents declining an injected instruction.
-fn finding_entry(summary: &str, evidence: usize, confidence_pct: u8) -> Entry {
-    let (tag, tone) = if summary.starts_with("refused:") {
-        ("REFUSED", Tone::Good)
-    } else {
-        ("FINDING", Tone::Warn)
-    };
-    Entry::new(
-        tag,
-        tone,
-        format!("{summary} ({confidence_pct}%, {evidence} evidence)"),
-    )
-}
-
 /// A commander's approval or denial on the bus.
 const fn approval_entry(subject_id: String, approved: bool) -> Entry {
     if approved {
@@ -796,25 +808,37 @@ const fn approval_entry(subject_id: String, approved: bool) -> Entry {
     }
 }
 
-/// One agent loop step. A `denied: ` result is the kernel grant refusing the action.
-fn trace_entry(step: u32, tool: &str, args: &Value, result: &str) -> Entry {
-    let result = first_line(result);
-    let (tag, tone) = if result.starts_with("denied: ") {
-        ("BLOCKED BY OS", Tone::Bad)
-    } else if result.starts_with("timed out") || result.starts_with("invalid arguments: ") {
-        ("TRACE", Tone::Warn)
-    } else if tool == "answer" {
-        ("ANSWER", Tone::Plain)
-    } else {
-        ("TRACE", Tone::Quiet)
-    };
+/// One agent loop step. An `outcome` of `denied` is the kernel grant refusing the command.
+fn trace_entry(
+    step: u32,
+    tool: &str,
+    args: &Value,
+    result: &str,
+    outcome: Option<&ExecOutcome>,
+) -> Entry {
     let args = summarize_args(args);
-    let text = if args.is_empty() {
-        format!("#{step} {tool} → {result}")
+    let call = if args.is_empty() {
+        format!("#{step} {tool}")
     } else {
-        format!("#{step} {tool} {args} → {result}")
+        format!("#{step} {tool} {args}")
     };
-    Entry::new(tag, tone, text)
+    let result = first_line(result);
+    match outcome {
+        Some(ExecOutcome::Denied { reason }) => Entry::new(
+            "BLOCKED BY OS",
+            Tone::Bad,
+            format!("{call} → denied by the grant: {reason}"),
+        ),
+        Some(ExecOutcome::TimedOut) => {
+            Entry::new("TRACE", Tone::Warn, format!("{call} → {result}"))
+        }
+        Some(ExecOutcome::Exited { .. }) | None if tool == "answer" => {
+            Entry::new("ANSWER", Tone::Plain, format!("{call} → {result}"))
+        }
+        Some(ExecOutcome::Exited { .. }) | None => {
+            Entry::new("TRACE", Tone::Quiet, format!("{call} → {result}"))
+        }
+    }
 }
 
 /// A safety model's verdict on an untrusted artifact.
@@ -913,38 +937,6 @@ fn started_clocks(old: &Triggers, new: &Triggers) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(started, name)| started.then_some(name))
     .collect()
-}
-
-/// Parse the agent runtime's counters out of a status line.
-///
-/// The tokens are `blocked_by_model=<n> blocked_by_os=<n> safety_flags=<n>
-/// guardrails=<on|off> llm=<mode>`. Returns `None` unless both blocked counters are present.
-fn parse_counters(text: &str) -> Option<(Counters, Option<bool>)> {
-    let mut by_model = None;
-    let mut by_os = None;
-    let mut safety_flags = 0;
-    let mut guardrails = None;
-    let mut llm = None;
-    for (key, value) in text
-        .split_whitespace()
-        .filter_map(|token| token.split_once('='))
-    {
-        match key {
-            "blocked_by_model" => by_model = value.parse().ok(),
-            "blocked_by_os" => by_os = value.parse().ok(),
-            "safety_flags" => safety_flags = value.parse().unwrap_or(0),
-            "guardrails" => guardrails = Some(value == "on"),
-            "llm" => llm = Some(value.to_owned()),
-            _ => {}
-        }
-    }
-    let counters = Counters {
-        blocked_by_model: by_model?,
-        blocked_by_os: by_os?,
-        safety_flags,
-        llm,
-    };
-    Some((counters, guardrails))
 }
 
 /// Compact display of a tool call's JSON arguments.

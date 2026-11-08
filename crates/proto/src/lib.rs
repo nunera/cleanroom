@@ -416,6 +416,21 @@ pub enum BusBody {
         tool: String,
         args: Value,
         result_preview: String,
+        /// Set when the step ran a command through the daemon; `denied` means the grant blocked it.
+        outcome: Option<ExecOutcome>,
+    },
+    /// An agent declined an instruction it found inside untrusted data (blocked by the model, layer 2).
+    Refusal {
+        artifact: String,
+        instruction: String,
+    },
+    /// Running totals for the defense-in-depth counters on the command center.
+    Counters {
+        blocked_by_model: u32,
+        blocked_by_os: u32,
+        safety_flags: u32,
+        guardrails: bool,
+        llm: LlmMode,
     },
     /// Verdict from a Nemotron safety model on an untrusted artifact.
     SafetyVerdict {
@@ -443,6 +458,15 @@ pub enum BusBody {
     AgentControl {
         guardrails: bool,
     },
+}
+
+/// Where model responses come from. `replay` must be visible on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmMode {
+    Live,
+    Record,
+    Replay,
 }
 
 /// Signed under [`domain::BUS`].

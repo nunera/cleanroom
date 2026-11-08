@@ -6,19 +6,19 @@
 //! the conversation and route it to the local model, the safety model scores the text, and with
 //! guardrails on an unsafe verdict wraps it in an untrusted-data envelope.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cleanroom_proto::{
-    BusBody, CoreRequest, CoreResponse, ExecOutcome, ExecRequest, ExecResult, ModelRoute, Role,
-    ToolDecision, ToolRequest, ToolSource,
+    BusBody, CoreRequest, CoreResponse, ExecOutcome, ExecRequest, ExecResult, LlmMode, ModelRoute,
+    Role, ToolDecision, ToolRequest, ToolSource,
 };
 use serde_json::{Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::cache::Hit;
-use crate::config::CacheMode;
 use crate::daemon::{Connection, now};
 use crate::llm::{Message, Origin, Reply, Router, ToolCall};
 use crate::records::{Case, Records};
@@ -27,8 +27,8 @@ use crate::safety::{self, Counters};
 use crate::sensitivity::{self, Detector};
 use crate::text::{clip, preview};
 use crate::tools::{
-    self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, Prepared, ProposalArgs, Rejection,
-    ScopeUpdate, ToolAsk, ToolSpec,
+    self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, Prepared, ProposalArgs, RefusalArgs,
+    Rejection, ScopeUpdate, ToolAsk, ToolSpec,
 };
 
 /// Characters of tool output a model sees at most.
@@ -116,22 +116,21 @@ impl Shared {
         *self.guardrails.borrow()
     }
 
-    /// The counters status line the TUI parses.
-    pub(crate) fn counters_line(&self) -> String {
+    /// The current `counters` message.
+    pub(crate) fn counters(&self) -> BusBody {
         let counts = self.counters.snapshot();
-        format!(
-            "injections blocked_by_model={} blocked_by_os={} safety_flags={} guardrails={} llm={}",
-            counts.blocked_by_model,
-            counts.blocked_by_os,
-            counts.safety_flags,
-            on_off(self.guardrails()),
-            self.router.mode().label()
-        )
+        BusBody::Counters {
+            blocked_by_model: counts.blocked_by_model,
+            blocked_by_os: counts.blocked_by_os,
+            safety_flags: counts.safety_flags,
+            guardrails: self.guardrails(),
+            llm: self.router.mode(),
+        }
     }
 
     /// Prefix status text in replay mode so nobody mistakes recorded output for a live model.
     pub(crate) fn label(&self, text: String) -> String {
-        if self.router.mode() == CacheMode::Replay {
+        if self.router.mode() == LlmMode::Replay {
             format!("[llm replay: recorded responses, no live model] {text}")
         } else {
             text
@@ -159,6 +158,8 @@ pub(crate) struct Desk {
     pub(crate) proposals: Vec<(String, String)>,
     /// Tool requests so far.
     tool_requests: u32,
+    /// Artifacts this role already refused instructions from.
+    refusals: HashSet<String>,
     /// Scribe's records.
     pub(crate) records: Records,
     /// Where findings and proposals go (to Scribe).
@@ -177,6 +178,7 @@ impl Desk {
             findings: Vec::new(),
             proposals: Vec::new(),
             tool_requests: 0,
+            refusals: HashSet::new(),
             records: Records::default(),
             notes,
             replay_noted: false,
@@ -204,13 +206,32 @@ struct Thread {
     sensitive: bool,
 }
 
+/// What the trace pane shows for one step.
+#[derive(Debug)]
+struct Shown {
+    /// Short result text.
+    preview: String,
+    /// The daemon's verdict when the step ran a command; `denied` means the grant blocked it.
+    outcome: Option<ExecOutcome>,
+}
+
+impl Shown {
+    /// A step that ran no command.
+    fn text(text: &str) -> Self {
+        Self {
+            preview: preview(text, PREVIEW_CHARS),
+            outcome: None,
+        }
+    }
+}
+
 /// A finished tool call: what the model reads back and what the trace shows.
 #[derive(Debug)]
 struct Done {
     /// Text for the model.
     text: String,
-    /// Trace preview.
-    preview: String,
+    /// Trace content.
+    shown: Shown,
     /// The text carries evidence and must be screened before a model sees it.
     untrusted: bool,
 }
@@ -219,7 +240,7 @@ impl Done {
     /// A runner-authored result.
     fn ok(text: String) -> Self {
         Self {
-            preview: preview(&text, PREVIEW_CHARS),
+            shown: Shown::text(&text),
             text,
             untrusted: false,
         }
@@ -227,9 +248,10 @@ impl Done {
 
     /// A failure the model should know about.
     fn error(reason: &str) -> Self {
+        let text = format!("error: {reason}");
         Self {
-            text: format!("error: {reason}"),
-            preview: preview(&format!("error: {reason}"), PREVIEW_CHARS),
+            shown: Shown::text(&text),
+            text,
             untrusted: false,
         }
     }
@@ -399,7 +421,7 @@ impl Agent {
             step,
             "answer",
             Value::Object(Map::new()),
-            preview(&answer, PREVIEW_CHARS),
+            Shown::text(&answer),
         )
         .await;
         if !answer.is_empty() {
@@ -450,7 +472,7 @@ impl Agent {
         let Call { tool, args, action } = match outcome {
             Ok(call) => call,
             Err(Rejection { args, reason }) => {
-                self.trace(desk.steps, name, args, preview(&reason, PREVIEW_CHARS))
+                self.trace(desk.steps, name, args, Shown::text(&reason))
                     .await;
                 return format!("error: {reason}. Fix the call and try again.");
             }
@@ -463,12 +485,12 @@ impl Agent {
             }
             Action::RequestTool(ask) => self.request_tool(desk, ask).await,
             Action::Finding(finding) => self.report(desk, finding).await,
+            Action::Refusal(refusal) => self.refuse(desk, refusal).await,
             Action::Proposal(proposal) => self.propose(desk, proposal).await,
             Action::Scope(update) => self.scope(desk, update).await,
             Action::Incident(update) => self.incident(desk, update).await,
         };
-        self.trace(desk.steps, tool.name(), args, done.preview)
-            .await;
+        self.trace(desk.steps, tool.name(), args, done.shown).await;
         match subject {
             Some(subject) if done.untrusted => self.screen(desk, thread, &subject, done.text).await,
             Some(_) | None => done.text,
@@ -485,7 +507,7 @@ impl Agent {
             timeout_ms: spec.timeout_ms,
         });
         match self.conn.request(request, wait).await {
-            Ok(CoreResponse::Exec(result)) => self.observe(&result).await,
+            Ok(CoreResponse::Exec(result)) => self.observe(result).await,
             Ok(CoreResponse::Error { message }) => Done::error(&format!("cleanroomd: {message}")),
             Ok(other) => Done::error(&format!(
                 "cleanroomd answered exec with `{}`",
@@ -495,36 +517,34 @@ impl Agent {
         }
     }
 
-    /// Turn an exec result into model text and a trace preview; count grant denials.
-    async fn observe(&self, result: &ExecResult) -> Done {
-        match &result.outcome {
-            ExecOutcome::Denied { reason } => {
-                self.shared.counters.denied_by_os();
-                self.counters_status().await;
-                Done {
-                    text: format!(
-                        "denied by the stratum grant: {reason}. The command did not run."
-                    ),
-                    preview: preview(&format!("denied: {reason}"), PREVIEW_CHARS),
-                    untrusted: false,
-                }
-            }
-            ExecOutcome::Exited { code } => Done {
-                text: exec_text(&format!("exit code {code}"), result),
-                preview: preview(
-                    &format!("exit {code}: {}", first_output(result)),
-                    PREVIEW_CHARS,
-                ),
-                untrusted: true,
+    /// Turn an exec result into model text and a trace step; count grant denials.
+    async fn observe(&self, result: ExecResult) -> Done {
+        let (text, preview_text) = match &result.outcome {
+            ExecOutcome::Denied { reason } => (
+                format!("denied by the stratum grant: {reason}. The command did not run."),
+                reason.clone(),
+            ),
+            ExecOutcome::Exited { code } => (
+                exec_text(&format!("exit code {code}"), &result),
+                first_output(&result).to_owned(),
+            ),
+            ExecOutcome::TimedOut => (
+                exec_text("timed out; partial output follows", &result),
+                first_output(&result).to_owned(),
+            ),
+        };
+        let denied = matches!(result.outcome, ExecOutcome::Denied { .. });
+        if denied {
+            self.shared.counters.denied_by_os();
+            self.publish_counters().await;
+        }
+        Done {
+            text,
+            shown: Shown {
+                preview: preview(&preview_text, PREVIEW_CHARS),
+                outcome: Some(result.outcome),
             },
-            ExecOutcome::TimedOut => Done {
-                text: exec_text("timed out; partial output follows", result),
-                preview: preview(
-                    &format!("timed out: {}", first_output(result)),
-                    PREVIEW_CHARS,
-                ),
-                untrusted: true,
-            },
+            untrusted: !denied,
         }
     }
 
@@ -557,8 +577,8 @@ impl Agent {
                 if safe {
                     return text;
                 }
-                self.shared.counters.flagged(thread.guardrails);
-                self.counters_status().await;
+                self.shared.counters.flagged();
+                self.publish_counters().await;
                 if thread.guardrails {
                     safety::envelope(&artifact, &rating, &text)
                 } else {
@@ -610,7 +630,8 @@ impl Agent {
         self.publish(BusBody::Route { route, reason }).await;
     }
 
-    /// Ask the daemon to admit a tool; wait for the commander if the request is pending.
+    /// Ask the daemon to admit a tool (the daemon publishes `tool_request` and `tool_decision`);
+    /// wait for the commander if the request is pending.
     async fn request_tool(&self, desk: &mut Desk, ask: ToolAsk) -> Done {
         desk.tool_requests += 1;
         let id = format!(
@@ -629,7 +650,6 @@ impl Agent {
             reason: ask.reason,
         };
         let mut decisions = self.shared.control.subscribe();
-        self.publish(BusBody::ToolRequest(request.clone())).await;
         let decision = match self
             .conn
             .request(CoreRequest::RequestTool(request), TOOL_REQUEST_WAIT)
@@ -652,6 +672,31 @@ impl Agent {
             Err(error) => return Done::error(&format!("{error:#}")),
         };
         Done::ok(describe_decision(&ask.tool, decision))
+    }
+
+    /// Publish a refusal of an instruction found in untrusted data (blocked by the model).
+    async fn refuse(&self, desk: &mut Desk, refusal: RefusalArgs) -> Done {
+        if desk.refusals.contains(&refusal.artifact) {
+            return Done::ok(format!(
+                "a refusal for {} is already recorded",
+                refusal.artifact
+            ));
+        }
+        let text = format!(
+            "refusal recorded for {}; keep investigating",
+            refusal.artifact
+        );
+        let body = BusBody::Refusal {
+            artifact: refusal.artifact.clone(),
+            instruction: refusal.instruction,
+        };
+        if let Err(error) = self.conn.publish(body).await {
+            return Done::error(&format!("cannot publish the refusal: {error:#}"));
+        }
+        desk.refusals.insert(refusal.artifact);
+        self.shared.counters.refused();
+        self.publish_counters().await;
+        Done::ok(text)
     }
 
     /// Publish a finding and send it to Scribe.
@@ -729,18 +774,26 @@ impl Agent {
     }
 
     /// Publish a trace step and log it.
-    async fn trace(&self, step: u32, tool: &str, args: Value, result_preview: String) {
-        tracing::info!(role = self.name(), step, tool, "{result_preview}");
+    async fn trace(&self, step: u32, tool: &str, args: Value, shown: Shown) {
+        tracing::info!(
+            role = self.name(),
+            step,
+            tool,
+            outcome = outcome_label(shown.outcome.as_ref()),
+            "{}",
+            shown.preview
+        );
         self.publish(BusBody::Trace {
             step,
             tool: tool.to_owned(),
             args,
-            result_preview,
+            result_preview: shown.preview,
+            outcome: shown.outcome,
         })
         .await;
     }
 
-    /// Publish a status line (labelled in replay mode).
+    /// Publish a status line for humans (labelled in replay mode).
     pub(crate) async fn status(&self, text: String) {
         tracing::info!(role = self.name(), "{text}");
         self.publish(BusBody::Status {
@@ -749,12 +802,9 @@ impl Agent {
         .await;
     }
 
-    /// Publish the counters status line.
-    pub(crate) async fn counters_status(&self) {
-        self.publish(BusBody::Status {
-            text: self.shared.counters_line(),
-        })
-        .await;
+    /// Publish the current `counters`.
+    pub(crate) async fn publish_counters(&self) {
+        self.publish(self.shared.counters()).await;
     }
 
     /// Publish, logging instead of failing: the bus is best effort for the loop itself.
@@ -834,10 +884,22 @@ fn exec_text(head: &str, result: &ExecResult) -> String {
 
 /// The first non-empty output stream, for previews.
 fn first_output(result: &ExecResult) -> &str {
-    if result.stdout.trim().is_empty() {
+    if !result.stdout.trim().is_empty() {
+        &result.stdout
+    } else if !result.stderr.trim().is_empty() {
         &result.stderr
     } else {
-        &result.stdout
+        "(no output)"
+    }
+}
+
+/// A daemon outcome for log lines.
+fn outcome_label(outcome: Option<&ExecOutcome>) -> String {
+    match outcome {
+        None => String::new(),
+        Some(ExecOutcome::Exited { code }) => format!("exited {code}"),
+        Some(ExecOutcome::TimedOut) => "timed out".to_owned(),
+        Some(ExecOutcome::Denied { .. }) => "denied".to_owned(),
     }
 }
 
