@@ -26,6 +26,8 @@ use crate::strata::{self, VICTIM_BIN, VICTIM_DROP, VICTIM_LOGS, VICTIM_SHARE};
 
 /// Name of the ransomware binary inside the victim stratum.
 const RANSOM: &str = "cleanroom-ransom";
+/// The scenario this daemon runs; `ransomware-<variant>` runs one of the ransomware's variants.
+const RANSOMWARE: &str = "ransomware";
 /// How sure the integrity check is about what it flags.
 const INTEGRITY_CONFIDENCE: u8 = 90;
 /// Evidence paths listed per asset at most.
@@ -323,9 +325,25 @@ pub(crate) fn install_ransom(layout: &Layout, binary: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The detonation command inside the victim stratum.
-pub(crate) fn detonation_argv() -> Vec<String> {
-    [
+/// The detonation command inside the victim stratum for `scenario`: `ransomware`, or
+/// `ransomware-<variant>`, which passes `--variant=<variant>` (the ransomware checks the name).
+///
+/// # Errors
+/// Fails for any other scenario name.
+pub(crate) fn detonation_argv(scenario: &str) -> Result<Vec<String>> {
+    let variant = scenario
+        .strip_prefix(RANSOMWARE)
+        .and_then(|rest| match rest.strip_prefix('-') {
+            None if rest.is_empty() => Some(None),
+            Some(name) if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_lowercase()) => {
+                Some(Some(name))
+            }
+            Some(_) | None => None,
+        })
+        .with_context(|| {
+            format!("unknown scenario {scenario}; this cleanroomd runs {RANSOMWARE} and {RANSOMWARE}-<variant>")
+        })?;
+    let mut argv: Vec<String> = [
         &format!("{VICTIM_BIN}/{RANSOM}"),
         "detonate",
         "--share",
@@ -336,7 +354,9 @@ pub(crate) fn detonation_argv() -> Vec<String> {
         VICTIM_LOGS,
     ]
     .map(str::to_owned)
-    .into()
+    .into();
+    argv.extend(variant.map(|name| format!("--variant={name}")));
+    Ok(argv)
 }
 
 /// How a seeded file looks after a detonation.

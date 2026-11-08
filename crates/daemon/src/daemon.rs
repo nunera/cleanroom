@@ -27,8 +27,6 @@ use crate::{keys, lock, now, receipts};
 
 /// The root every stratum runs on.
 const ROOT: &str = "debian";
-/// The scenario this daemon runs.
-const RANSOMWARE: &str = "ransomware";
 /// Longest the ransomware may run.
 const DETONATION_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -671,9 +669,7 @@ impl Daemon {
     )]
     async fn detonate(&self, peer: &Peer, name: &str) -> Result<CoreResponse> {
         peer.human("detonate")?;
-        if name != RANSOMWARE {
-            bail!("unknown scenario {name}; this cleanroomd runs {RANSOMWARE}");
-        }
+        let argv = scenario::detonation_argv(name)?;
         let mut incident = self.scenario.incident().await;
         if let Some(id) = incident.as_ref() {
             bail!("acme-fs was already detonated ({id}); reset first");
@@ -688,7 +684,7 @@ impl Daemon {
             "{} detonated {name} in the acme-fs stratum: Debian root read-only, share read-write, no network (receipt #{seq})",
             peer.name()
         ));
-        let summary = self.run_ransomware(&root, &ransom).await?;
+        let summary = self.run_ransomware(&root, &ransom, argv).await?;
         self.status(format!(
             "ransomware finished in acme-fs: {} files locked, {} files copied into a staging directory, ransom note {}",
             summary.locked.len(),
@@ -700,18 +696,22 @@ impl Daemon {
         Ok(CoreResponse::Ok)
     }
 
-    /// Launch `cleanroom-ransom detonate` in the victim stratum and read its summary.
+    /// Launch `argv` (`cleanroom-ransom detonate`) in the victim stratum and read its summary.
     ///
     /// # Errors
     /// Fails if the binary cannot be installed, the sandbox fails, or the run does not succeed.
-    async fn run_ransomware(&self, root: &Admitted, ransom: &Path) -> Result<scenario::Summary> {
+    async fn run_ransomware(
+        &self,
+        root: &Admitted,
+        ransom: &Path,
+        argv: Vec<String>,
+    ) -> Result<scenario::Summary> {
         let layout = self.layout.clone();
         let binary = ransom.to_owned();
         spawn_blocking(move || scenario::install_ransom(&layout, &binary))
             .await
             .context("installing the ransomware panicked")??;
         let grant = strata::victim(&self.layout, root)?;
-        let argv = scenario::detonation_argv();
         let launch = Launch {
             rootfs: &root.rootfs,
             grant: &grant,

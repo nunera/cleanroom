@@ -303,6 +303,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cleanroom-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cleanroom-proto",
+ "ed25519-dalek",
+ "hex",
+ "humantime",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cleanroom-proto"
 version = "0.1.0"
 dependencies = [

