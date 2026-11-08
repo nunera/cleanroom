@@ -89,6 +89,11 @@ Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, N
 ```sh
 cleanroomd [--socket PATH] [--state DIR] [--repo DIR]   # serve until SIGINT/SIGTERM
 cleanroomd [--socket PATH] admit ROOT                   # ask the running daemon: exit 0 admitted, 1 rejected, 2 error
+cleanroomd [--socket PATH] verify                       # receipt signatures and chain: exit 0 intact, 1 broken
+cleanroomd [--socket PATH] reset                        # re-seed the victim, close the incident, keep receipts
+cleanroomd [--socket PATH] detonate [SCENARIO]          # default ransomware; starts the investigation
+cleanroomd [--socket PATH] tamper [ROOT]                # flip a byte in a staged copy; the next admit is rejected
+cleanroomd [--socket PATH] run STRATUM [--timeout S] -- CMD...  # as that agent, under its grant: exit = CMD's, 124 timeout, 126 denied
 ```
 
 `--repo` is where `scenario/` and `roots/` live (default: the nearest ancestor of the binary that has both, else the current directory). State lives in `$XDG_STATE_HOME/cleanroom`: `store/oci`, `store/containers-policy.json`, `store/staging/<root>`, `store/roots/<root>/rootfs`, `keys/cleanroomd.key`, `keys/members.ndjson`, `run/acme-fs/{share,drop,logs}`, `run/scratch/<role>`, `run/bin` and `receipts.ndjson`.

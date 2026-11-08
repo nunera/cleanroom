@@ -27,11 +27,11 @@ mod tools;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use cleanroom_proto::Timestamp;
+use cleanroom_proto::{CoreRequest, Timestamp};
 use tracing_subscriber::EnvFilter;
 
 use crate::daemon::Daemon;
@@ -58,14 +58,42 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// One-shot client commands.
+/// One-shot client commands against the running daemon. Each exits 2 on errors (no daemon, a
+/// refused request).
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Ask the running daemon to admit a root. Exits 0 when admitted, 1 when rejected, 2 on
-    /// errors.
+    /// Admit a root. Exits 0 when admitted, 1 when rejected.
     Admit {
         /// Root name, for example `debian`.
         root: String,
+    },
+    /// Verify every receipt's signature and the hash chain. Exits 0 when intact, 1 when broken.
+    Verify,
+    /// Restore the victim share and close the incident; the receipt log is kept.
+    Reset,
+    /// Detonate a scenario in the victim stratum and start the investigation.
+    Detonate {
+        /// Scenario name.
+        #[arg(default_value = "ransomware")]
+        scenario: String,
+    },
+    /// Flip one byte in a staged copy of a root, so the next `admit` is rejected.
+    Tamper {
+        /// Root name.
+        #[arg(default_value = "debian")]
+        root: String,
+    },
+    /// Run a command in an agent's stratum under that agent's grant, as that agent. Exits with
+    /// the command's code, 124 on timeout, 126 when the grant denies it.
+    Run {
+        /// Agent stratum: hunter, forensics, scribe or containment.
+        stratum: String,
+        /// Seconds before the sandbox is killed.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Program and arguments, after `--`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -80,7 +108,7 @@ async fn main() -> ExitCode {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Admit { root }) => match admit(cli.socket, &root).await {
+        Some(command) => match client_command(cli.socket, command).await {
             Ok(code) => code,
             Err(error) => {
                 tracing::error!("{error:#}");
@@ -110,16 +138,40 @@ async fn serve(cli: Cli) -> Result<()> {
     server::serve(daemon, listener, &socket).await
 }
 
-/// `cleanroomd admit <root>`.
+/// Run one client command against the daemon on `socket` (default: the usual path).
 ///
 /// # Errors
 /// Fails if the socket path cannot be resolved or the daemon cannot answer.
-async fn admit(socket: Option<PathBuf>, root: &str) -> Result<ExitCode> {
+async fn client_command(socket: Option<PathBuf>, command: Command) -> Result<ExitCode> {
     let socket = match socket {
         Some(socket) => socket,
         None => layout::default_socket()?,
     };
-    client::admit(&socket, root).await
+    match command {
+        Command::Admit { root } => client::admit(&socket, &root).await,
+        Command::Verify => client::verify(&socket).await,
+        Command::Reset => {
+            client::simple(
+                &socket,
+                CoreRequest::Reset,
+                "reset: victim re-seeded, incident closed",
+            )
+            .await
+        }
+        Command::Detonate { scenario } => {
+            let done = format!("detonated {scenario}; the investigation has started");
+            client::simple(&socket, CoreRequest::Detonate { scenario }, &done).await
+        }
+        Command::Tamper { root } => {
+            let done = format!("tampered a staged copy of {root}; the next admit is rejected");
+            client::simple(&socket, CoreRequest::Tamper { root }, &done).await
+        }
+        Command::Run {
+            stratum,
+            timeout,
+            argv,
+        } => client::run(&socket, &stratum, argv, Duration::from_secs(timeout)).await,
+    }
 }
 
 /// The current time as an RFC 3339 UTC timestamp with seconds precision.
