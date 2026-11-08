@@ -378,7 +378,8 @@ impl Voice {
             | Action::Proposal(_)
             | Action::Refusal(_)
             | Action::Scope(_)
-            | Action::Incident(_) => "error: the Lead has no such tool".to_owned(),
+            | Action::Incident(_)
+            | Action::Rule(_) => "error: the Lead has no such tool".to_owned(),
         }
     }
 

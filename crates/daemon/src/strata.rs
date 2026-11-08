@@ -156,6 +156,35 @@ pub(crate) fn victim(layout: &Layout, root: &Admitted) -> Result<Grant> {
     })
 }
 
+/// Where the clean seed files sit in the rule-check stratum (an existing mount point).
+pub(crate) const RULE_CHECK_SEED: &str = SCRATCH;
+/// Where the candidate rule's directory sits in the rule-check stratum.
+pub(crate) const RULE_CHECK_RULES: &str = RULES;
+
+/// The rule-check grant: the clean seed files at [`RULE_CHECK_SEED`], the evidence, and the
+/// directory holding only the candidate rule at [`RULE_CHECK_RULES`], all read-only, plus the
+/// Nix store for `yara`; no network.
+///
+/// # Errors
+/// Fails if a host path is not UTF-8.
+pub(crate) fn rule_check(layout: &Layout, root: &Admitted) -> Result<Grant> {
+    Ok(Grant {
+        stratum: "rule-check".to_owned(),
+        role: None,
+        root: root.manifest.clone(),
+        mounts: vec![
+            mount(&layout.seed(), RULE_CHECK_SEED, MountMode::ReadOnly)?,
+            mount(&layout.share(), EVIDENCE_SHARE, MountMode::ReadOnly)?,
+            mount(&layout.dropbox(), EVIDENCE_DROP, MountMode::ReadOnly)?,
+            mount(&layout.logs(), EVIDENCE_LOGS, MountMode::ReadOnly)?,
+            mount(&layout.rule_check(), RULE_CHECK_RULES, MountMode::ReadOnly)?,
+            mount(Path::new(NIX_STORE), NIX_STORE, MountMode::ReadOnly)?,
+        ],
+        network: Network::None,
+        tools: vec!["yara".to_owned()],
+    })
+}
+
 /// One bind of a grant.
 ///
 /// # Errors

@@ -11,15 +11,18 @@ use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
 use cleanroom_proto::{
     Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
     ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, ModelCall, Outcome, Principal,
-    Revocation, Role, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource, domain,
+    Revocation, Role, RuleSubmission, ScopeRecord, Signed, ToolDecision, ToolRequest, ToolSource,
+    domain,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use sha2::{Digest as _, Sha256};
 use tokio::task::spawn_blocking;
 
 use crate::bus::{Bus, Outbox, Subject};
 use crate::layout::Layout;
 use crate::members::Members;
 use crate::roots::{Admitted, Roots, Verdict};
+use crate::rules;
 use crate::scenario::{self, Scenario};
 use crate::strata::{self, Captured, Launch};
 use crate::tools::{self, Granted, Grants, Policy};
@@ -27,6 +30,8 @@ use crate::{keys, lock, now, receipts};
 
 /// The root every stratum runs on.
 const ROOT: &str = "debian";
+/// How long one scan of a submitted rule may run.
+const RULE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest the ransomware may run.
 const DETONATION_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -256,6 +261,9 @@ impl Daemon {
             CoreRequest::Exec(exec) => Box::pin(self.exec(peer, exec)).await,
             CoreRequest::RequestTool(ask) => Box::pin(self.request_tool(peer, ask)).await,
             CoreRequest::ModelCall(call) => self.model_call(peer, call),
+            CoreRequest::SubmitRule(submission) => {
+                Box::pin(self.submit_rule(peer, submission)).await
+            }
             CoreRequest::Approve(decision) => self.approve(peer, decision),
             CoreRequest::Enroll(member) => self.enroll(peer, member),
             CoreRequest::Revoke(revocation) => self.revoke(peer, revocation),
@@ -289,6 +297,95 @@ impl Daemon {
         };
         self.receipt(Principal::Agent { role }, action, Outcome::Allowed)?;
         Ok(CoreResponse::Ok)
+    }
+
+    /// `submit_rule`: check an investigator's YARA rule in a sandbox (`yara` over the clean seed
+    /// files, then over the evidence) and admit it into `/rules` only if it compiles, matches no
+    /// clean file and matches some evidence. Either way the verdict is a receipt and a status
+    /// line; a rejection comes back as an error the agent can fix.
+    ///
+    /// # Errors
+    /// Fails for a caller that is not an investigator, a bad name or size, no open incident, a
+    /// rejected rule, or a sandbox or receipt failure.
+    async fn submit_rule(&self, peer: &Peer, submission: RuleSubmission) -> Result<CoreResponse> {
+        let role = peer.role(submission.from)?;
+        if !matches!(role, Role::Hunter | Role::Forensics) {
+            bail!("only hunter and forensics write detection rules");
+        }
+        rules::check_name(&submission.name).map_err(anyhow::Error::msg)?;
+        if submission.source.trim().is_empty() || submission.source.len() > rules::SOURCE_MAX {
+            bail!("a rule has 1 to {} bytes", rules::SOURCE_MAX);
+        }
+        if lock(&self.open_incident).is_none() {
+            bail!("no incident is open; detection rules are written for one");
+        }
+        let actor = Principal::Agent { role };
+        let root = self.launchable_root(&actor).await?;
+        let yara = self
+            .grants
+            .of(Role::Hunter)
+            .into_iter()
+            .find(|tool| tool.name == "yara")
+            .context("yara is not built yet; submit the rule again shortly")?;
+        let file = format!("agent-{}.yar", submission.name);
+        let check_dir = self.layout.rule_check();
+        let candidate = check_dir.join(&file);
+        drop(std::fs::remove_dir_all(&check_dir));
+        std::fs::create_dir_all(&check_dir)
+            .and_then(|()| std::fs::write(&candidate, &submission.source))
+            .with_context(|| format!("cannot stage {}", candidate.display()))?;
+        let grant = strata::rule_check(&self.layout, &root)?;
+        let rule = format!("{}/{file}", strata::RULE_CHECK_RULES);
+        let mut scans = Vec::with_capacity(2);
+        for target in [strata::RULE_CHECK_SEED, "/evidence"] {
+            let argv = ["yara", "-r", rule.as_str(), target].map(str::to_owned);
+            scans.push(
+                strata::run(&Launch {
+                    rootfs: &root.rootfs,
+                    grant: &grant,
+                    bins: &yara.bins,
+                    argv: &argv,
+                    timeout: RULE_CHECK_TIMEOUT,
+                })
+                .await?,
+            );
+        }
+        let who = describe(&actor);
+        let name = submission.name;
+        let action = Action::YaraRule {
+            name: name.clone(),
+            digest: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(submission.source.as_bytes()))
+            ),
+        };
+        match rules::judge(&scans[0], &scans[1]) {
+            Err(reason) => {
+                let seq = self.receipt(
+                    actor,
+                    action,
+                    Outcome::Denied {
+                        reason: reason.clone(),
+                    },
+                )?;
+                self.status(format!(
+                    "OS rejected {who}'s YARA rule {name}: {reason} (receipt #{seq})"
+                ));
+                bail!("rule rejected: {reason} (receipt #{seq}); fix it and submit it again")
+            }
+            Ok(hits) => {
+                let deployed = self.layout.rules().join(&file);
+                std::fs::copy(&candidate, &deployed)
+                    .with_context(|| format!("cannot deploy {}", deployed.display()))?;
+                let seq = self.receipt(actor, action, Outcome::Allowed)?;
+                self.status(format!(
+                    "{who}'s YARA rule {name} admitted to {}/{file}: it compiles, matches none of the clean files from before the attack, and matches {} evidence file(s) (receipt #{seq})",
+                    strata::RULES,
+                    hits.len()
+                ));
+                Ok(CoreResponse::Ok)
+            }
+        }
     }
 
     /// Run a command in the caller's stratum under its grant.
@@ -377,7 +474,8 @@ impl Daemon {
             | Action::RecordUpdate { .. }
             | Action::Detonate { .. }
             | Action::EvidenceSeal { .. }
-            | Action::ModelCall { .. } => String::new(),
+            | Action::ModelCall { .. }
+            | Action::YaraRule { .. } => String::new(),
         };
         let seq = self.receipt(actor, action, receipt_outcome)?;
         if let ExecOutcome::Denied { reason } = &outcome {
@@ -1261,6 +1359,7 @@ const fn op_name(request: &CoreRequest) -> &'static str {
         CoreRequest::Exec(_) => "exec",
         CoreRequest::RequestTool(_) => "request_tool",
         CoreRequest::ModelCall(_) => "model_call",
+        CoreRequest::SubmitRule(_) => "submit_rule",
         CoreRequest::Approve(_) => "approve",
         CoreRequest::Enroll(_) => "enroll",
         CoreRequest::Revoke(_) => "revoke",

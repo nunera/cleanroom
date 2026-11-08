@@ -224,6 +224,8 @@ pub(crate) fn reseed(layout: &Layout) -> Result<BTreeMap<String, Digest>> {
         layout.dropbox(),
         layout.logs(),
         layout.scratch_root(),
+        layout.rules(),
+        layout.rule_check(),
     ] {
         empty_dir(&dir)?;
     }
@@ -235,6 +237,9 @@ pub(crate) fn reseed(layout: &Layout) -> Result<BTreeMap<String, Digest>> {
         fs::create_dir_all(&scratch)
             .with_context(|| format!("cannot create {}", scratch.display()))?;
     }
+    // Agent rules admitted during an incident go with it: every seeding starts from the
+    // repository's rules.
+    copy_tree(&layout.rules_seed(), &layout.rules())?;
     copy_tree(&seed, &share)?;
     fingerprint(&share)
 }
