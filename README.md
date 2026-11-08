@@ -35,8 +35,6 @@ Built in about 24 hours at **HackUTD 2026 (ZeroDay)** for the NVIDIA, Winstead a
 
 `cleanroomd` is the core. It runs rootless on Linux hosts that allow unprivileged user namespaces, holds the only signing key, and decides what every stratum may touch. The terminal captures below are real output from the shipped binary.
 
-<img src="docs/os/diagram-boot.png" width="100%" alt="Boot: plans/vm.json is validated, rendered for dinit or s6-rc, and booted with the chosen init as PID 1. Roots: the lock pins a manifest digest, the staged copy is checked blob by blob, unpacked, and its tree digest is re-checked at every stratum launch; one byte different is rejected with the layer named.">
-
 ### Roots are admitted by digest
 
 Each distro root is pinned in a lock file (`roots/debian-bookworm.lock.json`, `roots/alpine-3.21.lock.json`). Admission checks the manifest against the lock and every blob against the manifest, then records a digest of the unpacked tree that every launch checks again. Flip one byte and it's refused, naming the layer.
@@ -61,13 +59,13 @@ A stratum is bubblewrap with every namespace unshared, no capabilities, a cleare
 
 When an agent gets talked into wiping the evidence, the command reaches the kernel and fails there. cleanroomd records the denial, then rehashes the evidence and confirms it still matches the seal taken at detection.
 
-<img src="docs/os/diagram-exec.png" width="100%" alt="Every agent action: a Nemotron tool call goes through cleanroom-agents to cleanroomd, which launches the role's bubblewrap stratum under its grant; the kernel denies writes to the read-only evidence. After every command: a signed chained receipt, an evidence rehash against the seal, a status line, and offline verification.">
-
 <img src="docs/os/run.png" width="100%" alt="cleanroomd run hunter rm -rf /evidence/acme-fs: Read-only file system for every file, denied by the hunter grant, receipt 20, exit 126; then cleanroomd verify: chain intact">
 
 ### Software from any distro
 
 The roots are real distros, so their software runs unchanged. The command center ships as a Debian `.deb` and runs inside the admitted Debian root on a NixOS host (`scripts/launch-tui.sh`). Hunter works on Debian's GNU userland and Forensics on Alpine's busybox. Tools the agents ask for (`yara`, `volatility3`, `tshark`, `file`, `binutils`) come from a pinned nixpkgs and carry their own libraries, so the same build runs in either root. Anything outside that allowlist waits for a commander's signature.
+
+<img src="docs/visuals/distros.png" width="100%" alt="Debian bookworm and Alpine 3.21 roots, each pinned by digest and admitted, side by side on one Cleanroom host; a Debian package runs unchanged">
 
 ### Choose your init
 
@@ -81,13 +79,25 @@ That boots Cleanroom in QEMU/KVM with the chosen init as PID 1. It admits the De
 
 NixOS is declarative too, but it's built around systemd, and software has to be packaged in nixpkgs. Cleanroom keeps the plan independent of the init, keeps the trusted base to a small supervisor, and runs other distros' software as it ships.
 
+<table>
+  <tr>
+    <td width="50%"><img src="docs/visuals/plan.png" alt="One declared plan: cleanroomd, admit-debian, admit-alpine, cleanroom-agents and cleanroom-tui with their dependencies"></td>
+    <td width="50%"><img src="docs/visuals/nixos.png" alt="NixOS fixes systemd as PID 1 and packages everything in nixpkgs; Cleanroom picks dinit or s6-rc at boot and runs Debian and Alpine roots as they are"></td>
+  </tr>
+</table>
+
 <img src="docs/os/plan.png" width="100%" alt="cleanroomd plan validate: responder.json is valid with boot order under dinit; cycle.json is invalid under s6-rc with the dependency cycle named">
 
 ## Nemotron inside the OS
 
 Every role runs on Nemotron, and every call goes through the OS like any other action.
 
-<img src="docs/os/diagram-model.png" width="100%" alt="Every model call: evidence is scored by Safety Guard, routed by an egress policy to hosted Nemotron or a local Brev GPU, and the answer and reasoning are recorded by cleanroomd as a model_call receipt whose stored trace can be verified offline.">
+<table>
+  <tr>
+    <td width="50%"><img src="docs/visuals/family.png" alt="The Nemotron family: Nano, Super and Ultra; Clean, Hunter, Forensics and Containment on Lightning, Vision on Super VL, Scribe on Ultra"></td>
+    <td width="50%"><img src="docs/visuals/local.png" alt="Self-hosted: Cleanroom on Nemotron Lightning on vLLM on an RTX PRO 6000; evidence stays on the machine; 0.70 s local vs 1.06 s hosted"></td>
+  </tr>
+</table>
 
 | Role | Model | Why this one |
 | --- | --- | --- |
@@ -110,6 +120,8 @@ Its next action was that command, and the kernel denied it in the very next rece
 
 **Memory tiers follow the model's layout.** Lightning has 52 layers: 23 Mamba-2, 23 mixture of experts and 6 attention. Only the attention layers recall exact tokens, and their cache grows with every one.
 
+<img src="docs/visuals/hybrid.png" width="100%" alt="Lightning's layer groups: Mamba-2, MoE and attention blocks repeated, 23 Mamba-2, 23 MoE, 6 attention, 52 layers">
+
 ```text
 MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME     from the served checkpoint's config.json
      ^      ^      ^      ^      ^        ^
@@ -124,6 +136,8 @@ With `--memory-tiers`, anything the attacker wrote enters an agent's context as 
 
 **Training data the OS can vouch for.** A step is tagged trainable only if guardrails were on, the kernel didn't deny it and the safety model didn't flag it. `cleanroom-agents export-gym` turns an incident into NeMo Gym rows that pass NeMo Gym's own validator.
 
+<img src="docs/visuals/tags.png" width="100%" alt="Agent steps tagged with role, model, what they read and provenance pass a gate: guardrails on, kernel allowed, safety model passed; denied and flagged steps drop out, trainable steps go on">
+
 ## Clean, the lead agent
 
 <img align="right" width="150" src="docs/assets/clean.svg" alt="Clean, the mascot">
@@ -131,6 +145,8 @@ With `--memory-tiers`, anything the attacker wrote enters an agent's context as 
 Clean is the agent you talk to. It narrates the incident as it happens, answers your questions and asks the specialists for you. It has no exec rights at all. Ask "did anyone try to delete the evidence?" and it answers with the receipt numbers.
 
 The team is split the way a mixture of experts model is: Clean routes each task to one specialist (Hunter, Forensics, Scribe or Containment), and each specialist runs in its own stratum with only the grant its job needs.
+
+<img src="docs/visuals/experts.png" width="100%" alt="Clean routes each task to Hunter, Forensics, Scribe or Containment, each inside its own walled stratum">
 
 <br clear="right">
 
