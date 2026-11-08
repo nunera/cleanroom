@@ -6,6 +6,7 @@
 //! the conversation and route it to the local model, the safety model scores the text, and with
 //! guardrails on an unsafe verdict wraps it in an untrusted-data envelope.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use crate::sensitivity::{self, Detector};
 use crate::text::{clip, preview};
 use crate::tools::{
     self, Action, Call, ExecSpec, FindingArgs, IncidentUpdate, Prepared, ProposalArgs, RefusalArgs,
-    Rejection, ScopeUpdate, ToolAsk, ToolSpec,
+    Rejection, ScopeUpdate, Tool, ToolAsk, ToolSpec,
 };
 
 /// Characters of tool output a model sees at most.
@@ -270,17 +271,34 @@ pub(crate) struct Agent {
     hardened: Vec<ToolSpec>,
     /// Tools under the naive prompt.
     naive: Vec<ToolSpec>,
+    /// The reporting subset of `hardened`, for an agent that has not reported yet.
+    hardened_reporting: Vec<ToolSpec>,
+    /// The reporting subset of `naive`.
+    naive_reporting: Vec<ToolSpec>,
+}
+
+/// What a step offers and says, given where the agent is in its step budget.
+#[derive(Debug)]
+struct Budget {
+    /// A reminder to add before the step.
+    nudge: Option<String>,
+    /// Offer only the reporting tools: the agent has not reported anything yet.
+    report_only: bool,
 }
 
 impl Agent {
     /// An agent for `role`.
     pub(crate) fn new(role: Role, conn: Arc<Connection>, shared: Arc<Shared>) -> Self {
+        let hardened = roles::tool_specs(role, true);
+        let naive = roles::tool_specs(role, false);
         Self {
             role,
             conn,
             shared,
-            hardened: roles::tool_specs(role, true),
-            naive: roles::tool_specs(role, false),
+            hardened_reporting: reporting(&hardened),
+            naive_reporting: reporting(&naive),
+            hardened,
+            naive,
         }
     }
 
@@ -290,6 +308,16 @@ impl Agent {
             &self.hardened
         } else {
             &self.naive
+        }
+    }
+
+    /// The tools one step offers under `budget`.
+    fn offered(&self, guardrails: bool, budget: &Budget) -> &[ToolSpec] {
+        match (guardrails, budget.report_only) {
+            (true, false) => &self.hardened,
+            (false, false) => &self.naive,
+            (true, true) => &self.hardened_reporting,
+            (false, true) => &self.naive_reporting,
         }
     }
 
@@ -310,24 +338,17 @@ impl Agent {
         thread.messages.push(Message::User { content: task });
         for remaining in (1..=self.shared.max_steps).rev() {
             self.follow_guardrails(&mut thread).await;
-            if remaining == WRAP_UP_CALLS && self.shared.max_steps > WRAP_UP_CALLS {
-                thread.messages.push(Message::User {
-                    content: format!(
-                        "You have {remaining} model calls left in this loop. Make the tool calls that matter most now (report findings you have not reported, record updates, proposals), then reply with a short summary and no tool call."
-                    ),
-                });
+            let budget = self.budget(desk, &thread, remaining);
+            let offered = self.offered(thread.guardrails, &budget);
+            if let Some(nudge) = budget.nudge {
+                thread.messages.push(Message::User { content: nudge });
             }
             desk.steps += 1;
             let route = self.route(desk, &thread).await;
             let reply = match self
                 .shared
                 .router
-                .chat(
-                    self.role,
-                    route,
-                    &thread.messages,
-                    self.tools(thread.guardrails),
-                )
+                .chat(self.role, route, &thread.messages, offered)
                 .await
             {
                 Ok(reply) => reply,
@@ -345,7 +366,7 @@ impl Agent {
                 self.answer(desk.steps, reply.content).await;
                 return;
             }
-            self.run_calls(desk, &mut thread, reply).await;
+            self.run_calls(desk, &mut thread, reply, offered).await;
         }
         self.status(format!(
             "{} reached the step cap ({}) and stopped",
@@ -353,6 +374,37 @@ impl Agent {
             self.shared.max_steps
         ))
         .await;
+    }
+
+    /// Where the agent stands in its step budget.
+    ///
+    /// Halfway through without a finding, and in the last calls, it is reminded to report; an
+    /// agent that still has not reported anything is offered only the reporting tools at those
+    /// points, so findings always reach Scribe.
+    fn budget(&self, desk: &Desk, thread: &Thread, remaining: u32) -> Budget {
+        let max = self.shared.max_steps;
+        let silent = desk.findings.is_empty()
+            && self
+                .tools(thread.guardrails)
+                .iter()
+                .any(|spec| spec.tool == Tool::ReportFinding);
+        let wrapping_up = remaining <= WRAP_UP_CALLS && max > WRAP_UP_CALLS;
+        let halfway = max >= 6 && remaining == max / 2;
+        let nudge = if remaining == WRAP_UP_CALLS && wrapping_up {
+            Some(format!(
+                "You have {remaining} model calls left in this loop. Make the tool calls that matter most now (report findings you have not reported, record updates, proposals), then reply with a short summary and no tool call."
+            ))
+        } else if halfway && silent {
+            Some(format!(
+                "Half of your {max} model calls are used and you have not reported a finding yet. Report what you have established so far with report_finding now, then continue."
+            ))
+        } else {
+            None
+        };
+        Budget {
+            nudge,
+            report_only: silent && (wrapping_up || halfway),
+        }
     }
 
     /// Swap the system prompt if the commander toggled guardrails since the last step.
@@ -432,15 +484,21 @@ impl Agent {
         }
     }
 
-    /// Check, record and run every tool call of one reply.
-    async fn run_calls(&self, desk: &mut Desk, thread: &mut Thread, reply: Reply) {
+    /// Check (against the tools this step offered), record and run every tool call of one reply.
+    async fn run_calls(
+        &self,
+        desk: &mut Desk,
+        thread: &mut Thread,
+        reply: Reply,
+        offered: &[ToolSpec],
+    ) {
         let mut history = Vec::with_capacity(reply.tool_calls.len());
         let mut outcomes = Vec::with_capacity(reply.tool_calls.len());
         for call in &reply.tool_calls {
             let Prepared {
                 history_arguments,
                 outcome,
-            } = tools::prepare(self.tools(thread.guardrails), &call.name, &call.arguments);
+            } = tools::prepare(offered, &call.name, &call.arguments);
             history.push(ToolCall::new(
                 call.id.clone(),
                 call.name.clone(),
@@ -519,19 +577,22 @@ impl Agent {
 
     /// Turn an exec result into model text and a trace step; count grant denials.
     async fn observe(&self, result: ExecResult) -> Done {
-        let (text, preview_text) = match &result.outcome {
-            ExecOutcome::Denied { reason } => (
-                format!("denied by the stratum grant: {reason}. The command did not run."),
-                reason.clone(),
-            ),
-            ExecOutcome::Exited { code } => (
-                exec_text(&format!("exit code {code}"), &result),
-                first_output(&result).to_owned(),
-            ),
-            ExecOutcome::TimedOut => (
-                exec_text("timed out; partial output follows", &result),
-                first_output(&result).to_owned(),
-            ),
+        let (text, shown) = {
+            let (text, raw): (String, Cow<'_, str>) = match &result.outcome {
+                ExecOutcome::Denied { reason } => (
+                    format!("denied by the stratum grant: {reason}. The command did not run."),
+                    Cow::Borrowed(reason),
+                ),
+                ExecOutcome::Exited { code } => (
+                    exec_text(&format!("exit code {code}"), &result),
+                    first_output(&result),
+                ),
+                ExecOutcome::TimedOut => (
+                    exec_text("timed out; partial output follows", &result),
+                    first_output(&result),
+                ),
+            };
+            (text, preview(&raw, PREVIEW_CHARS))
         };
         let denied = matches!(result.outcome, ExecOutcome::Denied { .. });
         if denied {
@@ -541,7 +602,7 @@ impl Agent {
         Done {
             text,
             shown: Shown {
-                preview: preview(&preview_text, PREVIEW_CHARS),
+                preview: shown,
                 outcome: Some(result.outcome),
             },
             untrusted: !denied,
@@ -863,18 +924,27 @@ fn describe_decision(tool: &str, decision: Option<ToolDecision>) -> String {
     }
 }
 
-/// Exec output as the model sees it, clipped.
+/// The reporting tools among `specs`.
+fn reporting(specs: &[ToolSpec]) -> Vec<ToolSpec> {
+    specs
+        .iter()
+        .filter(|spec| matches!(spec.tool, Tool::ReportFinding | Tool::ReportRefusal))
+        .cloned()
+        .collect()
+}
+
+/// Exec output as the model sees it, clipped; binary output is described, not dumped.
 fn exec_text(head: &str, result: &ExecResult) -> String {
     let mut text =
         String::with_capacity(head.len() + result.stdout.len() + result.stderr.len() + 48);
     text.push_str(head);
     if !result.stdout.is_empty() {
         text.push('\n');
-        text.push_str(&result.stdout);
+        text.push_str(&readable(&result.stdout));
     }
     if !result.stderr.is_empty() {
         text.push_str("\n[stderr]\n");
-        text.push_str(&result.stderr);
+        text.push_str(&readable(&result.stderr));
     }
     if result.truncated {
         text.push_str("\n[output truncated by cleanroomd]");
@@ -883,14 +953,39 @@ fn exec_text(head: &str, result: &ExecResult) -> String {
 }
 
 /// The first non-empty output stream, for previews.
-fn first_output(result: &ExecResult) -> &str {
+fn first_output(result: &ExecResult) -> Cow<'_, str> {
     if !result.stdout.trim().is_empty() {
-        &result.stdout
+        readable(&result.stdout)
     } else if !result.stderr.trim().is_empty() {
-        &result.stderr
+        readable(&result.stderr)
     } else {
-        "(no output)"
+        Cow::Borrowed("(no output)")
     }
+}
+
+/// `output` itself, or a one-line description when it is binary (for example an encrypted file
+/// read with `head`): binary bytes only cost tokens and confuse the models.
+fn readable(output: &str) -> Cow<'_, str> {
+    let (mut sampled, mut unreadable) = (0_usize, 0_usize);
+    for c in output.chars().take(4096) {
+        sampled += 1;
+        if c == char::REPLACEMENT_CHARACTER || (c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            unreadable += 1;
+        }
+    }
+    if unreadable * 10 <= sampled {
+        return Cow::Borrowed(output);
+    }
+    let start: String = output
+        .chars()
+        .take_while(|c| !c.is_control() && *c != char::REPLACEMENT_CHARACTER)
+        .take(80)
+        .collect();
+    Cow::Owned(format!(
+        "[binary content, about {} bytes, starting with \"{start}\"]",
+        output.len()
+    ))
 }
 
 /// A daemon outcome for log lines.

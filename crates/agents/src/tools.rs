@@ -14,6 +14,8 @@ use crate::{repair, schema};
 
 /// `head -c` byte limit for `read_file`.
 const READ_LIMIT: &str = "65536";
+/// The read-only YARA rules mount in Hunter's and Forensics' strata.
+const RULES_DIR: &str = "/rules";
 /// Daemon-side timeout for single-file commands.
 const QUICK_TIMEOUT_MS: u64 = 15_000;
 /// Daemon-side timeout for commands that walk directories or run a shell.
@@ -30,7 +32,7 @@ pub(crate) enum Tool {
     GrepLogs,
     /// `sha256sum <path>`.
     HashFile,
-    /// `yara -r <rules> <target>`.
+    /// `yara -r <rules> <target>`, by default once per rules file in `/rules`.
     YaraScan,
     /// Daemon `request_tool`: ask for a tool to be admitted.
     RequestAdmission,
@@ -49,6 +51,23 @@ pub(crate) enum Tool {
 }
 
 impl Tool {
+    /// Whether arguments the schema doesn't know can be ignored rather than rejected: true for
+    /// the read-only evidence tools, where an invented knob (`max`, `lines`) changes nothing.
+    const fn ignores_unknown_arguments(self) -> bool {
+        match self {
+            Self::ListFiles | Self::ReadFile | Self::GrepLogs | Self::HashFile | Self::YaraScan => {
+                true
+            }
+            Self::RequestAdmission
+            | Self::ReportFinding
+            | Self::ReportRefusal
+            | Self::ProposeAction
+            | Self::UpdateScope
+            | Self::UpdateIncident
+            | Self::Exec => false,
+        }
+    }
+
     /// The function name the model calls.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -81,7 +100,7 @@ impl Tool {
                 "Compute the SHA-256 of a file with `sha256sum <path>` for chain of custody."
             }
             Self::YaraScan => {
-                "Scan a file or directory with YARA: `yara -r <rules> <target>`, where rules is a rules file under /rules (read-only; list /rules to see them)."
+                "Scan a file or directory with YARA using the read-only rules in /rules: every rules file there by default, or the one rules file you name."
             }
             Self::RequestAdmission => {
                 "Ask Cleanroom to admit a tool you don't have (for example volatility3 or tshark) into your stratum from pinned nixpkgs. Policy or the human commander decides."
@@ -123,10 +142,10 @@ impl Tool {
             ),
             Self::YaraScan => object(
                 &json!({
-                    "rules": {"type": "string", "pattern": "^/rules/", "maxLength": 4096, "description": "YARA rules file under /rules"},
                     "target": absolute_path("File or directory to scan"),
+                    "rules": {"type": "string", "pattern": "^/rules(/|$)", "maxLength": 4096, "description": "Optional: one rules file under /rules; omit it to use every rules file there"},
                 }),
-                &["rules", "target"],
+                &["target"],
             ),
             Self::RequestAdmission => object(
                 &json!({
@@ -137,7 +156,7 @@ impl Tool {
             ),
             Self::ReportFinding => object(
                 &json!({
-                    "summary": {"type": "string", "minLength": 10, "maxLength": 800},
+                    "summary": {"type": "string", "minLength": 10, "maxLength": 1500, "description": "One finding in a few sentences"},
                     "evidence": evidence_list(1),
                     "confidence_pct": percent(),
                 }),
@@ -226,12 +245,14 @@ pub(crate) struct ExecSpec {
     pub(crate) argv: Vec<String>,
     /// Daemon-side timeout.
     pub(crate) timeout_ms: u64,
+    /// Index in `argv` of what the command reads or runs.
+    subject: usize,
 }
 
 impl ExecSpec {
-    /// What the command reads or runs (its last argument), for safety verdicts.
+    /// What the command reads or runs, for safety verdicts.
     pub(crate) fn subject(&self) -> &str {
-        self.argv.last().map_or("", String::as_str)
+        self.argv.get(self.subject).map_or("", String::as_str)
     }
 }
 
@@ -426,11 +447,11 @@ pub(crate) fn prepare(offered: &[ToolSpec], name: &str, raw_arguments: &str) -> 
     }
 }
 
-/// Validate `args` for the tool called `name` and build its action.
+/// Conform `args` to the schema of the tool called `name`, validate them, and build its action.
 ///
 /// # Errors
 /// Returns a [`Rejection`] when the tool is not offered or the arguments break its schema.
-fn check(offered: &[ToolSpec], name: &str, args: Value) -> Result<Call, Rejection> {
+fn check(offered: &[ToolSpec], name: &str, mut args: Value) -> Result<Call, Rejection> {
     let Some(spec) = offered.iter().find(|spec| spec.tool.name() == name) else {
         let names: Vec<&str> = offered.iter().map(|spec| spec.tool.name()).collect();
         return Err(Rejection {
@@ -441,6 +462,10 @@ fn check(offered: &[ToolSpec], name: &str, args: Value) -> Result<Call, Rejectio
             args,
         });
     };
+    if spec.tool.ignores_unknown_arguments() {
+        schema::drop_unknown(&spec.parameters, &mut args);
+    }
+    schema::conform(&spec.parameters, &mut args);
     if let Err(problems) = schema::validate(&spec.parameters, &args) {
         return Err(Rejection {
             reason: format!("invalid arguments: {problems}"),
@@ -490,10 +515,13 @@ fn action(tool: Tool, args: &Value) -> Result<Action, String> {
         }
         Tool::YaraScan => {
             let YaraArgs { rules, target } = typed(args)?;
-            exec(
-                vec!["yara".into(), "-r".into(), rules, target],
-                SCAN_TIMEOUT_MS,
-            )
+            match rules.filter(|rules| rules.trim_end_matches('/') != RULES_DIR) {
+                Some(file) => exec(
+                    vec!["yara".into(), "-r".into(), file, target],
+                    SCAN_TIMEOUT_MS,
+                ),
+                None => every_rules_file(target),
+            }
         }
         Tool::Exec => {
             let ExecArgs { command } = typed(args)?;
@@ -508,9 +536,43 @@ fn action(tool: Tool, args: &Value) -> Result<Action, String> {
     })
 }
 
-/// An [`Action::Exec`] for `argv`.
+/// An [`Action::Exec`] for `argv`, whose last argument is what it reads.
 const fn exec(argv: Vec<String>, timeout_ms: u64) -> Action {
-    Action::Exec(ExecSpec { argv, timeout_ms })
+    let subject = argv.len().saturating_sub(1);
+    Action::Exec(ExecSpec {
+        argv,
+        timeout_ms,
+        subject,
+    })
+}
+
+/// `yara -r` once per rules file in `/rules`, through `find -exec`: no shell needed.
+fn every_rules_file(target: String) -> Action {
+    let mut argv: Vec<String> = [
+        "find",
+        RULES_DIR,
+        "-maxdepth",
+        "1",
+        "-type",
+        "f",
+        "-name",
+        "*.yar*",
+        "-exec",
+        "yara",
+        "-r",
+        "{}",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let subject = argv.len();
+    argv.push(target);
+    argv.push(";".to_owned());
+    Action::Exec(ExecSpec {
+        argv,
+        timeout_ms: SCAN_TIMEOUT_MS,
+        subject,
+    })
 }
 
 /// Deserialize validated arguments into `T`.
@@ -543,8 +605,8 @@ struct GrepArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct YaraArgs {
-    /// Rules file.
-    rules: String,
+    /// One rules file; every file in `/rules` when absent.
+    rules: Option<String>,
     /// File or directory to scan.
     target: String,
 }
@@ -715,40 +777,112 @@ mod tests {
         let missing = rejection(Role::Hunter, true, "grep_logs", r#"{"path": "/evidence"}"#);
         assert!(missing.contains("`pattern` is required"), "{missing}");
         let unknown = rejection(
+            Role::Scribe,
+            true,
+            "update_scope",
+            r#"{"asset_id": "payroll", "timeline_note": "encrypted at 03:01"}"#,
+        );
+        assert!(
+            unknown.contains("unknown argument `timeline_note`"),
+            "records reject arguments they would silently lose: {unknown}"
+        );
+        let read = call(
             Role::Hunter,
             true,
             "read_file",
-            r#"{"path": "/e", "lines": 5}"#,
+            r#"{"path": "/evidence/note", "max": "65536"}"#,
+        )
+        .expect("an invented knob on a read is ignored");
+        assert_eq!(
+            read.args,
+            serde_json::json!({"path": "/evidence/note"}),
+            "knob dropped"
         );
-        assert!(unknown.contains("unknown argument `lines`"), "{unknown}");
         let mistyped = rejection(
             Role::Hunter,
             true,
             "report_finding",
-            r#"{"summary": "ransom note found", "evidence": "/evidence/note", "confidence_pct": 80}"#,
+            r#"{"summary": "ransom note found", "evidence": ["/evidence/note"], "confidence_pct": "high"}"#,
         );
         assert!(
-            mistyped.contains("`evidence` must be an array"),
+            mistyped.contains("`confidence_pct` must be an integer"),
             "{mistyped}"
         );
     }
 
     #[test]
-    fn finding_bounds_are_enforced() {
+    fn finding_without_evidence_is_rejected() {
         let reason = rejection(
             Role::Forensics,
             true,
             "report_finding",
-            r#"{"summary": "payroll encrypted", "evidence": [], "confidence_pct": 150}"#,
+            r#"{"summary": "payroll encrypted", "evidence": [], "confidence_pct": 90}"#,
         );
         assert!(
             reason.contains("`evidence` needs at least 1 items"),
             "{reason}"
         );
-        assert!(
-            reason.contains("`confidence_pct` must be at most 100"),
-            "{reason}"
+    }
+
+    fn finding(raw: &str) -> FindingArgs {
+        match call(Role::Forensics, true, "report_finding", raw)
+            .expect("near miss is conformed, not rejected")
+            .action
+        {
+            Action::Finding(finding) => finding,
+            other => panic!("expected a finding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn near_miss_findings_are_conformed() {
+        for (confidence, expected) in [
+            (r#""95%""#, 95),
+            ("0.85", 85),
+            (r#""0.9""#, 90),
+            ("95.0", 95),
+            (r#"" 80 ""#, 80),
+            ("150", 100),
+        ] {
+            let raw = format!(
+                r#"{{"summary": "payroll.csv was encrypted", "evidence": ["/evidence/acme-fs/payroll.csv.locked"], "confidence_pct": {confidence}}}"#
+            );
+            assert_eq!(
+                finding(&raw).confidence_pct,
+                expected,
+                "confidence {confidence}"
+            );
+        }
+        let shaped = finding(
+            r#"{"summary": "payroll.csv was encrypted", "evidence": "/evidence/acme-fs/payroll.csv.locked", "confidence_pct": 90}"#,
         );
+        assert_eq!(
+            shaped.evidence,
+            ["/evidence/acme-fs/payroll.csv.locked"],
+            "a single path becomes a list"
+        );
+        let objects = finding(
+            r#"{"summary": "payroll.csv was encrypted", "evidence": [{"path": "/evidence/a"}, {"path": "/evidence/b", "sha256": "ab12"}], "confidence_pct": 90}"#,
+        );
+        assert_eq!(
+            objects.evidence,
+            [
+                "/evidence/a".to_owned(),
+                r#"{"path":"/evidence/b","sha256":"ab12"}"#.to_owned()
+            ],
+            "objects keep their detail"
+        );
+        let long = format!(
+            r#"{{"summary": "{}", "evidence": ["/evidence/x"], "confidence_pct": 90}}"#,
+            "hash ".repeat(400)
+        );
+        let clipped = finding(&long);
+        assert_eq!(
+            clipped.summary.chars().count(),
+            1500,
+            "long summaries are clipped"
+        );
+        assert!(clipped.summary.ends_with('…'), "and marked as clipped");
     }
 
     #[test]
@@ -807,6 +941,41 @@ mod tests {
             ["yara", "-r", "/rules/ransomware.yar", "/evidence"],
             "yara argv"
         );
+        let every = [
+            r#"{"target": "/evidence/acme-fs"}"#,
+            r#"{"rules": "/rules", "target": "/evidence/acme-fs"}"#,
+            r#"{"rules": "/rules/", "target": "/evidence/acme-fs"}"#,
+        ];
+        for raw in every {
+            let all =
+                call(Role::Hunter, true, "yara_scan", raw).expect("the rules directory is valid");
+            assert_eq!(
+                argv(&all),
+                [
+                    "find",
+                    "/rules",
+                    "-maxdepth",
+                    "1",
+                    "-type",
+                    "f",
+                    "-name",
+                    "*.yar*",
+                    "-exec",
+                    "yara",
+                    "-r",
+                    "{}",
+                    "/evidence/acme-fs",
+                    ";"
+                ],
+                "every rules file, without a shell: {raw}"
+            );
+            match all.action {
+                Action::Exec(spec) => {
+                    assert_eq!(spec.subject(), "/evidence/acme-fs", "safety subject")
+                }
+                other => panic!("expected an exec action, got {other:?}"),
+            }
+        }
         let elsewhere = rejection(
             Role::Hunter,
             true,
@@ -814,7 +983,7 @@ mod tests {
             r#"{"rules": "/evidence/acme-fs/evil.yar", "target": "/evidence"}"#,
         );
         assert!(
-            elsewhere.contains("`rules` must match ^/rules/"),
+            elsewhere.contains("`rules` must match ^/rules(/|$)"),
             "{elsewhere}"
         );
     }
@@ -842,17 +1011,22 @@ mod tests {
             Role::Scribe,
             true,
             "update_scope",
-            r#"{"asset_id": "payroll-2026q3", "name": "Q3 payroll", "data_classes": ["pii", "financial"], "locked": "yes"}"#,
+            r#"{"asset_id": "payroll-2026q3", "name": "Q3 payroll", "data_classes": ["PII", "financial"], "locked": "Yes", "encrypted_at_rest": "false"}"#,
         )
         .expect("valid scope update");
         match good.action {
             Action::Scope(update) => {
-                assert_eq!(update.locked, Some(Tri::Yes), "flag parsed");
+                assert_eq!(
+                    update.locked,
+                    Some(Tri::Yes),
+                    "flag parsed, case-insensitively"
+                );
                 assert_eq!(
                     update.data_classes,
                     Some(vec![DataClass::Pii, DataClass::Financial]),
-                    "classes parsed"
+                    "classes parsed, case-insensitively"
                 );
+                assert_eq!(update.encrypted_at_rest, Some(false), "boolean from text");
             }
             other => panic!("expected a scope update, got {other:?}"),
         }
