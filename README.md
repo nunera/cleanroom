@@ -65,6 +65,8 @@ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 
 Point `NVIDIA_BASE_URL` at a self-hosted OpenAI-compatible server (Brev, vLLM, NIM) to run Nemotron locally.
 
+**Egress** is declared in [`policy/egress.json`](policy/egress.json): deny by default, and the model router in `cleanroom-agents` may reach only `https://integrate.api.nvidia.com` (hosted Nemotron) and `http://127.0.0.1:8000` (Brev through `deploy/brev/tunnel.sh`). The policy is compiled into the agents binary; at start the router refuses any hosted or local endpoint outside it, and its HTTPS client follows no redirects and ignores proxy variables. Agent strata have no network at all. Replay (`scripts/demo.sh --replay`, `CLEANROOM_LLM_CACHE=replay`) is the offline mode: the router builds no network client. The agents' first `status` line names the egress in effect. Adding an endpoint means editing the policy and rebuilding.
+
 ## Daemon
 
 `cleanroomd` is the OS core. One Unix socket, `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock` (mode `0600`), carries the bus and the operations in [docs/interfaces.md](docs/interfaces.md). It runs rootless: run it inside `nix develop` (bubblewrap, skopeo, umoci) on a host that allows unprivileged user namespaces.
@@ -113,7 +115,7 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 | `CLEANROOM_MODEL_SCRIBE` | Record keeper model (default `nvidia/nemotron-3-ultra-550b-a55b`) |
 | `CLEANROOM_MODEL_SAFETY` | Safety model (default `nvidia/llama-3.1-nemotron-safety-guard-8b-v3`) |
 | `CLEANROOM_LOCAL_BASE_URL`, `CLEANROOM_LOCAL_MODEL`, `CLEANROOM_LOCAL_API_KEY`, `CLEANROOM_LOCAL_SAFETY_MODEL` | Optional local endpoint for sensitive evidence (model default `nvidia/nemotron-3.5-bolt-e4b`) |
-| `CLEANROOM_LLM_CACHE=record\|replay`, `CLEANROOM_LLM_CACHE_DIR` | Record model responses, or replay them without network (default dir `~/.cache/cleanroom/llm`). Replay is labelled in every `status` |
+| `CLEANROOM_LLM_CACHE=record\|replay`, `CLEANROOM_LLM_CACHE_DIR` | Record model responses, or replay them with no network client (default dir `~/.cache/cleanroom/llm`). Replay is labelled in every `status` |
 | `CLEANROOM_NIXPKGS` | Pinned flake prefix for tool requests (default: the `flake.lock` nixpkgs rev) |
 
 ## Command center
