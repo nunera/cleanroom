@@ -10,8 +10,8 @@ use anyhow::{Context as _, Result, bail};
 use cleanroom_proto::sign::{self, key_id, verifying_key_from_hex};
 use cleanroom_proto::{
     Action, ApprovalDecision, Audience, BusBody, BusMessage, CoreRequest, CoreResponse,
-    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal, Role,
-    Signed, ToolDecision, ToolRequest, ToolSource, domain,
+    ExecOutcome, ExecRequest, ExecResult, KeyId, Member, MemberRole, Outcome, Principal,
+    Revocation, Role, Signed, ToolDecision, ToolRequest, ToolSource, domain,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::task::spawn_blocking;
@@ -251,6 +251,7 @@ impl Daemon {
             CoreRequest::RequestTool(ask) => Box::pin(self.request_tool(peer, ask)).await,
             CoreRequest::Approve(decision) => self.approve(peer, decision),
             CoreRequest::Enroll(member) => self.enroll(peer, member),
+            CoreRequest::Revoke(revocation) => self.revoke(peer, revocation),
             CoreRequest::Detonate { scenario } => Box::pin(self.detonate(peer, &scenario)).await,
             CoreRequest::Tamper { root } => self.tamper(peer, &root).await,
             CoreRequest::Admit { root } => self.admit(peer, &root).await,
@@ -340,6 +341,7 @@ impl Daemon {
             | Action::ToolGrant { .. }
             | Action::Approval { .. }
             | Action::Enroll { .. }
+            | Action::Revoke { .. }
             | Action::RecordUpdate { .. }
             | Action::Detonate { .. } => String::new(),
         };
@@ -673,6 +675,35 @@ impl Daemon {
             Ok(()) => {
                 let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
                 self.status(format!("enrolled {label}: {member} (receipt #{seq})"));
+                Ok(CoreResponse::Ok)
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.receipt(peer.principal.clone(), action, Outcome::Denied { reason })?;
+                Err(error)
+            }
+        }
+    }
+
+    /// `revoke`: an admin-signed revocation of a member's key.
+    ///
+    /// # Errors
+    /// Fails for agents, a signature that does not verify against this connection's key, or a
+    /// revocation the members policy refuses.
+    fn revoke(&self, peer: &Peer, signed: Signed<Revocation>) -> Result<CoreResponse> {
+        peer.human("revoke")?;
+        sign::verify(&signed, &peer.key, domain::REVOKE)
+            .context("the revocation is not signed by this connection's key")?;
+        let member = signed.body.key_id.clone();
+        let reason = signed.body.reason.clone();
+        let action = Action::Revoke {
+            member: member.clone(),
+        };
+        let revoked = lock(&self.members).revoke(&peer.key_id, signed);
+        match revoked {
+            Ok(()) => {
+                let seq = self.receipt(peer.principal.clone(), action, Outcome::Allowed)?;
+                self.status(format!("revoked {member}: {reason} (receipt #{seq})"));
                 Ok(CoreResponse::Ok)
             }
             Err(error) => {
@@ -1076,6 +1107,7 @@ const fn op_name(request: &CoreRequest) -> &'static str {
         CoreRequest::RequestTool(_) => "request_tool",
         CoreRequest::Approve(_) => "approve",
         CoreRequest::Enroll(_) => "enroll",
+        CoreRequest::Revoke(_) => "revoke",
         CoreRequest::Detonate { .. } => "detonate",
         CoreRequest::Tamper { .. } => "tamper",
         CoreRequest::Admit { .. } => "admit",
