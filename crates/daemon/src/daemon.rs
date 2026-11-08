@@ -130,6 +130,9 @@ pub(crate) struct Daemon {
     scenario: Scenario,
     /// Enrolled members.
     members: Mutex<Members>,
+    /// The incident agents may write records for: declared by a detonation or a human's
+    /// `investigate`, cleared by a reset.
+    open_incident: Mutex<Option<String>>,
 }
 
 impl Daemon {
@@ -156,6 +159,7 @@ impl Daemon {
             grants: Grants::default(),
             scenario: Scenario::new(assets),
             members: Mutex::new(members),
+            open_incident: Mutex::default(),
             key,
         });
         tracing::info!(
@@ -199,8 +203,10 @@ impl Daemon {
         } else {
             None
         };
+        let stale = stale_refusal(&peer.principal, body, lock(&self.open_incident).as_deref());
         let verdict = may_publish(&peer.principal, body)
             .map_err(str::to_owned)
+            .and_then(|()| stale.map_or(Ok(()), Err))
             .and_then(|()| measured.clone().map_or(Ok(()), Err));
         if let Some(action) = self.record_update(body) {
             let outcome = match &verdict {
@@ -227,6 +233,9 @@ impl Daemon {
         if let Err(reason) = verdict {
             tracing::warn!(peer = %peer.name(), "dropping a publish: {reason}");
             return;
+        }
+        if let BusBody::Investigate { incident_id, .. } = body {
+            *lock(&self.open_incident) = Some(incident_id.clone());
         }
         self.bus.fan_out(signed);
     }
@@ -792,6 +801,7 @@ impl Daemon {
             self.publish(BusBody::Scope(record));
         }
         let id = scenario::incident_id(&at);
+        *lock(&self.open_incident) = Some(id.clone());
         self.publish(BusBody::Incident(scenario::incident(
             &id, &at, &integrity, receipt,
         )));
@@ -854,6 +864,7 @@ impl Daemon {
             .context("re-seeding panicked")??;
         self.scenario.set_baseline(baseline);
         self.scenario.set_measured(&[]);
+        *lock(&self.open_incident) = None;
         self.grants.reset();
         self.bus.clear_incident();
         *incident = None;
@@ -1016,6 +1027,33 @@ fn may_publish(principal: &Principal, body: &BusBody) -> Result<(), &'static str
     }
 }
 
+/// Why an agent's record, proposal or finding is refused because it doesn't belong to the open
+/// incident: none is open (a reset cleared it), or an incident record names another incident.
+/// Humans may always write; chat, traces and status lines always flow.
+fn stale_refusal(principal: &Principal, body: &BusBody, open: Option<&str>) -> Option<String> {
+    if !matches!(principal, Principal::Agent { .. }) {
+        return None;
+    }
+    let record = matches!(
+        body,
+        BusBody::Scope(_)
+            | BusBody::Incident(_)
+            | BusBody::Proposal { .. }
+            | BusBody::Finding { .. }
+    );
+    match (open, body) {
+        (None, _) if record => Some(
+            "no incident is open (a reset cleared it); records, findings and proposals wait for the next investigation"
+                .to_owned(),
+        ),
+        (Some(open), BusBody::Incident(incident)) if incident.id != open => Some(format!(
+            "incident {} is not the open incident {open}",
+            incident.id
+        )),
+        _ => None,
+    }
+}
+
 /// A principal for logs and status lines.
 fn describe(principal: &Principal) -> String {
     match principal {
@@ -1052,4 +1090,96 @@ fn session_tag() -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
     format!("{millis:x}{:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn body(value: &serde_json::Value) -> BusBody {
+        serde_json::from_value(value.clone()).expect("well-formed bus body")
+    }
+
+    fn agent(role: Role) -> Principal {
+        Principal::Agent { role }
+    }
+
+    fn scope() -> BusBody {
+        body(&json!({
+            "type": "scope", "asset_id": "payroll", "name": "Payroll export",
+            "data_classes": ["pii"], "record_count": 1240, "texas_residents": 1180,
+            "flags": {"locked": "yes", "exfiltrated": "unknown", "accessed": "yes", "destroyed": "unknown", "modified": "yes"},
+            "encrypted_at_rest": false, "key_exposed": "no", "confidence_pct": 90, "evidence": [],
+            "updated_by": {"kind": "agent", "role": "scribe"}, "updated_at": "2026-11-08T05:30:10Z"
+        }))
+    }
+
+    fn incident(id: &str) -> BusBody {
+        body(&json!({
+            "type": "incident", "id": id, "title": "Ransomware on acme-fs", "status": "analyzing",
+            "severity": "critical", "category": "ransomware", "detected_at": "2026-11-08T05:29:40Z",
+            "reported_by": {"kind": "system"}, "summary": "", "affected_systems": ["acme-fs"],
+            "triggers": {"aware_at": null, "discovered_at": null, "breach_determined_at": null, "materiality_determined_at": null},
+            "timeline": []
+        }))
+    }
+
+    /// A live run: the commander reset mid-investigation, and within seconds the agents wrote
+    /// the cleared incident, four red scope rows and two proposals back onto the bus.
+    #[test]
+    fn after_a_reset_agents_cannot_write_records_or_propose() {
+        let proposal = body(
+            &json!({"type": "proposal", "proposal_id": "INC-1-proposal-1", "action": "isolate acme-fs", "rationale": "encrypting"}),
+        );
+        let finding = body(
+            &json!({"type": "finding", "summary": "encryptor ran", "evidence": ["/evidence/logs/syslog"], "confidence_pct": 90}),
+        );
+        for (who, what) in [
+            (agent(Role::Scribe), scope()),
+            (agent(Role::Scribe), incident("INC-1")),
+            (agent(Role::Containment), proposal),
+            (agent(Role::Hunter), finding),
+        ] {
+            let reason = stale_refusal(&who, &what, None).unwrap_or_else(|| {
+                panic!("{} must be refused with no open incident", describe(&who))
+            });
+            assert!(reason.contains("no incident is open"), "{reason}");
+        }
+        let chat = body(&json!({"type": "chat", "text": "standing by"}));
+        assert_eq!(
+            stale_refusal(&agent(Role::Hunter), &chat, None),
+            None,
+            "chat still flows"
+        );
+        let human = Principal::Human {
+            key_id: "sha256:commander".to_owned(),
+        };
+        assert_eq!(
+            stale_refusal(&human, &scope(), None),
+            None,
+            "a commander may still write"
+        );
+    }
+
+    #[test]
+    fn during_an_incident_only_its_own_record_is_accepted() {
+        let reason = stale_refusal(&agent(Role::Scribe), &incident("INC-1"), Some("INC-2"))
+            .expect("an earlier incident's record is refused");
+        assert!(
+            reason.contains("INC-1") && reason.contains("INC-2"),
+            "{reason}"
+        );
+        assert_eq!(
+            stale_refusal(&agent(Role::Scribe), &incident("INC-2"), Some("INC-2")),
+            None,
+            "the open incident's record is accepted"
+        );
+        assert_eq!(
+            stale_refusal(&agent(Role::Scribe), &scope(), Some("INC-2")),
+            None,
+            "scope records are accepted while an incident is open"
+        );
+    }
 }
