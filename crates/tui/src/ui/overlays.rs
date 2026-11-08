@@ -164,7 +164,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         (", .", "Switch the Overview chart: Activity, Exec, Safety"),
         (
             "Enter",
-            "Lead tab: send to the Lead (@hunter, @forensics, @scribe, @containment asks one)",
+            "Clean tab: send to Clean, the lead agent (@hunter, @forensics, @scribe, @containment asks one)",
         ),
         (
             "Esc",

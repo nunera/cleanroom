@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1034 250" width="1034" height="250" role="img" aria-label="Cleanroom">
+<g transform="translate(12,4) scale(0.66)"><defs><clipPath id="lh"><circle cx="150" cy="150" r="110"/></clipPath></defs>
+  <g fill="#e6fffa" stroke="#e6fffa" stroke-width="34" stroke-linejoin="round"><circle cx="150" cy="150" r="110"/><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/></g>
+  <g fill="#0b1117" stroke="#0b1117" stroke-width="16" stroke-linejoin="round"><circle cx="150" cy="150" r="110"/><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/></g>
+  <g fill="#f4fffd"><circle cx="150" cy="150" r="110"/></g>
+  <g fill="#2dd4bf"><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/><rect x="30" y="215" width="240" height="120" clip-path="url(#lh)"/></g>
+  <line x1="62" y1="215" x2="238" y2="215" stroke="#0b1117" stroke-width="8" stroke-linecap="round"/>
+  <g fill="#0b1117">
+    <rect x="56" y="93" width="70" height="22" rx="11" transform="rotate(-5 91 104)"/>
+    <rect x="174" y="93" width="70" height="22" rx="11" transform="rotate(5 209 104)"/>
+    <ellipse cx="95" cy="146" rx="32" ry="34"/><ellipse cx="205" cy="146" rx="32" ry="34"/>
+    <ellipse cx="150" cy="190" rx="44" ry="7.5"/>
+  </g>
+  <g fill="#ffffff"><circle cx="78" cy="158" r="11"/><circle cx="222" cy="158" r="11"/></g></g>
+<g transform="translate(262,30)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M51 99 A30 30 0 1 0 51 141 M90 52 V150 M120 120 H180 A30 30 0 1 0 171 141 M270 120 A30 30 0 1 0 210 120 A30 30 0 1 0 270 120 M270 90 V150 M300 150 V90 M300 120 A30 30 0 0 1 360 120 V150 M390 150 V90 M390 120 A30 30 0 0 1 434 93 M464 120 A30 30 0 1 0 524 120 A30 30 0 1 0 464 120 M554 120 A30 30 0 1 0 614 120 A30 30 0 1 0 554 120 M644 150 V90 M644 112 A22 22 0 0 1 688 112 V150 M688 112 A22 22 0 0 1 732 112 V150" stroke="#e6fffa" stroke-width="40"/>
+  <path d="M51 99 A30 30 0 1 0 51 141 M90 52 V150 M120 120 H180 A30 30 0 1 0 171 141 M270 120 A30 30 0 1 0 210 120 A30 30 0 1 0 270 120 M270 90 V150 M300 150 V90 M300 120 A30 30 0 0 1 360 120 V150 M390 150 V90 M390 120 A30 30 0 0 1 434 93 M464 120 A30 30 0 1 0 524 120 A30 30 0 1 0 464 120 M554 120 A30 30 0 1 0 614 120 A30 30 0 1 0 554 120 M644 150 V90 M644 112 A22 22 0 0 1 688 112 V150 M688 112 A22 22 0 0 1 732 112 V150" stroke="#0b1117" stroke-width="28"/>
+  <path d="M51 99 A30 30 0 1 0 51 141 M90 52 V150 M120 120 H180 A30 30 0 1 0 171 141 M270 120 A30 30 0 1 0 210 120 A30 30 0 1 0 270 120 M270 90 V150 M300 150 V90 M300 120 A30 30 0 0 1 360 120 V150 M390 150 V90 M390 120 A30 30 0 0 1 434 93 M464 120 A30 30 0 1 0 524 120 A30 30 0 1 0 464 120 M554 120 A30 30 0 1 0 614 120 A30 30 0 1 0 554 120 M644 150 V90 M644 112 A22 22 0 0 1 688 112 V150 M688 112 A22 22 0 0 1 732 112 V150" stroke="#2dd4bf" stroke-width="15"/>
+</g>
+</svg>

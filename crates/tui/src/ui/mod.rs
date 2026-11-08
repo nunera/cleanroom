@@ -10,6 +10,7 @@ mod controlroom;
 mod lead;
 mod memory;
 mod overlays;
+mod system;
 mod tabs;
 
 use std::cell::Cell;
@@ -73,13 +74,15 @@ pub(crate) enum Tab {
     Team,
     /// F7: each agent's working context, span by span.
     Memory,
+    /// F8: the OS underneath: roots, strata, the evidence seal and the receipt chain.
+    System,
     /// F10: the dense operator screen.
     Controlroom,
 }
 
 impl Tab {
     /// Every tab, in tab-bar order.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Overview,
         Self::Lead,
         Self::Scope,
@@ -87,6 +90,7 @@ impl Tab {
         Self::Defense,
         Self::Team,
         Self::Memory,
+        Self::System,
         Self::Controlroom,
     ];
 
@@ -100,6 +104,7 @@ impl Tab {
             5 => Some(Self::Defense),
             6 => Some(Self::Team),
             7 => Some(Self::Memory),
+            8 => Some(Self::System),
             10 => Some(Self::Controlroom),
             _ => None,
         }
@@ -121,12 +126,13 @@ impl Tab {
     const fn label(self) -> (&'static str, &'static str) {
         match self {
             Self::Overview => ("Overview", "F1"),
-            Self::Lead => ("Lead", "F2"),
+            Self::Lead => ("Clean", "F2"),
             Self::Scope => ("Scope", "F3"),
             Self::Record => ("Record", "F4"),
             Self::Defense => ("Defense", "F5"),
             Self::Team => ("Team", "F6"),
             Self::Memory => ("Memory", "F7"),
+            Self::System => ("System", "F8"),
             Self::Controlroom => ("Controlroom", "F10"),
         }
     }
@@ -140,7 +146,7 @@ impl Tab {
             ),
             Self::Lead => (
                 "the line",
-                "Talk to the Lead; it asks the specialists for you. @hunter asks one directly. Esc for keys.",
+                "Talk to Clean, the lead agent; it asks the specialists for you. @hunter asks one directly. Esc for keys.",
             ),
             Self::Scope => (
                 "the vault",
@@ -158,13 +164,17 @@ impl Tab {
                 "the crew",
                 "The Lead and the four specialists: model, live status, recent steps and findings.",
             ),
+            Self::System => (
+                "the machine",
+                "The OS under the agents: admitted roots, each stratum's walls, the evidence seal and the receipt chain.",
+            ),
             Self::Memory => (
                 "the stacks",
                 "Each agent's working context: what sits verbatim, what is paged out to a digest, and every move.",
             ),
             Self::Controlroom => (
                 "the deck",
-                "Everything at once: pinned OS blocks, scope, trace, the Lead, the team and approvals.",
+                "Everything at once: pinned OS blocks, scope, trace, Clean, the team and approvals.",
             ),
         }
     }
@@ -323,6 +333,8 @@ pub struct View {
     pub(crate) motion: bool,
     /// The color theme.
     pub(crate) theme: Name,
+    /// Whether the cards between agents show their whole text.
+    pub(crate) cards_open: bool,
 }
 
 impl View {
@@ -366,6 +378,7 @@ impl View {
             chart: ChartView::All,
             motion: false,
             theme: Name::Cleanroom,
+            cards_open: false,
         }
     }
 
@@ -429,6 +442,7 @@ impl View {
             | Tab::Defense
             | Tab::Team
             | Tab::Memory
+            | Tab::System
             | Tab::Controlroom => Focus::Keys,
         };
     }
@@ -487,6 +501,7 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
         match view.tab {
             Tab::Lead => lead::render(frame, body, state, view, now),
             Tab::Memory => memory::render(frame, body, state, view, now),
+            Tab::System => system::render(frame, body, state, view, now),
             Tab::Overview
             | Tab::Scope
             | Tab::Record
@@ -589,7 +604,7 @@ const fn key_items(view: &View) -> (Hints, Hints) {
         }
         (Overlay::None, _, Focus::Input) => (
             &[
-                ("Enter", "Send to the Lead"),
+                ("Enter", "Send to Clean"),
                 ("@hunter", "Ask a specialist"),
                 ("Esc", "Command keys"),
                 ("PgUp/PgDn", "Scroll"),
@@ -624,12 +639,13 @@ const fn key_items(view: &View) -> (Hints, Hints) {
             | Tab::Record
             | Tab::Defense
             | Tab::Team
-            | Tab::Memory,
+            | Tab::Memory
+            | Tab::System,
             Focus::Keys,
         ) => (
             &[
                 ("a/x", "Approve/Deny"),
-                ("c", "Ask the Lead"),
+                ("c", "Ask Clean"),
                 ("d", "Detonate"),
                 ("t", "Tamper"),
                 ("A", "Admit"),
@@ -1010,7 +1026,7 @@ pub(super) fn who_label(who: &Who) -> String {
 /// Upper-case role name.
 pub(super) const fn role_label(role: Role) -> &'static str {
     match role {
-        Role::Lead => "LEAD",
+        Role::Lead => "CLEAN",
         Role::Hunter => "HUNTER",
         Role::Forensics => "FORENSICS",
         Role::Scribe => "SCRIBE",

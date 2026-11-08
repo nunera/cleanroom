@@ -21,8 +21,8 @@ use crate::denials::{Denial, Kind};
 use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who};
 use crate::team::{self, SPECIALISTS, Status};
 use crate::theme::{
-    ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, OK, RAISED, RAISED_HI, RED, RED_BG, TEXT, Theme,
-    blend, glyph, tint,
+    ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, Theme, blend,
+    glyph, tint,
 };
 
 /// How long a new message takes to fade in.
@@ -73,7 +73,8 @@ pub(super) fn render(
 
 // ---------- Conversation ----------
 
-/// The conversation panel: banner, messages, the latest notice and the message line.
+/// The conversation panel: Clean's face and status, the kernel banner for a new denial, the
+/// messages and the message line.
 pub(super) fn render_conversation(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -84,7 +85,7 @@ pub(super) fn render_conversation(
     let focused = view.focus == Focus::Input;
     let title = Line::from(vec![
         Span::raw(" ◆ ").fg(ACCENT),
-        Span::raw("LEAD").fg(BRIGHT).bold(),
+        Span::raw("CLEAN").fg(BRIGHT).bold(),
         Span::raw(" · conversation ").fg(MUTED),
     ]);
     let mut block = panel(title, focused).padding(Padding::horizontal(1));
@@ -99,34 +100,84 @@ pub(super) fn render_conversation(
     frame.render_widget(block, area);
     let banner = state.denials.banner(now);
     let banner_height = match banner {
-        Some(_) if inner.height >= 16 => 4,
+        Some(_) if inner.height >= 18 => 4,
         Some(_) => 2,
         None => 0,
     };
-    let [banner_area, _, feed, notice, rule, input] = Layout::vertical([
+    let [face, _, banner_area, _, feed, rule, input] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Length(banner_height),
         Constraint::Length(u16::from(banner.is_some())),
         Constraint::Fill(1),
-        Constraint::Length(u16::from(state.notice.is_some())),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
+    render_face(frame, face, state, view, now);
     if let Some(denial) = banner {
         render_banner(frame, banner_area, denial);
     }
     render_feed(frame, feed, state, view, now);
-    if let Some(note) = &state.notice {
-        let room = usize::from(notice.width).saturating_sub(2);
-        let line = Line::from(vec![
-            Span::raw("↳ ").fg(DIM),
-            Span::raw(fit(&note.text, room)).fg(super::tone_color(note.tone)),
-        ]);
-        frame.render_widget(Paragraph::new(line), notice);
-    }
     let rule_line = "─".repeat(usize::from(rule.width));
     frame.render_widget(Paragraph::new(rule_line).fg(LINE), rule);
     render_input(frame, input, view, focused);
+}
+
+/// Clean's mascot, three rows: a round head with thick brows, two big eyes and a flat mouth.
+const FACE: [&str; 3] = [" ▄▀▀▀▄ ", "█ ◕ ◕ █", " ▀▄▬▄▀ "];
+
+/// Clean's face, name, status and model, with how to open the cards.
+fn render_face(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+    let [face, _, about] = Layout::horizontal([
+        Constraint::Length(7),
+        Constraint::Length(2),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let face_lines: Vec<Line<'static>> = FACE
+        .iter()
+        .map(|row| {
+            Line::from(
+                row.chars()
+                    .map(|ch| match ch {
+                        '◕' | '▬' => Span::raw(ch.to_string()).fg(BRIGHT),
+                        _ => Span::raw(ch.to_string()).fg(ACCENT),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(face_lines), face);
+    let status = state
+        .team
+        .status(Role::Lead, state.waiting_on(Role::Lead), now);
+    let model = state
+        .team
+        .desk(Role::Lead)
+        .model
+        .as_deref()
+        .map(short_model)
+        .unwrap_or_default();
+    let cards = if view.cards_open {
+        "Esc, then Enter folds the cards"
+    } else {
+        "Esc, then Enter opens the cards"
+    };
+    let mut status_line = vec![Span::raw("● ").fg(ACCENT)];
+    status_line.extend(status_spans(&status, now));
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("Clean").fg(BRIGHT).bold(),
+            Span::raw("  the lead agent · asks the specialists for you").fg(MUTED),
+        ]),
+        Line::from(status_line),
+        Line::from(vec![
+            Span::raw(model).fg(DIM),
+            Span::raw(format!("   {cards}")).fg(DIM),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), about);
 }
 
 /// The kernel banner: what was blocked, for whom, why, and the receipt that proves it.
@@ -184,7 +235,7 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, no
     if rows == 0 {
         return;
     }
-    let lines = feed_lines(state, usize::from(area.width));
+    let lines = feed_lines(state, usize::from(area.width), view.cards_open);
     if lines.is_empty() {
         frame.render_widget(Paragraph::new(empty_feed(rows)), area);
         return;
@@ -246,7 +297,7 @@ fn empty_feed(rows: usize) -> Vec<Line<'static>> {
     lines.extend([
         Line::from(Span::raw("◆").fg(ACCENT)).centered(),
         Line::default(),
-        Line::from("The Lead is standing by.").fg(TEXT).centered(),
+        Line::from("Clean is standing by.").fg(TEXT).centered(),
         Line::from("Ask what happened, what to do first, or to check on a specialist.")
             .fg(MUTED)
             .centered(),
@@ -268,26 +319,47 @@ enum Class {
     Marker,
 }
 
-/// Every conversation line at `width`, oldest first.
-fn feed_lines(state: &State, width: usize) -> Vec<Line<'static>> {
+/// Every conversation line at `width`, oldest first, with room between turns. System notes stay
+/// in the toast and on the other tabs; only kernel blocks remain, one red line each with the
+/// receipt. A run of "Scribe updated the scope" narration is one line with its newest text.
+fn feed_lines(state: &State, width: usize, open: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut previous: Option<Class> = None;
+    let mut scope_run: Option<(&Said, usize)> = None;
     for item in &state.talk {
-        let class = match item {
-            Talk::Marker(_) => Class::Marker,
-            Talk::Said(said) => said_class(said),
-        };
-        if previous.is_some_and(|previous| class == Class::Message || previous != class) {
-            lines.push(Line::default());
+        if let Talk::Said(said) = item
+            && is_scope_note(said)
+        {
+            scope_run = Some((said, scope_run.map_or(1, |(_, count)| count + 1)));
+            continue;
         }
-        previous = Some(class);
+        if let Talk::Marker(marker) = item
+            && marker.tone != Tone::Bad
+        {
+            continue;
+        }
+        if let Some((said, count)) = scope_run.take() {
+            space(&mut lines, &mut previous, Class::Card);
+            lines.push(scope_line(said, count, width));
+        }
         match item {
-            Talk::Marker(marker) => lines.push(marker_line(marker, width)),
-            Talk::Said(said) => match said_class(said) {
-                Class::Message => message_lines(said, width, &mut lines),
-                Class::Card | Class::Marker => card_lines(said, width, &mut lines),
-            },
+            Talk::Marker(marker) => {
+                space(&mut lines, &mut previous, Class::Marker);
+                lines.push(denial_line(state, marker, width));
+            }
+            Talk::Said(said) => {
+                let class = said_class(said);
+                space(&mut lines, &mut previous, class);
+                match class {
+                    Class::Message => message_lines(said, width, &mut lines),
+                    Class::Card | Class::Marker => card_lines(said, width, open, &mut lines),
+                }
+            }
         }
+    }
+    if let Some((said, count)) = scope_run {
+        space(&mut lines, &mut previous, Class::Card);
+        lines.push(scope_line(said, count, width));
     }
     lines
 }
@@ -302,24 +374,57 @@ const fn said_class(said: &Said) -> Class {
     }
 }
 
-/// `• 04:38:24  incident INC-7 declared: Ransomware on acme-fs`.
-fn marker_line(marker: &Marker, width: usize) -> Line<'static> {
-    let color = match marker.tone {
-        Tone::Quiet | Tone::Plain => DIM,
-        Tone::Good => OK,
-        Tone::Warn => AMBER,
-        Tone::Bad => RED,
+/// Blank lines before an entry of `class`: two around a message, one between kinds, none inside
+/// a run of cards or blocks.
+fn space(lines: &mut Vec<Line<'static>>, previous: &mut Option<Class>, class: Class) {
+    if let Some(before) = *previous {
+        let gap = match (before, class) {
+            (Class::Message, _) | (_, Class::Message) => 2,
+            (Class::Card, Class::Card) | (Class::Marker, Class::Marker) => 0,
+            (Class::Card, Class::Marker) | (Class::Marker, Class::Card) => 1,
+        };
+        lines.extend(std::iter::repeat_n(Line::default(), gap));
+    }
+    *previous = Some(class);
+}
+
+/// Whether `said` is Clean narrating a scope update.
+fn is_scope_note(said: &Said) -> bool {
+    said.from == Who::Agent(Role::Lead) && said.text.starts_with("Scribe updated the scope")
+}
+
+/// `◆ Clean · Scribe updated the scope: VPN credentials now locked.  ×4`, in place.
+fn scope_line(said: &Said, count: usize, width: usize) -> Line<'static> {
+    let times = if count > 1 {
+        format!("  ×{count}")
+    } else {
+        String::new()
     };
-    let lead = format!("  • {}  ", marker.at);
-    let text = fit(&marker.text, width.saturating_sub(width_of(&lead)));
+    let room = width.saturating_sub(16 + times.len());
     Line::from(vec![
-        Span::raw("  • ").fg(color),
+        Span::raw("    ◆ ").fg(ACCENT),
+        Span::raw(format!("{}  ", said.at)).fg(DIM),
+        Span::raw(fit(&crate::state::one_line(&said.text), room)).fg(MUTED),
+        Span::raw(times).fg(DIM),
+    ])
+}
+
+/// `⛔ 06:46:19  kernel blocked hunter: rm -rf /evidence/* · read-only · receipt #45`.
+fn denial_line(state: &State, marker: &Marker, width: usize) -> Line<'static> {
+    let receipt = state
+        .denials
+        .all()
+        .iter()
+        .find(|denial| denial.at == marker.at)
+        .and_then(|denial| denial.receipt)
+        .map(|seq| format!(" · receipt #{seq}"))
+        .unwrap_or_default();
+    let room = width.saturating_sub(16 + receipt.len());
+    Line::from(vec![
+        Span::raw("    ⛔ ").fg(RED),
         Span::raw(format!("{}  ", marker.at)).fg(DIM),
-        Span::raw(text).fg(if marker.tone == Tone::Plain {
-            MUTED
-        } else {
-            color
-        }),
+        Span::raw(fit(&marker.text, room)).fg(RED).bold(),
+        Span::raw(receipt).fg(RED),
     ])
 }
 
@@ -387,8 +492,9 @@ fn agent_lines(role: Role, said: &Said, width: usize, lines: &mut Vec<Line<'stat
     }
 }
 
-/// A compact card between agents: `│ ◆ Lead → ▲ Hunter  What did you find?`, two lines at most.
-fn card_lines(said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
+/// A compact card between agents, `│ ◆ Clean → ▲ Hunter  What did you find?`: one line, or the
+/// whole text when the cards are open.
+fn card_lines(said: &Said, width: usize, open: bool, lines: &mut Vec<Line<'static>>) {
     let Who::Agent(from) = said.from else {
         return;
     };
@@ -405,17 +511,23 @@ fn card_lines(said: &Said, width: usize, lines: &mut Vec<Line<'static>>) {
     header.push(Span::raw("  "));
     let used: usize = header.iter().map(Span::width).sum();
     let text = crate::state::one_line(&said.text);
-    let first_room = width.saturating_sub(used);
-    let wrapped = wrap(&text, first_room.max(8));
+    if !open {
+        header.push(Span::raw(fit(&text, width.saturating_sub(used))).fg(MUTED));
+        lines.push(Line::from(header));
+        return;
+    }
+    let wrapped = wrap(&text, width.saturating_sub(used).max(8));
     let first = wrapped.first().cloned().unwrap_or_default();
     let rest: String = wrapped.get(1..).unwrap_or_default().join(" ");
-    let second_room = width.saturating_sub(GUTTER);
     header.push(Span::raw(first).fg(MUTED));
     lines.push(Line::from(header));
-    if !rest.is_empty() {
+    for line in wrap(&rest, width.saturating_sub(GUTTER).max(8))
+        .into_iter()
+        .take(MESSAGE_LINES)
+    {
         lines.push(Line::from(vec![
             Span::raw("    │ ").fg(LINE),
-            Span::raw(fit(&rest, second_room)).fg(MUTED),
+            Span::raw(line).fg(MUTED),
         ]));
     }
 }
@@ -467,10 +579,10 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, view: &View, focused: bool) {
     if view.draft.is_empty() {
         let placeholder = match (focused, room >= 84) {
             (true, true) => {
-                "Ask the Lead anything · @hunter, @forensics, @scribe or @containment asks a specialist"
+                "Ask Clean anything · @hunter, @forensics, @scribe or @containment asks a specialist"
             }
-            (true, false) => "Ask the Lead · @hunter asks a specialist",
-            (false, _) => "Press Enter to talk to the Lead",
+            (true, false) => "Ask Clean · @hunter asks a specialist",
+            (false, _) => "Press c to talk to Clean",
         };
         spans.push(Span::raw(fit(placeholder, room)).fg(DIM));
     } else {

@@ -109,9 +109,11 @@ fn page(state: &State, view: &View, now: Timestamp) -> Page {
         super::Tab::Scope => scope_page(state),
         super::Tab::Record => record_page(state, now),
         super::Tab::Defense => defense_page(state),
-        super::Tab::Team | super::Tab::Lead | super::Tab::Memory | super::Tab::Controlroom => {
-            team_page(state, now)
-        }
+        super::Tab::Team
+        | super::Tab::Lead
+        | super::Tab::Memory
+        | super::Tab::System
+        | super::Tab::Controlroom => team_page(state, now),
     }
 }
 
@@ -295,7 +297,7 @@ fn overview_page(state: &State, view: &View, now: Timestamp) -> Page {
                         ("d", "Detonate"),
                         ("t", "Tamper"),
                         ("A", "Admit"),
-                        ("F2", "Lead"),
+                        ("F2", "Clean"),
                     ],
                 )],
                 vec![
@@ -383,7 +385,7 @@ fn welcome(frame: &mut Frame<'_>, area: Rect) {
         key("t", "flip a byte in the Debian root; admission rejects it"),
         key("A", "admit the clean root again"),
         key("d", "detonate the ransomware scenario in the sacrificial stratum"),
-        key("F2", "talk to the Lead agent while the team investigates"),
+        key("F2", "talk to Clean, the lead agent, while the team investigates"),
         key("?", "every key"),
         Line::default(),
         Line::from(vec![
@@ -595,8 +597,8 @@ fn now_lines(state: &State, now: Timestamp) -> Vec<Line<'static>> {
         ]));
     }
     lines.push(Line::from(vec![
-        Span::raw("ask the Lead what to do first").fg(TEXT),
-        link("Lead F2"),
+        Span::raw("ask Clean what to do first").fg(TEXT),
+        link("Clean F2"),
     ]));
     lines.push(log_line(state));
     lines
@@ -1234,13 +1236,13 @@ fn team_page(state: &State, now: Timestamp) -> Page {
         Panel::lines(
             &format!("{} {}", glyph(role), team::title(role)),
             member_lines(state, role, now),
-            &[("F2", "Ask the Lead")],
+            &[("F2", "Ask Clean")],
         )
     };
     Page {
         columns: vec![
             vec![
-                Panel::lines("Crew", crew_tree(state, now), &[("F2", "Ask the Lead")]),
+                Panel::lines("Crew", crew_tree(state, now), &[("F2", "Ask Clean")]),
                 card(Role::Lead),
                 card(Role::Forensics),
             ],

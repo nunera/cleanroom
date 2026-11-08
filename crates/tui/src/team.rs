@@ -15,7 +15,7 @@ pub(crate) const SPECIALISTS: [Role; 4] = [
 /// `Lead`, `Hunter`, …: a role's name in a sentence.
 pub(crate) const fn title(role: Role) -> &'static str {
     match role {
-        Role::Lead => "Lead",
+        Role::Lead => "Clean",
         Role::Hunter => "Hunter",
         Role::Forensics => "Forensics",
         Role::Scribe => "Scribe",

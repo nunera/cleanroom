@@ -611,7 +611,8 @@ impl App {
                 | Tab::Record
                 | Tab::Defense
                 | Tab::Team
-                | Tab::Memory => {
+                | Tab::Memory
+                | Tab::System => {
                     self.view.show(Tab::Lead);
                 }
             },
@@ -622,10 +623,9 @@ impl App {
             }
             Key::Left | Key::Char('[') => self.move_focus(false),
             Key::Right | Key::Char(']') => self.move_focus(true),
-            Key::Char(',') => self.view.chart = self.view.chart.step(false),
-            Key::Char('.') => self.view.chart = self.view.chart.step(true),
+            Key::Char(ch @ (',' | '.')) => self.view.chart = self.view.chart.step(ch == '.'),
             Key::Enter => match (self.view.tab, self.view.pane) {
-                (Tab::Lead, _) => self.view.focus = Focus::Input,
+                (Tab::Lead, _) => self.view.cards_open = !self.view.cards_open,
                 (Tab::Controlroom, Pane::Trace) => {
                     self.view.trace = match self.view.trace {
                         Some(_) => None,
@@ -639,7 +639,8 @@ impl App {
                     | Tab::Record
                     | Tab::Defense
                     | Tab::Team
-                    | Tab::Memory,
+                    | Tab::Memory
+                    | Tab::System,
                     _,
                 ) => {}
             },
@@ -1301,8 +1302,8 @@ mod tests {
         );
         assert_eq!(app.view.draft, "draft", "the draft waits for the commander");
 
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view.focus, Focus::Input, "Enter returns to the line");
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.view.focus, Focus::Input, "c returns to the line");
     }
 
     #[test]

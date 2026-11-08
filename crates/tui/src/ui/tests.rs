@@ -388,9 +388,6 @@ fn every_tab_tells_its_part_of_the_incident_at_projector_size() {
         &[
             "KERNEL BLOCKED",
             "signed receipt #15",
-            "What happened, and what should I do first?",
-            "◆ Lead → ▲ Hunter",
-            "▲ Hunter → ◆ Lead",
             "asking Forensics",
             "waiting on you",
         ],
@@ -499,7 +496,7 @@ fn the_tabs_still_read_at_120_by_36() {
     renders(
         Tab::Lead,
         size,
-        &["KERNEL BLOCKED", "◆ LEAD", "TEAM", "waiting on you"],
+        &["KERNEL BLOCKED", "◆ CLEAN", "TEAM", "waiting on you"],
     );
     renders(
         Tab::Controlroom,

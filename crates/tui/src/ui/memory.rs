@@ -1403,7 +1403,7 @@ mod tests {
             "attention ×6",
             "KV cache: the only exact recall",
             "Context, span by span",
-            "◆ LEAD",
+            "◆ CLEAN",
             "● FORENSICS",
             "▣ CONTAINMENT",
             "Cache · computed, not measured",

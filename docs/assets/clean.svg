@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 370" width="300" height="370" role="img" aria-label="Clean, the Cleanroom mascot">
+  <defs><clipPath id="ch"><circle cx="150" cy="150" r="110"/></clipPath></defs>
+  <g fill="#e6fffa" stroke="#e6fffa" stroke-width="34" stroke-linejoin="round"><circle cx="150" cy="150" r="110"/><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/></g>
+  <g fill="#0b1117" stroke="#0b1117" stroke-width="16" stroke-linejoin="round"><circle cx="150" cy="150" r="110"/><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/></g>
+  <g fill="#f4fffd"><circle cx="150" cy="150" r="110"/></g>
+  <g fill="#2dd4bf"><path d="M118 240 C126 252 128 262 128 276 L128 318 a22 22 0 0 0 44 0 L172 276 C172 262 174 252 182 240 Z"/><rect x="30" y="215" width="240" height="120" clip-path="url(#ch)"/></g>
+  <line x1="62" y1="215" x2="238" y2="215" stroke="#0b1117" stroke-width="8" stroke-linecap="round"/>
+  <g fill="#0b1117">
+    <rect x="56" y="93" width="70" height="22" rx="11" transform="rotate(-5 91 104)"/>
+    <rect x="174" y="93" width="70" height="22" rx="11" transform="rotate(5 209 104)"/>
+    <ellipse cx="95" cy="146" rx="32" ry="34"/>
+    <ellipse cx="205" cy="146" rx="32" ry="34"/>
+    <ellipse cx="150" cy="190" rx="44" ry="7.5"/>
+  </g>
+  <g fill="#ffffff"><circle cx="78" cy="158" r="11"/><circle cx="222" cy="158" r="11"/></g></svg>
