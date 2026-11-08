@@ -1,27 +1,25 @@
-//! The Cleanroom screen, the commander's default view.
+//! The Lead tab, and the conversation the Controlroom shares.
 //!
-//! The conversation with the Lead fills the left; the team and the situation sit on the right.
-//! After every OS denial the kernel banner is pinned over the conversation for a few seconds.
+//! The conversation with the Lead fills the left; the team and the approvals waiting sit on the
+//! right. After every OS denial the kernel banner is pinned over the conversation for 8 seconds.
 
-use cleanroom_proto::{Audience, Role, ScopeRecord, Tri};
+use cleanroom_proto::{Audience, Role};
 use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style, Stylize as _};
+use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::{
-    Focus, View, fit, grouped, heading, on, pad, panel, role_label, role_name, running_clocks,
-    short_model, spaces, spinner, tail_fit, urgency_color, width_of, wrap,
+    Focus, View, fit, heading, on, pad, panel, role_label, role_name, short_model, spaces, spinner,
+    tail_fit, width_of, wrap,
 };
-use crate::clocks;
 use crate::denials::{Denial, Kind};
-use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who, compromised, yes_flags};
+use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who};
 use crate::team::{self, SPECIALISTS, Status};
 use crate::theme::{
-    ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, DIM, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG,
-    TEXT, glyph, tint,
+    ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, glyph, tint,
 };
 
 /// Widest a Lead or specialist message runs before wrapping, for a comfortable measure.
@@ -31,7 +29,7 @@ const MESSAGE_LINES: usize = 16;
 /// Columns before a card's name: the trunk and its branch.
 const GUTTER: usize = 6;
 
-/// Draw the screen into `area`, everything between the top bar and the hint bar.
+/// The Lead tab: the conversation, with the team and the approvals waiting beside it.
 pub(super) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -70,7 +68,7 @@ pub(super) fn render(
 // ---------- Conversation ----------
 
 /// The conversation panel: banner, messages, the latest notice and the message line.
-fn render_conversation(
+pub(super) fn render_conversation(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &State,
@@ -468,23 +466,24 @@ fn draft_spans(shown: &str, focused: bool) -> Vec<Span<'static>> {
 
 // ---------- Right column ----------
 
-/// TEAM on top, SITUATION below.
+/// The team on top, the approvals waiting below.
 fn render_column(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
     let team_height: u16 = 2 + 2 + 3 * 4;
-    let gap = u16::from(area.height >= team_height + 19);
-    let [team_area, _, situation] = Layout::vertical([
+    let [team_area, _, approvals] = Layout::vertical([
         Constraint::Length(team_height),
-        Constraint::Length(gap),
+        Constraint::Length(1),
         Constraint::Fill(1),
     ])
     .areas(area);
     render_team(frame, team_area, state, now);
-    render_situation(frame, situation, state, view, now);
+    let mut lines = Vec::new();
+    approval_lines(state, view, usize::from(approvals.width), &mut lines);
+    frame.render_widget(Paragraph::new(lines), approvals);
 }
 
 /// The Lead's card, and the four specialists hanging off it. A link lights while the Lead waits
 /// on that specialist.
-fn render_team(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
+pub(super) fn render_team(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
     let width = usize::from(area.width);
     let mut lines = vec![heading("TEAM"), Line::default()];
     lines.extend(agent_card(Role::Lead, state, width, now));
@@ -520,7 +519,12 @@ fn render_team(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp)
 }
 
 /// A two-line card, `width` columns wide: glyph, name, model and status, then the last action.
-fn agent_card(role: Role, state: &State, width: usize, now: Timestamp) -> [Line<'static>; 2] {
+pub(super) fn agent_card(
+    role: Role,
+    state: &State,
+    width: usize,
+    now: Timestamp,
+) -> [Line<'static>; 2] {
     let card = Style::new().bg(RAISED);
     let desk = state.team.desk(role);
     let status = state.team.status(role, state.waiting_on(role), now);
@@ -570,7 +574,7 @@ fn agent_card(role: Role, state: &State, width: usize, now: Timestamp) -> [Line<
 }
 
 /// The status at the right of a card.
-fn status_spans(status: &Status, now: Timestamp) -> Vec<Span<'static>> {
+pub(super) fn status_spans(status: &Status, now: Timestamp) -> Vec<Span<'static>> {
     match status {
         Status::Idle => vec![Span::raw("idle").fg(DIM)],
         Status::Thinking => vec![
@@ -597,164 +601,13 @@ fn status_spans(status: &Status, now: Timestamp) -> Vec<Span<'static>> {
     }
 }
 
-/// Assets, the nearest legal clocks, the approvals waiting and, when there is room, what each
-/// defense layer stopped.
-fn render_situation(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
-    let width = usize::from(area.width);
-    let roomy = area.height >= 20;
-    let mut lines = vec![heading("SITUATION")];
-    if roomy {
-        lines.push(Line::default());
-    }
-    asset_tiles(state, width, &mut lines);
-    lines.push(Line::default());
-    clock_lines(state, width, now, &mut lines);
-    lines.push(Line::default());
-    approval_lines(state, view, width, &mut lines);
-    if usize::from(area.height) >= lines.len() + 5 {
-        lines.push(Line::default());
-        lines.extend(defense_lines(state));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// What each layer stopped: the model refusing, the kernel blocking, the safety model flagging.
-fn defense_lines(state: &State) -> [Line<'static>; 4] {
-    let counters = state.counters;
-    let kernel = Some(u32::try_from(state.blocks()).unwrap_or(u32::MAX));
-    let row = |label: &str, value: Option<u32>, color| {
-        let value = value.map_or_else(|| "–".to_owned(), |value| value.to_string());
-        Line::from(vec![
-            Span::raw(format!("  {label:<18}")).fg(MUTED),
-            Span::raw(format!("{value:>4}")).fg(color).bold(),
-        ])
-    };
-    [
-        heading("DEFENSE LAYERS"),
-        row(
-            "model refused",
-            counters.map(|counters| counters.blocked_by_model),
-            ACCENT,
-        ),
-        row("kernel blocked", kernel, RED),
-        row(
-            "safety flagged",
-            counters.map(|counters| counters.safety_flags),
-            AMBER,
-        ),
-    ]
-}
-
-/// Up to six assets as two-line tiles, two to a row: the accent when clean, red when hit, amber
-/// when unknown.
-fn asset_tiles(state: &State, width: usize, lines: &mut Vec<Line<'static>>) {
-    if state.scope.is_empty() {
-        lines.push(Line::from("  no assets reported yet").fg(DIM));
-        return;
-    }
-    let tile = width.saturating_sub(2) / 2;
-    for (row, pair) in state.scope.chunks(2).take(3).enumerate() {
-        if row > 0 {
-            lines.push(Line::default());
-        }
-        let mut first = Vec::new();
-        let mut second = Vec::new();
-        for (index, asset) in pair.iter().enumerate() {
-            if index > 0 {
-                first.push(Span::raw("  "));
-                second.push(Span::raw("  "));
-            }
-            let [name, state_line] = tile_lines(asset, tile);
-            first.extend(name);
-            second.extend(state_line);
-        }
-        lines.push(Line::from(first));
-        lines.push(Line::from(second));
-    }
-    let more = state.scope.len().saturating_sub(6);
-    if more > 0 {
-        lines.push(Line::from(format!("  +{more} more in the Controlroom")).fg(DIM));
-    }
-}
-
-/// One asset tile: its name, then what happened to it and its record count.
-fn tile_lines(asset: &ScopeRecord, width: usize) -> [Vec<Span<'static>>; 2] {
-    let hit = yes_flags(asset.flags);
-    let unknown = [
-        asset.flags.locked,
-        asset.flags.exfiltrated,
-        asset.flags.accessed,
-        asset.flags.destroyed,
-        asset.flags.modified,
-    ]
-    .iter()
-    .filter(|value| **value == Tri::Unknown)
-    .count();
-    let (surface, word, word_color): (Color, String, Color) = if compromised(asset.flags) {
-        let word = match hit.as_slice() {
-            [only] => (*only).to_owned(),
-            [first, rest @ ..] => format!("{first} +{}", rest.len()),
-            [] => String::new(),
-        };
-        (RED_BG, word, BRIGHT)
-    } else if unknown > 0 {
-        (AMBER_BG, format!("{unknown} UNKNOWN"), BRIGHT)
-    } else {
-        (ACCENT_BG, "clean".to_owned(), ACCENT)
-    };
-    let style = Style::new().bg(surface);
-    let name = pad(&format!(" {}", asset.name), width);
-    let count = format!("{} rec ", grouped(asset.record_count));
-    let records = if width_of(&word) + width_of(&count) + 2 <= width {
-        count
-    } else {
-        String::new()
-    };
-    let word = fit(&word, width.saturating_sub(width_of(&records) + 2));
-    let fill = width.saturating_sub(1 + width_of(&word) + width_of(&records));
-    [
-        vec![Span::styled(name, style.fg(BRIGHT).bold())],
-        vec![
-            Span::styled(" ", style),
-            Span::styled(word, style.fg(word_color).bold()),
-            spaces(fill, style),
-            Span::styled(records, style.fg(TEXT)),
-        ],
-    ]
-}
-
-/// The three nearest running legal clocks.
-fn clock_lines(state: &State, width: usize, now: Timestamp, lines: &mut Vec<Line<'static>>) {
-    lines.push(heading("LEGAL CLOCKS"));
-    let running = running_clocks(state);
-    if running.is_empty() {
-        lines.push(
-            Line::from(fit(
-                "  none running · each starts when the record sets its trigger",
-                width,
-            ))
-            .fg(DIM),
-        );
-        return;
-    }
-    let label_width = width.saturating_sub(25).clamp(10, 22);
-    for (clock, due) in running.into_iter().take(3) {
-        let remaining = due.duration_since(now);
-        let countdown = clocks::countdown(remaining);
-        let day = super::due_label(due, &state.display_tz, "%a %b %-d");
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::raw(pad(clock.regime.notice(), label_width)).fg(MUTED),
-            Span::raw(format!("{countdown:>10}"))
-                .fg(urgency_color(clocks::urgency(remaining)))
-                .bold(),
-            Span::raw(format!("   {day}")).fg(DIM),
-        ]));
-    }
-}
-
 /// What waits for the commander's signature, with the keys that decide it.
-fn approval_lines(state: &State, view: &View, width: usize, lines: &mut Vec<Line<'static>>) {
+pub(super) fn approval_lines(
+    state: &State,
+    view: &View,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
     let waiting = state.waiting();
     let mut header = vec![Span::raw("APPROVALS").fg(MUTED).bold()];
     if waiting > 0 {

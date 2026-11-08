@@ -353,6 +353,8 @@ pub struct State {
     pub(crate) investigating: Option<String>,
     /// Latest notice.
     pub(crate) notice: Option<Notice>,
+    /// Bumped on every notice, so the corner toast can tell a new one from an old one.
+    pub(crate) notice_seq: u64,
 }
 
 impl State {
@@ -378,6 +380,7 @@ impl State {
             admission_seq: 0,
             investigating: None,
             notice: None,
+            notice_seq: 0,
         }
     }
 
@@ -414,6 +417,7 @@ impl State {
             tone,
             text: text.into(),
         });
+        self.notice_seq = self.notice_seq.wrapping_add(1);
     }
 
     /// Queue items still waiting for the commander's signature.

@@ -25,7 +25,7 @@ use crate::access::{MEMBER_ROLES, Standing};
 use crate::replay;
 use crate::state::{SentRequest, State, Tone};
 use crate::team;
-use crate::ui::{self, Field, Focus, Link, Overlay, Pane, Screen, View};
+use crate::ui::{self, Field, Focus, Link, Overlay, Pane, Tab, View};
 
 /// Redraw often enough that second-resolution countdowns tick smoothly.
 const TICK: Duration = Duration::from_millis(250);
@@ -244,10 +244,8 @@ enum Key {
     PageDown,
     /// End.
     End,
-    /// F1: the Cleanroom screen.
-    F1,
-    /// F2: the Controlroom screen.
-    F2,
+    /// A function key: F1 to F6 and F10 open tabs.
+    F(u8),
 }
 
 /// The console's controller.
@@ -446,18 +444,20 @@ impl App {
         }
     }
 
-    /// A key with no modal open: screen switches work everywhere, the rest follows the focus.
+    /// A key with no modal open: tab switches work everywhere, the rest follows the focus.
     fn on_screen_key(&mut self, key: Key) {
+        let talking = matches!(self.view.tab, Tab::Lead | Tab::Controlroom);
         match key {
-            Key::Tab | Key::BackTab => self.view.show(match self.view.screen {
-                Screen::Cleanroom => Screen::Controlroom,
-                Screen::Controlroom => Screen::Cleanroom,
-            }),
-            Key::F1 => self.view.show(Screen::Cleanroom),
-            Key::F2 => self.view.show(Screen::Controlroom),
-            Key::PageUp if self.view.screen == Screen::Cleanroom => self.scroll_by(PAGE, true),
-            Key::PageDown if self.view.screen == Screen::Cleanroom => self.scroll_by(PAGE, false),
-            Key::End if self.view.screen == Screen::Cleanroom => self.view.scroll = 0,
+            Key::Tab => self.view.show(self.view.tab.step(true)),
+            Key::BackTab => self.view.show(self.view.tab.step(false)),
+            Key::F(number) => {
+                if let Some(tab) = Tab::for_key(number) {
+                    self.view.show(tab);
+                }
+            }
+            Key::PageUp if talking => self.scroll_by(PAGE, true),
+            Key::PageDown if talking => self.scroll_by(PAGE, false),
+            Key::End if talking => self.view.scroll = 0,
             Key::Char(_)
             | Key::Up
             | Key::Down
@@ -503,18 +503,14 @@ impl App {
             | Key::PageUp
             | Key::PageDown
             | Key::End
-            | Key::F1
-            | Key::F2 => {}
+            | Key::F(_) => {}
         }
     }
 
-    /// Send the draft to the Lead, or to the agent it names with `@`.
+    /// Send the draft to the Lead, or to the agent it names with `@`. The line keeps focus.
     fn send_draft(&mut self) {
         let text = self.view.draft.trim().to_owned();
         if text.is_empty() {
-            if self.view.screen == Screen::Controlroom {
-                self.view.focus = Focus::Keys;
-            }
             return;
         }
         match address(&text) {
@@ -525,9 +521,6 @@ impl App {
                 if self.publish(body, Audience::Role { role }) {
                     self.view.draft.clear();
                     self.view.scroll = 0;
-                    if self.view.screen == Screen::Controlroom {
-                        self.view.focus = Focus::Keys;
-                    }
                 }
             }
             Err(problem) => self.state.notify(Tone::Warn, problem),
@@ -567,24 +560,37 @@ impl App {
             Key::Char('v') => self.request(CoreRequest::VerifyLog, SentRequest::VerifyLog),
             Key::Char('r') => self.view.overlay = Overlay::ConfirmReset,
             Key::Char('m') => self.open_members(),
-            Key::Char('c' | '/') => self.view.focus = Focus::Input,
+            Key::Char('c' | '/') => match self.view.tab {
+                Tab::Lead | Tab::Controlroom => self.view.focus = Focus::Input,
+                Tab::Overview | Tab::Scope | Tab::Record | Tab::Defense | Tab::Team => {
+                    self.view.show(Tab::Lead);
+                }
+            },
             Key::Up | Key::Char('k') => self.select(true),
             Key::Down | Key::Char('j') => self.select(false),
-            Key::Left | Key::Right if self.view.screen == Screen::Controlroom => {
+            Key::Left | Key::Right if self.view.tab == Tab::Controlroom => {
                 self.view.pane = match self.view.pane {
                     Pane::Approvals => Pane::Trace,
                     Pane::Trace => Pane::Approvals,
                 };
             }
-            Key::Enter => match (self.view.screen, self.view.pane) {
-                (Screen::Cleanroom, _) => self.view.focus = Focus::Input,
-                (Screen::Controlroom, Pane::Trace) => {
+            Key::Enter => match (self.view.tab, self.view.pane) {
+                (Tab::Lead, _) => self.view.focus = Focus::Input,
+                (Tab::Controlroom, Pane::Trace) => {
                     self.view.trace = match self.view.trace {
                         Some(_) => None,
                         None => self.state.activity.len().checked_sub(1),
                     };
                 }
-                (Screen::Controlroom, Pane::Approvals) => {}
+                (
+                    Tab::Controlroom
+                    | Tab::Overview
+                    | Tab::Scope
+                    | Tab::Record
+                    | Tab::Defense
+                    | Tab::Team,
+                    _,
+                ) => {}
             },
             Key::Esc => self.view.trace = None,
             Key::Char(_)
@@ -596,15 +602,14 @@ impl App {
             | Key::PageUp
             | Key::PageDown
             | Key::End
-            | Key::F1
-            | Key::F2 => {}
+            | Key::F(_) => {}
         }
     }
 
     /// Move the selection up (`up`) or down: approvals, or a trace step in the Controlroom's
     /// trace pane. Stepping down past the newest step follows the trace again.
     fn select(&mut self, up: bool) {
-        if self.view.screen == Screen::Controlroom && self.view.pane == Pane::Trace {
+        if self.view.tab == Tab::Controlroom && self.view.pane == Pane::Trace {
             let last = self.state.activity.len().checked_sub(1);
             self.view.trace = match (self.view.trace, up) {
                 (None, true) => last,
@@ -658,8 +663,7 @@ impl App {
             | Key::PageUp
             | Key::PageDown
             | Key::End
-            | Key::F1
-            | Key::F2 => {}
+            | Key::F(_) => {}
         }
     }
 
@@ -682,8 +686,7 @@ impl App {
             | Key::PageUp
             | Key::PageDown
             | Key::End
-            | Key::F1
-            | Key::F2 => {}
+            | Key::F(_) => {}
         }
     }
 
@@ -728,8 +731,7 @@ impl App {
                 | Key::PageUp
                 | Key::PageDown
                 | Key::End
-                | Key::F1
-                | Key::F2 => {}
+                | Key::F(_) => {}
             }
             return;
         }
@@ -774,8 +776,7 @@ impl App {
                 | Key::PageUp
                 | Key::PageDown
                 | Key::End
-                | Key::F1
-                | Key::F2,
+                | Key::F(_),
             ) => {}
         }
     }
@@ -1087,8 +1088,7 @@ const fn key(code: KeyCode) -> Option<Key> {
         KeyCode::PageUp => Some(Key::PageUp),
         KeyCode::PageDown => Some(Key::PageDown),
         KeyCode::End => Some(Key::End),
-        KeyCode::F(1) => Some(Key::F1),
-        KeyCode::F(2) => Some(Key::F2),
+        KeyCode::F(number) => Some(Key::F(number)),
         _ => None,
     }
 }
@@ -1201,10 +1201,11 @@ mod tests {
     #[test]
     fn typing_in_the_message_line_never_fires_a_command() {
         let (mut app, mut sent) = console();
+        press(&mut app, KeyCode::F(2));
         assert_eq!(
             app.view.focus,
             Focus::Input,
-            "Cleanroom opens on the message line"
+            "the Lead tab opens on the message line"
         );
 
         type_text(&mut app, "approve? x d q");
@@ -1233,6 +1234,7 @@ mod tests {
     #[test]
     fn esc_leaves_the_line_and_the_keys_command_again() {
         let (mut app, mut sent) = console();
+        press(&mut app, KeyCode::F(2));
         type_text(&mut app, "draft");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view.focus, Focus::Keys);
@@ -1258,6 +1260,7 @@ mod tests {
     #[test]
     fn an_at_name_goes_to_that_specialist_and_a_typo_goes_nowhere() {
         let (mut app, mut sent) = console();
+        press(&mut app, KeyCode::F(2));
         type_text(&mut app, "@hunter what did the note ask for?");
         press(&mut app, KeyCode::Enter);
         let frames = drain(&mut sent);
@@ -1279,21 +1282,26 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_screens_from_either_focus() {
+    fn function_keys_and_tab_switch_tabs_from_either_focus() {
         let (mut app, _sent) = console();
+        assert_eq!((app.view.tab, app.view.focus), (Tab::Overview, Focus::Keys));
+        press(&mut app, KeyCode::F(3));
         press(&mut app, KeyCode::Tab);
         assert_eq!(
-            (app.view.screen, app.view.focus),
-            (Screen::Controlroom, Focus::Keys)
+            app.view.tab,
+            Tab::Record,
+            "F3 is Scope, Tab steps to Record"
+        );
+        press(&mut app, KeyCode::F(10));
+        assert_eq!(
+            (app.view.tab, app.view.focus),
+            (Tab::Controlroom, Focus::Keys)
         );
         press(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.view.focus, Focus::Input, "c opens the chat line");
+        assert_eq!(app.view.focus, Focus::Input, "c opens the Controlroom chat");
         type_text(&mut app, "t");
         press(&mut app, KeyCode::F(1));
-        assert_eq!(
-            (app.view.screen, app.view.focus),
-            (Screen::Cleanroom, Focus::Input)
-        );
+        assert_eq!((app.view.tab, app.view.focus), (Tab::Overview, Focus::Keys));
         assert_eq!(app.view.draft, "t", "t was typed, not a tamper");
     }
 }

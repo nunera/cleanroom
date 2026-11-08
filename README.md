@@ -34,15 +34,23 @@ Prompt guardrails and safety models are probabilistic layers. The read-only gran
 
 ## Screenshots
 
-Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45.
+Live run, guardrails off, hosted Nemotron, captured from tmux at 160×45. The banner's sky follows the incident: teal while everything is clean, a red sunset once assets are compromised, amber at the horizon while something waits for a signature.
 
-**Cleanroom** (the default screen): the commander's conversation with the Lead agent, the Lead's delegations to the specialists, the team with live status, and the situation (assets, the nearest legal clocks, approvals waiting). The red banner is pinned for a few seconds after the kernel blocks an agent.
+**Overview** (F1): what to do next, with the key for each line; the incident; every asset's flags; what each defense layer stopped; the nearest legal deadlines.
 
-![Cleanroom screen](docs/screenshots/cleanroom.png)
+![Overview tab](docs/screenshots/overview.png)
 
-**Controlroom**: the dense operator view. Every OS denial stays pinned at the top with its receipt; below are the legal clocks, the scope table, the one-line agent trace, approvals, the incident timeline and comms.
+**Lead** (F2): the conversation with the Lead agent and its delegations to the specialists, the team with live status, and the red banner pinned for 8 seconds after the kernel blocks an agent.
 
-![Controlroom screen](docs/screenshots/controlroom.png)
+![Lead tab](docs/screenshots/lead.png)
+
+**Defense** (F5): every kernel denial with its receipt, the model's refusals, the safety verdicts, the guardrails setting and the receipt log.
+
+![Defense tab](docs/screenshots/defense.png)
+
+**Controlroom** (F10): the complete operator screen. Every OS denial stays pinned at the top with its receipt; below are the legal clocks, the scope table, the one-line agent trace over the Lead conversation, and the team, approvals, defense layers and timeline.
+
+![Controlroom](docs/screenshots/controlroom.png)
 
 ## Quick start
 
@@ -53,7 +61,7 @@ scripts/demo.sh --local            # route sensitive steps to Nemotron on Brev (
 scripts/demo.sh --replay           # replay recorded model responses, no network
 ```
 
-In the command center (Esc first if the message line has focus): `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset, `m` members, `Tab` switch screens.
+In the command center: `F1`–`F6` and `F10` pick a tab (Overview, Lead, Scope, Record, Defense, Team, Controlroom); on the Lead tab type to the Lead and press Esc for keys. Keys: `t` tamper (rejected), `A` admit clean root, `d` detonate, `a`/`x` approve/deny, `g` guardrails, `v` verify log, `r` reset, `m` members.
 
 ## Layout
 
@@ -170,11 +178,16 @@ cleanroom-agents run [--guardrails on|off] [--max-steps N] [--socket PATH] [--on
 
 ## Command center
 
-`cleanroom-tui` connects as the commander and renders only from bus events. Two screens, switched with `Tab` (or `F1`/`F2`):
-- **Cleanroom** (default): the conversation with the Lead agent, its delegations to the specialists as compact cards, key system events as one-line markers, the team (status, model, last action; a Lead↔specialist link lights while a delegation is open) and the situation (asset tiles, the three nearest legal clocks, approvals waiting). A kernel denial pins a red banner over the conversation for 8 seconds and leaves a count in the top bar.
-- **Controlroom**: every OS denial pinned with its agent, command and receipt; legal clocks, scope table, one-line agent trace (select a step to expand it), approvals, timeline and comms.
+`cleanroom-tui` connects as the commander and renders only from bus events. It is a row of tabs under a pixel-art banner whose sky shows the incident's state; `F1`–`F6` and `F10` pick a tab, `Tab`/`Shift+Tab` cycle:
+- **Overview** (F1): the next step and what needs you, each line naming the key that acts on it; the incident; assets with a flag strip; bars per defense layer; the nearest legal deadlines.
+- **Lead** (F2): the conversation with the Lead agent, its delegations to the specialists as compact cards, key system events as one-line markers, and the team (status, model, last action; a Lead↔specialist link lights while a delegation is open). A kernel denial pins a red banner over the conversation for 8 seconds.
+- **Scope** (F3): one card per asset with every flag, classes, records, Texans, confidence and evidence.
+- **Record** (F4): the incident record, its timeline and all five legal clocks with deadlines and duties.
+- **Defense** (F5): every kernel denial with its receipt, refusals, safety verdicts, guardrails and the receipt log (`v` verifies).
+- **Team** (F6): the Lead and each specialist with model, route, status, recent steps and findings.
+- **Controlroom** (F10): every OS denial pinned with agent, command and receipt; clocks, scope table, one-line agent trace (select a step to expand it) over the Lead conversation; team, approvals, defense layers and timeline beside them.
 
-The Cleanroom screen opens with the message line focused: everything typed is text, Enter sends it to the Lead, and `@hunter …` (or any agent name or its first letters) sends it to that specialist. Esc leaves the line for the command keys; Enter or `c` returns.
+The Lead tab opens with the message line focused: everything typed is text, Enter sends it to the Lead, and `@hunter …` (or any agent name or its first letters) sends it to that specialist. Esc leaves the line for the command keys; Enter or `c` returns. On every other tab the letters are commands, and daemon answers show in a corner toast.
 
 Keys: `d` detonate, `t` tamper then admit (rejected), `A` admit the clean root, `a`/`x` approve/deny the selected item, `g` toggle agent prompt guardrails, `i` investigate, `v` verify the receipt log, `r` reset, `c` chat, `m` access control (enroll a member by public key, name and role, or revoke one; signed with the commander key), `PgUp`/`PgDn` scroll the conversation, `←`/`→` switch Controlroom panes, `?` help, `q` quit. `NO_COLOR` turns color off.
 

@@ -1,25 +1,27 @@
 //! Rendering: draws a [`State`] and a [`View`] into one ratatui frame.
 //!
-//! Two screens share one top bar and one hint bar. **Cleanroom**, the default, is the commander's
-//! conversation with the Lead agent beside the team and the situation at a glance.
-//! **Controlroom** is the dense operator view, with every OS denial pinned so it never scrolls
-//! away. Text sits next to every color, so nothing depends on color alone.
+//! The Cleanroom app is a row of tabs under a pixel-art banner whose sky shows the incident's
+//! state: Overview, Lead, Scope, Record, Defense and Team, plus the Controlroom, the dense operator
+//! screen with every OS denial pinned. Text sits next to every color, so nothing depends on color
+//! alone.
 
-mod cleanroom;
+mod banner;
 mod controlroom;
+mod lead;
 mod overlays;
+mod tabs;
 
 use std::cell::Cell;
 
 use cleanroom_proto::{IncidentStatus, LlmMode, MemberRole, Role, Severity, Tri};
-use jiff::Timestamp;
 use jiff::fmt::strtime;
 use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize as _};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar as _;
 
 use crate::access::Enrollment;
@@ -30,6 +32,11 @@ use crate::theme::{
     ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, Colors, DIM, INK, LINE, MUTED, RAISED, RAISED_HI,
     RED, RED_BG, TEXT, glyph, strip, tint,
 };
+
+/// The thin rule under the tab bar.
+const RULE: Color = Color::Rgb(24, 92, 86);
+/// How long a daemon answer stays in the corner toast.
+const TOAST_FOR: SignedDuration = SignedDuration::from_secs(6);
 
 /// How the console is fed.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,13 +55,109 @@ pub(crate) enum Link {
     },
 }
 
-/// Which screen is showing.
+/// The tab showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Screen {
-    /// The conversation with the Lead, the team and the situation.
-    Cleanroom,
-    /// The dense operator view.
+pub(crate) enum Tab {
+    /// F1: what happened, what's at risk, what to do next.
+    Overview,
+    /// F2: the conversation with the Lead.
+    Lead,
+    /// F3: every asset's scope record.
+    Scope,
+    /// F4: the incident record, timeline and legal clocks.
+    Record,
+    /// F5: what each defense layer stopped.
+    Defense,
+    /// F6: the agents.
+    Team,
+    /// F10: the dense operator screen.
     Controlroom,
+}
+
+impl Tab {
+    /// Every tab, in tab-bar order.
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Overview,
+        Self::Lead,
+        Self::Scope,
+        Self::Record,
+        Self::Defense,
+        Self::Team,
+        Self::Controlroom,
+    ];
+
+    /// The tab a function key opens: F1 to F6, and F10.
+    pub(crate) const fn for_key(number: u8) -> Option<Self> {
+        match number {
+            1 => Some(Self::Overview),
+            2 => Some(Self::Lead),
+            3 => Some(Self::Scope),
+            4 => Some(Self::Record),
+            5 => Some(Self::Defense),
+            6 => Some(Self::Team),
+            10 => Some(Self::Controlroom),
+            _ => None,
+        }
+    }
+
+    /// The next tab (`forward`) or the previous one, wrapping around.
+    pub(crate) fn step(self, forward: bool) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        let count = Self::ALL.len();
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        Self::ALL.get(next).copied().unwrap_or(self)
+    }
+
+    /// Name and function key on the tab bar.
+    const fn label(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Overview => ("Overview", "F1"),
+            Self::Lead => ("Lead", "F2"),
+            Self::Scope => ("Scope", "F3"),
+            Self::Record => ("Record", "F4"),
+            Self::Defense => ("Defense", "F5"),
+            Self::Team => ("Team", "F6"),
+            Self::Controlroom => ("Controlroom", "F10"),
+        }
+    }
+
+    /// Nickname and one-line description for the subtitle.
+    const fn about(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Overview => (
+                "the room",
+                "What happened, what's at risk, and what to do next. Each line names the key that goes there.",
+            ),
+            Self::Lead => (
+                "the line",
+                "Talk to the Lead; it asks the specialists for you. @hunter asks one directly. Esc for keys.",
+            ),
+            Self::Scope => (
+                "the vault",
+                "Every asset: what was locked, taken or touched, how sure the team is, and the evidence.",
+            ),
+            Self::Record => (
+                "the ledger",
+                "The incident record, its timeline, and every legal notification clock with its deadline.",
+            ),
+            Self::Defense => (
+                "the walls",
+                "What each layer stopped: the safety model, the agents' own refusals, and the kernel grant.",
+            ),
+            Self::Team => (
+                "the crew",
+                "The Lead and the four specialists: model, live status, recent steps and findings.",
+            ),
+            Self::Controlroom => (
+                "the deck",
+                "Everything at once: pinned OS blocks, scope, trace, the Lead, the team and approvals.",
+            ),
+        }
+    }
 }
 
 /// Where typed keys go.
@@ -150,8 +253,8 @@ pub struct View {
     pub(crate) overlay: Overlay,
     /// Last admission result the commander dismissed.
     pub(crate) admission_seen: u64,
-    /// The screen showing.
-    pub(crate) screen: Screen,
+    /// The tab showing.
+    pub(crate) tab: Tab,
     /// Where typed keys go.
     pub(crate) focus: Focus,
     /// The message being typed; kept when focus leaves the input.
@@ -166,6 +269,8 @@ pub struct View {
     pub(crate) trace: Option<usize>,
     /// The access-control overlay.
     pub(crate) access: AccessForm,
+    /// The notice the corner toast shows and when it first appeared.
+    pub(crate) toast: Cell<(u64, Option<Timestamp>)>,
     /// Whether color may be used.
     pub(crate) colors: Colors,
 }
@@ -189,7 +294,7 @@ impl View {
         )
     }
 
-    /// Shared constructor: the Cleanroom screen with the message line focused.
+    /// Shared constructor: the Overview tab with command keys.
     const fn new(link: Link, scenarios: Vec<String>) -> Self {
         Self {
             link,
@@ -197,14 +302,15 @@ impl View {
             selected: 0,
             overlay: Overlay::None,
             admission_seen: 0,
-            screen: Screen::Cleanroom,
-            focus: Focus::Input,
+            tab: Tab::Overview,
+            focus: Focus::Keys,
             draft: String::new(),
             scroll: 0,
             scroll_limit: Cell::new(0),
             pane: Pane::Approvals,
             trace: None,
             access: AccessForm::new(),
+            toast: Cell::new((0, None)),
             colors: Colors::Full,
         }
     }
@@ -226,12 +332,17 @@ impl View {
         state.admission.is_some() && state.admission_seq > self.admission_seen
     }
 
-    /// Show `screen`; the Cleanroom screen opens with the message line focused.
-    pub(crate) const fn show(&mut self, screen: Screen) {
-        self.screen = screen;
-        self.focus = match screen {
-            Screen::Cleanroom => Focus::Input,
-            Screen::Controlroom => Focus::Keys,
+    /// Show `tab`; the Lead tab opens with the message line focused, every other with keys.
+    pub(crate) const fn show(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.focus = match tab {
+            Tab::Lead => Focus::Input,
+            Tab::Overview
+            | Tab::Scope
+            | Tab::Record
+            | Tab::Defense
+            | Tab::Team
+            | Tab::Controlroom => Focus::Keys,
         };
     }
 }
@@ -240,67 +351,258 @@ impl View {
 pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(INK).fg(TEXT)), area);
-    let roomy = area.height >= 40;
-    let typing_here = view.screen == Screen::Controlroom && view.focus == Focus::Input;
-    let (items, fixed) = hint_items(view);
-    let wide = hints_width(items) + hints_width(fixed) + 1 > usize::from(area.width);
-    let hint_rows = if roomy && wide && !typing_here { 2 } else { 1 };
-    let [top, _, body, hints] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(u16::from(roomy)),
-        Constraint::Fill(1),
-        Constraint::Length(hint_rows),
-    ])
-    .areas(area);
-    render_top(frame, top, state, view, now);
-    match view.screen {
-        Screen::Cleanroom => cleanroom::render(frame, body, state, view, now),
-        Screen::Controlroom => controlroom::render(frame, body, state, view, now),
-    }
-    if typing_here {
-        controlroom::render_message_line(frame, hints, view);
+    if view.tab == Tab::Controlroom {
+        let [bar, pill, chips, body, keys] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        render_tab_bar(frame, bar, view);
+        frame.render_widget(
+            Paragraph::new(incident_pill(state, usize::from(pill.width))).bg(RAISED),
+            pill,
+        );
+        frame.render_widget(
+            Paragraph::new(vitals_line(state, now, usize::from(chips.width))).bg(RAISED),
+            chips,
+        );
+        controlroom::render(frame, body, state, view, now);
+        render_keys(frame, keys, view);
     } else {
-        render_hints(frame, hints, (items, fixed));
+        let banner_rows = if area.height >= 36 { banner::HEIGHT } else { 0 };
+        let [sky, bar, subtitle, rule, body, keys] = Layout::vertical([
+            Constraint::Length(banner_rows),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        if banner_rows > 0 {
+            banner::render(frame, sky, banner::Sky::of(state));
+        }
+        render_tab_bar(frame, bar, view);
+        render_subtitle(frame, subtitle, view.tab);
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(rule.width))).fg(RULE),
+            rule,
+        );
+        match view.tab {
+            Tab::Overview => tabs::overview(frame, body, state, view, now),
+            Tab::Lead => lead::render(frame, body, state, view, now),
+            Tab::Scope => tabs::scope(frame, body, state),
+            Tab::Record => tabs::record(frame, body, state, now),
+            Tab::Defense => tabs::defense(frame, body, state),
+            Tab::Team | Tab::Controlroom => tabs::crew(frame, body, state, now),
+        }
+        render_keys(frame, keys, view);
     }
+    render_toast(frame, area, state, view, now);
     overlays::render(frame, area, state, view);
     if view.colors == Colors::Off {
         strip(frame.buffer_mut());
     }
 }
 
-// ---------- Top bar ----------
+// ---------- Tab bar, subtitle, key bar, toast ----------
 
-/// Brand, incident and screen tabs on the first row; vital chips on the second.
-fn render_top(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+/// `◇ cleanroom   Overview F1   Lead F2 …`, the active tab a filled accent pill, the link on the
+/// right.
+fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, view: &View) {
     frame.render_widget(Block::new().style(Style::new().bg(RAISED)), area);
-    let [first, second] = Layout::vertical([Constraint::Length(1); 2]).areas(area);
-    let tabs = tabs(view.screen);
-    let tabs_width = u16::try_from(tabs.width()).unwrap_or(u16::MAX);
-    let [brand, tabs_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(tabs_width)]).areas(first);
+    let mut spans = vec![
+        Span::raw(" ◇ ").fg(ACCENT).bold(),
+        Span::raw("cleanroom").fg(BRIGHT).bold(),
+        Span::raw("   "),
+    ];
+    for tab in Tab::ALL {
+        let (name, key) = tab.label();
+        if tab == view.tab {
+            let pill = Style::new().fg(INK).bg(ACCENT);
+            spans.push(Span::styled(
+                format!(" {name} "),
+                pill.add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!("{key} "), pill));
+        } else {
+            spans.push(Span::raw(format!(" {name} ")).fg(TEXT));
+            spans.push(Span::raw(format!("{key} ")).fg(DIM));
+        }
+        spans.push(Span::raw(" "));
+    }
+    let link = link_badge(&view.link);
+    let link_width = u16::try_from(link.width() + 2).unwrap_or(u16::MAX);
+    let [tabs_area, link_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(link_width)]).areas(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
     frame.render_widget(
-        Paragraph::new(brand_line(state, usize::from(brand.width))),
-        brand,
+        Paragraph::new(Line::from(vec![link, Span::raw("  ")])),
+        link_area,
     );
-    frame.render_widget(Paragraph::new(tabs), tabs_area);
-    let link = link_chips(view, state);
-    let link_width = u16::try_from(link.width()).unwrap_or(u16::MAX);
-    let [vitals, link_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(link_width)]).areas(second);
-    let vitals_line = vitals_line(state, now, usize::from(vitals.width));
-    frame.render_widget(Paragraph::new(vitals_line), vitals);
-    frame.render_widget(Paragraph::new(link), link_area);
 }
 
-/// `◇ CLEANROOM   INC-7  Ransomware on acme-fs  ·  ANALYZING  ·  HIGH`, in `width` columns: a
-/// long title is cut so the status and severity always show.
-fn brand_line(state: &State, width: usize) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw("  ◇ ").fg(ACCENT).bold(),
-        Span::raw("CLEANROOM").fg(BRIGHT).bold(),
-        Span::raw("    "),
+/// `✦ OVERVIEW the room  What happened, …`.
+fn render_subtitle(frame: &mut Frame<'_>, area: Rect, tab: Tab) {
+    let (name, _) = tab.label();
+    let (nickname, about) = tab.about();
+    let lead = format!(" ✦ {} {nickname}  ", name.to_uppercase());
+    let line = Line::from(vec![
+        Span::raw(" ✦ ").fg(ACCENT).bold(),
+        Span::raw(name.to_uppercase()).fg(ACCENT).bold(),
+        Span::raw(" "),
+        Span::raw(nickname).fg(MUTED).italic(),
+        Span::raw("  "),
+        Span::raw(fit(
+            about,
+            usize::from(area.width).saturating_sub(width_of(&lead)),
+        ))
+        .fg(TEXT),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Key and action pairs for the key bar.
+type Hints = &'static [(&'static str, &'static str)];
+
+/// The keys for the current tab, focus and modal: the list, then the keys pinned to the right.
+const fn key_items(view: &View) -> (Hints, Hints) {
+    match (view.overlay, view.tab, view.focus) {
+        (Overlay::Members, ..) => (&[("Esc", "Close")], &[]),
+        (Overlay::Help | Overlay::Detonate { .. } | Overlay::ConfirmReset, ..) => {
+            (&[("Esc", "Close")], &[("q", "Quit")])
+        }
+        (Overlay::None, _, Focus::Input) => (
+            &[
+                ("Enter", "Send to the Lead"),
+                ("@hunter", "Ask a specialist"),
+                ("Esc", "Command keys"),
+                ("PgUp/PgDn", "Scroll"),
+                ("Tab", "Next tab"),
+            ],
+            &[("^C", "Quit")],
+        ),
+        (Overlay::None, Tab::Controlroom, Focus::Keys) => (
+            &[
+                ("a/x", "Approve/Deny"),
+                ("↑↓", "Select"),
+                ("←→", "Pane"),
+                ("Enter", "Expand"),
+                ("c", "Chat"),
+                ("d", "Detonate"),
+                ("t", "Tamper"),
+                ("A", "Admit"),
+                ("g", "Guardrails"),
+                ("i", "Investigate"),
+                ("v", "Verify"),
+                ("r", "Reset"),
+                ("m", "Members"),
+            ],
+            &[("?", "Help"), ("q", "Quit")],
+        ),
+        (
+            Overlay::None,
+            Tab::Overview | Tab::Lead | Tab::Scope | Tab::Record | Tab::Defense | Tab::Team,
+            Focus::Keys,
+        ) => (
+            &[
+                ("a/x", "Approve/Deny"),
+                ("c", "Ask the Lead"),
+                ("d", "Detonate"),
+                ("t", "Tamper"),
+                ("A", "Admit"),
+                ("g", "Guardrails"),
+                ("i", "Investigate"),
+                ("v", "Verify log"),
+                ("r", "Reset"),
+                ("m", "Members"),
+                ("Tab", "Next tab"),
+            ],
+            &[("?", "Help"), ("q", "Quit")],
+        ),
+    }
+}
+
+/// `key Action` pairs, the keys in the accent; what doesn't fit is left to `?`.
+fn render_keys(frame: &mut Frame<'_>, area: Rect, view: &View) {
+    let (items, pinned) = key_items(view);
+    let pair = |(key, action): &(&str, &str)| {
+        [
+            Span::raw(format!(" {key} ")).fg(ACCENT).bold(),
+            Span::raw(format!("{action} ")).fg(TEXT),
+        ]
+    };
+    let right: Vec<Span<'static>> = pinned.iter().flat_map(pair).collect();
+    let right_width: usize = right.iter().map(Span::width).sum();
+    let room = usize::from(area.width).saturating_sub(right_width + 1);
+    let mut left = Vec::new();
+    let mut used = 0;
+    for item in items {
+        let spans = pair(item);
+        let width: usize = spans.iter().map(Span::width).sum();
+        if used + width > room {
+            break;
+        }
+        used += width;
+        left.extend(spans);
+    }
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(u16::try_from(right_width + 1).unwrap_or(u16::MAX)),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(Line::from(left)).bg(RAISED), left_area);
+    frame.render_widget(Paragraph::new(Line::from(right)).bg(RAISED), right_area);
+}
+
+/// cleanroomd's latest answer, in a box at the bottom right for a few seconds.
+fn render_toast(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, now: Timestamp) {
+    let Some(notice) = &state.notice else {
+        return;
+    };
+    let (seen, since) = view.toast.get();
+    let since = if seen == state.notice_seq {
+        since.unwrap_or(now)
+    } else {
+        view.toast.set((state.notice_seq, Some(now)));
+        now
+    };
+    if now.duration_since(since) >= TOAST_FOR || area.height < 8 || area.width < 40 {
+        return;
+    }
+    let width = 64.min(area.width.saturating_sub(4));
+    let toast = Rect {
+        x: area.right().saturating_sub(width + 2),
+        y: area.bottom().saturating_sub(5),
+        width,
+        height: 3,
+    };
+    let color = match notice.tone {
+        Tone::Bad => RED,
+        Tone::Warn => AMBER,
+        Tone::Good | Tone::Quiet | Tone::Plain => ACCENT,
+    };
+    frame.render_widget(Clear, toast);
+    frame.render_widget(Block::new().style(Style::new().bg(RAISED_HI)), toast);
+    let text = fit(&notice.text, usize::from(width).saturating_sub(4));
+    let lines = vec![
+        Line::from(Span::raw("▌").fg(color)),
+        Line::from(vec![Span::raw("▌ ").fg(color), Span::raw(text).fg(BRIGHT)]),
+        Line::from(Span::raw("▌").fg(color)),
     ];
+    frame.render_widget(Paragraph::new(lines), toast);
+}
+
+// ---------- Controlroom header ----------
+
+/// `INC-7  Ransomware on acme-fs  ·  ANALYZING  ·  HIGH`, in `width` columns: a long title is cut
+/// so the status and severity always show.
+fn incident_pill(state: &State, width: usize) -> Line<'static> {
     let pill = Style::new().bg(RAISED_HI);
+    let mut spans = vec![Span::raw("  ")];
     match &state.incident {
         None => spans.push(Span::styled(" no incident declared ", pill.fg(DIM))),
         Some(incident) => {
@@ -327,32 +629,6 @@ fn brand_line(state: &State, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The two screen tabs, the active one lit.
-fn tabs(screen: Screen) -> Line<'static> {
-    let tab = |key: &'static str, name: &'static str, active: bool| {
-        if active {
-            [
-                Span::styled(format!(" {key} "), Style::new().fg(ACCENT).bg(ACCENT_BG)),
-                Span::styled(
-                    format!("{name} "),
-                    Style::new().fg(BRIGHT).bg(ACCENT_BG).bold(),
-                ),
-            ]
-        } else {
-            [
-                Span::styled(format!(" {key} "), Style::new().fg(DIM)),
-                Span::styled(format!("{name} "), Style::new().fg(MUTED)),
-            ]
-        }
-    };
-    let mut spans = Vec::with_capacity(6);
-    spans.extend(tab("F1", "Cleanroom", screen == Screen::Cleanroom));
-    spans.push(Span::raw(" "));
-    spans.extend(tab("F2", "Controlroom", screen == Screen::Controlroom));
-    spans.push(Span::raw("  "));
-    Line::from(spans)
-}
-
 /// One vital chip: a quiet label and a bold value, each with a shorter form for narrow screens.
 #[derive(Debug)]
 struct Chip {
@@ -364,8 +640,9 @@ struct Chip {
     color: Color,
 }
 
-/// Next deadline, assets compromised, kernel blocks, guardrails and approvals waiting, in
-/// `width` columns: short forms when the long ones don't fit, then the last chips dropped.
+/// Next deadline, assets compromised, kernel blocks, guardrails, approvals waiting and the
+/// agents' model mode, in `width` columns: short forms when the long ones don't fit, then the
+/// last chips dropped.
 fn vitals_line(state: &State, now: Timestamp, width: usize) -> Line<'static> {
     let mut chips = vec![next_deadline(state, now), assets_chip(state)];
     let blocks = state.blocks();
@@ -393,8 +670,22 @@ fn vitals_line(state: &State, now: Timestamp, width: usize) -> Line<'static> {
             color: AMBER,
         });
     }
+    if let Some(counters) = state.counters
+        && counters.llm != LlmMode::Live
+    {
+        let mode = if counters.llm == LlmMode::Replay {
+            "REPLAY"
+        } else {
+            "recording"
+        };
+        chips.push(Chip {
+            label: ("LLM", "LLM"),
+            value: (mode.to_owned(), mode.to_owned()),
+            color: AMBER,
+        });
+    }
     let line = |chips: &[Chip], short: bool| {
-        let mut spans = vec![Span::raw("    ")];
+        let mut spans = vec![Span::raw("  ")];
         for chip in chips {
             let (label, value) = if short {
                 (chip.label.1, chip.value.1.clone())
@@ -498,25 +789,6 @@ fn has_unknown(asset: &cleanroom_proto::ScopeRecord) -> bool {
     .contains(&Tri::Unknown)
 }
 
-/// LIVE / DISCONNECTED / REPLAY, and the agents' model mode when it is not live.
-fn link_chips(view: &View, state: &State) -> Line<'static> {
-    let mut spans = Vec::with_capacity(4);
-    if let Some(counters) = state.counters {
-        match counters.llm {
-            LlmMode::Live => {}
-            LlmMode::Record => spans.push(Span::raw("LLM recording   ").fg(MUTED)),
-            LlmMode::Replay => spans.push(Span::styled(
-                " LLM REPLAY ",
-                Style::new().fg(BRIGHT).bg(AMBER_BG).bold(),
-            )),
-        }
-        spans.push(Span::raw("   "));
-    }
-    spans.push(link_badge(&view.link));
-    spans.push(Span::raw("  "));
-    Line::from(spans)
-}
-
 /// LIVE / DISCONNECTED / REPLAY badge.
 fn link_badge(link: &Link) -> Span<'static> {
     match link {
@@ -544,149 +816,20 @@ fn status_span(status: IncidentStatus, pill: Style) -> Span<'static> {
     Span::styled(word, pill.fg(color).bold())
 }
 
-/// Severity word on the incident pill.
-fn severity_span(severity: Severity, pill: Style) -> Span<'static> {
-    let (word, color) = match severity {
+/// Severity word and color.
+pub(super) const fn severity_word(severity: Severity) -> (&'static str, Color) {
+    match severity {
         Severity::Critical => ("CRITICAL", RED),
         Severity::High => ("HIGH", RED),
         Severity::Moderate => ("MODERATE", AMBER),
         Severity::Low => ("LOW", MUTED),
-    };
+    }
+}
+
+/// Severity word on the incident pill.
+fn severity_span(severity: Severity, pill: Style) -> Span<'static> {
+    let (word, color) = severity_word(severity);
     Span::styled(word, pill.fg(color).bold())
-}
-
-// ---------- Hint bar ----------
-
-/// Key and label pairs for the hint bar.
-type Hints = &'static [(&'static str, &'static str)];
-
-/// Key hints for the current screen and focus: the list, then the keys pinned to the right.
-const fn hint_items(view: &View) -> (Hints, Hints) {
-    match (view.overlay, view.screen, view.focus) {
-        (Overlay::Members, ..) => (&[("Esc", "close")], &[]),
-        (Overlay::Help | Overlay::Detonate { .. } | Overlay::ConfirmReset, ..) => {
-            (&[("Esc", "close")], &[("q", "quit")])
-        }
-        (Overlay::None, Screen::Cleanroom, Focus::Input) => (
-            &[
-                ("Enter", "send to the Lead"),
-                ("@hunter", "ask a specialist"),
-                ("Esc", "command keys"),
-                ("PgUp/PgDn", "scroll"),
-            ],
-            &[("Tab", "Controlroom"), ("Ctrl+C", "quit")],
-        ),
-        (Overlay::None, Screen::Cleanroom, Focus::Keys) => (
-            CLEANROOM_KEYS,
-            &[("Tab", "Controlroom"), ("?", "help"), ("q", "quit")],
-        ),
-        (Overlay::None, Screen::Controlroom, Focus::Input | Focus::Keys) => (
-            CONTROLROOM_KEYS,
-            &[("Tab", "Cleanroom"), ("?", "help"), ("q", "quit")],
-        ),
-    }
-}
-
-/// Columns `hints` take on one line.
-fn hints_width(hints: Hints) -> usize {
-    hints
-        .iter()
-        .map(|(key, label)| hint(key, label).iter().map(Span::width).sum::<usize>())
-        .sum()
-}
-
-/// The hints, wrapped over the rows of `area`; the pinned keys stay at the right of the first
-/// row. Hints that still don't fit are left to the `?` help.
-fn render_hints(frame: &mut Frame<'_>, area: Rect, (items, fixed): (Hints, Hints)) {
-    let width = usize::from(area.width);
-    let pinned: Vec<Span<'static>> = fixed
-        .iter()
-        .flat_map(|(key, label)| hint(key, label))
-        .collect();
-    let pinned_width: usize = pinned.iter().map(Span::width).sum();
-    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw(" ")]];
-    let mut used = 1;
-    let rows_available = usize::from(area.height).max(1);
-    for (key, label) in items {
-        let pair = hint(key, label);
-        let pair_width: usize = pair.iter().map(Span::width).sum();
-        let room = if rows.len() == 1 {
-            width.saturating_sub(pinned_width)
-        } else {
-            width
-        };
-        if used + pair_width > room {
-            if rows.len() == rows_available {
-                break;
-            }
-            rows.push(vec![Span::raw(" ")]);
-            used = 1;
-        }
-        used += pair_width;
-        if let Some(row) = rows.last_mut() {
-            row.extend(pair);
-        }
-    }
-    for (index, row) in rows.into_iter().enumerate() {
-        let y = area
-            .y
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        frame.render_widget(
-            Paragraph::new(Line::from(row)),
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-        );
-    }
-    let pinned_width = u16::try_from(pinned_width).unwrap_or(u16::MAX);
-    let [_, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(pinned_width)])
-        .areas(Rect { height: 1, ..area });
-    frame.render_widget(Paragraph::new(Line::from(pinned)), right);
-}
-
-/// Command keys on the Cleanroom screen, most important first.
-const CLEANROOM_KEYS: Hints = &[
-    ("Enter", "talk"),
-    ("a/x", "approve/deny"),
-    ("↑↓", "select"),
-    ("d", "detonate"),
-    ("t", "tamper"),
-    ("A", "admit"),
-    ("g", "guardrails"),
-    ("i", "investigate"),
-    ("v", "verify log"),
-    ("r", "reset"),
-    ("m", "members"),
-];
-
-/// Command keys on the Controlroom screen, most important first.
-const CONTROLROOM_KEYS: Hints = &[
-    ("a/x", "approve/deny"),
-    ("↑↓", "select"),
-    ("←→", "pane"),
-    ("Enter", "expand"),
-    ("c", "chat"),
-    ("d", "detonate"),
-    ("t", "tamper"),
-    ("A", "admit"),
-    ("g", "guardrails"),
-    ("i", "investigate"),
-    ("v", "verify log"),
-    ("r", "reset"),
-    ("m", "members"),
-];
-
-/// One keycap and its label.
-fn hint(key: &str, label: &str) -> [Span<'static>; 2] {
-    [
-        Span::styled(
-            format!(" {key} "),
-            Style::new().fg(BRIGHT).bg(RAISED_HI).bold(),
-        ),
-        Span::raw(format!(" {label}  ")).fg(MUTED),
-    ]
 }
 
 // ---------- Shared pieces ----------

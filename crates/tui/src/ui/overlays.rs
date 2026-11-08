@@ -152,10 +152,13 @@ fn modal(
 /// Key reference.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let keys = [
-        ("Tab F1 F2", "Switch between Cleanroom and Controlroom"),
+        (
+            "F1-F6 F10",
+            "Overview, Lead, Scope, Record, Defense, Team; F10 the Controlroom (Tab cycles)",
+        ),
         (
             "Enter",
-            "Cleanroom: send to the Lead (@hunter, @forensics, @scribe, @containment asks one)",
+            "Lead tab: send to the Lead (@hunter, @forensics, @scribe, @containment asks one)",
         ),
         (
             "Esc",

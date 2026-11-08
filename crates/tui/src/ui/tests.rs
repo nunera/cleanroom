@@ -19,7 +19,8 @@ use ratatui::style::{Color, Modifier};
 use serde_json::json;
 use unicode_width::UnicodeWidthStr as _;
 
-use super::{Overlay, Pane, Screen, View, render};
+use super::banner::Sky;
+use super::{Overlay, Pane, Tab, View, render};
 use crate::state::State;
 
 /// The incident starts here; every event is a few seconds after it.
@@ -340,90 +341,145 @@ fn snapshot(name: &str, buffer: &Buffer) {
     }
 }
 
-fn controlroom() -> View {
+fn showing(tab: Tab) -> View {
     let mut view = View::live(vec!["ransomware".to_owned()]);
-    view.show(Screen::Controlroom);
+    view.show(tab);
     view
 }
 
-#[test]
-fn the_cleanroom_screen_shows_the_conversation_team_and_kernel_banner() {
-    let state = scripted();
-    let view = View::live(vec!["ransomware".to_owned()]);
-    let buffer = draw(&state, &view, (160, 45), 38);
-    snapshot("cleanroom-160x45", &buffer);
+/// Render `tab` at `size`, 38 s into the script, save the snapshot and check every `expected`
+/// string is on screen.
+fn renders(tab: Tab, (width, height): (u16, u16), expected: &[&str]) {
+    let buffer = draw(&scripted(), &showing(tab), (width, height), 38);
+    snapshot(
+        &format!("{}-{width}x{height}", tab.label().0.to_lowercase()),
+        &buffer,
+    );
     let screen = text(&buffer);
-    for expected in [
-        "◇ CLEANROOM",
-        "Ransomware on acme-fs",
-        "KERNEL BLOCKED",
-        "rm -rf /evidence/*",
-        "signed receipt #15",
-        "◆ LEAD",
-        "What happened, and what should I do first?",
-        "◆ Lead → ▲ Hunter",
-        "▲ Hunter → ◆ Lead",
-        "TEAM",
-        "lightning 30b",
-        "ultra 550b",
-        "asking Forensics",
-        "SITUATION",
-        "3/4 compromised",
-        "waiting on you",
-        "1 waiting",
-        "Enter",
-    ] {
+    for expected in expected {
         assert!(
             screen.contains(expected),
-            "missing {expected:?} in\n{screen}"
+            "missing {expected:?} on {tab:?}:\n{screen}"
         );
     }
 }
 
 #[test]
-fn the_banner_gives_way_to_the_conversation_after_eight_seconds() {
-    let state = scripted();
-    let view = View::live(Vec::new());
-    let later = text(&draw(&state, &view, (160, 45), 40));
+fn every_tab_tells_its_part_of_the_incident_at_projector_size() {
+    let size = (160, 45);
+    renders(
+        Tab::Overview,
+        size,
+        &[
+            "◇ cleanroom",
+            "✦ OVERVIEW",
+            "the room",
+            "waiting for your signature",
+            "→ Defense F5",
+            "Payroll export",
+            "kernel blocked",
+            "Next deadlines",
+            "Ransomware on acme-fs",
+        ],
+    );
+    renders(
+        Tab::Lead,
+        size,
+        &[
+            "KERNEL BLOCKED",
+            "signed receipt #15",
+            "What happened, and what should I do first?",
+            "◆ Lead → ▲ Hunter",
+            "▲ Hunter → ◆ Lead",
+            "asking Forensics",
+            "waiting on you",
+        ],
+    );
+    renders(
+        Tab::Scope,
+        size,
+        &["Clinic patient intake", "LOCKED", "Texans", "confidence"],
+    );
+    renders(
+        Tab::Record,
+        size,
+        &[
+            "Incident record",
+            "Timeline",
+            "TEXAS AG 30d",
+            "Hunter's evidence wipe denied",
+        ],
+    );
+    renders(
+        Tab::Defense,
+        size,
+        &[
+            "Kernel denials",
+            "#15",
+            "rm -rf /evidence/*",
+            "read-only",
+            "UNSAFE",
+            "Receipt log",
+        ],
+    );
+    renders(
+        Tab::Team,
+        size,
+        &[
+            "Hunter",
+            "lightning 30b",
+            "ultra 550b",
+            "→ BLOCKED (read-only)",
+        ],
+    );
+    renders(
+        Tab::Controlroom,
+        size,
+        &[
+            "BLOCKED BY OS · 1 denial · pinned",
+            "#5 exec rm -rf /evidence/* → BLOCKED (read-only)",
+            "receipt #15",
+            "SCOPE ·",
+            "✦ TEAM",
+            "APPROVALS",
+            "DEFENSE LAYERS",
+            "KERNEL BLOCKED",
+            "Ransomware on acme-fs",
+        ],
+    );
+}
+
+#[test]
+fn the_banner_sky_reads_the_incident() {
+    assert_eq!(
+        Sky::of(&State::new(TimeZone::UTC)),
+        Sky::Calm,
+        "nothing hit, nothing waiting"
+    );
+    assert_eq!(
+        Sky::of(&scripted()),
+        Sky::BreachWaiting,
+        "assets hit and a proposal waiting"
+    );
+}
+
+#[test]
+fn the_kernel_banner_gives_way_after_eight_seconds() {
+    let later = text(&draw(&scripted(), &showing(Tab::Lead), (160, 45), 40));
     assert!(
         !later.contains("KERNEL BLOCKED"),
-        "banner gone 10 s after the block"
+        "banner gone 9 s after the block"
     );
-    assert!(later.contains("1 block"), "the count chip stays");
     assert!(
         later.contains("kernel blocked hunter"),
-        "and the marker stays in the conversation"
+        "the marker stays in the conversation"
     );
-}
-
-#[test]
-fn the_controlroom_pins_every_denial_and_keeps_traces_to_one_line() {
-    let state = scripted();
-    let view = controlroom();
-    let buffer = draw(&state, &view, (160, 45), 38);
-    snapshot("controlroom-160x45", &buffer);
-    let screen = text(&buffer);
-    for expected in [
-        "BLOCKED BY OS · 1 denial · pinned",
-        "#5 exec rm -rf /evidence/*",
-        "receipt #15",
-        "#5 exec rm -rf /evidence/* → BLOCKED (read-only)",
-        "SCOPE OF COMPROMISED DATA",
-        "APPROVALS · 1 waiting",
-        "INCIDENT TIMELINE",
-        "COMMS",
-    ] {
-        assert!(
-            screen.contains(expected),
-            "missing {expected:?} in\n{screen}"
-        );
-    }
 }
 
 #[test]
 fn a_selected_trace_step_expands_to_its_full_detail() {
     let state = scripted();
-    let mut view = controlroom();
+    let mut view = showing(Tab::Controlroom);
     view.pane = Pane::Trace;
     view.trace = state
         .activity
@@ -437,32 +493,19 @@ fn a_selected_trace_step_expands_to_its_full_detail() {
 }
 
 #[test]
-fn both_screens_still_read_at_120_by_36() {
-    let state = scripted();
-    let cleanroom = draw(&state, &View::live(Vec::new()), (120, 36), 38);
-    snapshot("cleanroom-120x36", &cleanroom);
-    let cleanroom = text(&cleanroom);
-    for expected in [
-        "KERNEL BLOCKED",
-        "◆ LEAD",
-        "TEAM",
-        "SITUATION",
-        "waiting on you",
-    ] {
-        assert!(
-            cleanroom.contains(expected),
-            "missing {expected:?} in\n{cleanroom}"
-        );
-    }
-    let controlroom = draw(&state, &controlroom(), (120, 36), 38);
-    snapshot("controlroom-120x36", &controlroom);
-    let controlroom = text(&controlroom);
-    for expected in ["BLOCKED BY OS", "→ BLOCKED (read-only)", "APPROVALS"] {
-        assert!(
-            controlroom.contains(expected),
-            "missing {expected:?} in\n{controlroom}"
-        );
-    }
+fn the_tabs_still_read_at_120_by_36() {
+    let size = (120, 36);
+    renders(Tab::Overview, size, &["✦ OVERVIEW", "Now", "Assets"]);
+    renders(
+        Tab::Lead,
+        size,
+        &["KERNEL BLOCKED", "◆ LEAD", "TEAM", "waiting on you"],
+    );
+    renders(
+        Tab::Controlroom,
+        size,
+        &["BLOCKED BY OS", "→ BLOCKED (read-only)", "APPROVALS"],
+    );
 }
 
 #[test]
