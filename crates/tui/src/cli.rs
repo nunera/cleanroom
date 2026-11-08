@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::theme::Name;
+
 /// Cleanroom incident command center.
 ///
 /// Connects to cleanroomd and shows the incident, the scope of compromised data, the legal
@@ -39,6 +41,19 @@ pub(crate) struct Args {
     /// Draw without animation (motion is also off under `NO_COLOR`).
     #[arg(long)]
     pub(crate) no_motion: bool,
+
+    /// Color theme: cleanroom, ember, lavender, phosphor or projector. Overrides
+    /// `CLEANROOM_THEME` and the theme last chosen with `T`.
+    #[arg(long, value_name = "NAME", value_parser = parse_theme)]
+    pub(crate) theme: Option<Name>,
+}
+
+/// A theme by name.
+///
+/// # Errors
+/// Fails when no theme has that name.
+fn parse_theme(text: &str) -> Result<Name, String> {
+    Name::parse(text).ok_or_else(|| format!("unknown theme; choose one of {}", Name::listed()))
 }
 
 /// A playback speed between 0.01× and 1000×.

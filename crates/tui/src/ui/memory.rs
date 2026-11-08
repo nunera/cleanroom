@@ -43,21 +43,6 @@ const LOG_MIN: u16 = 6;
 /// Bytes in a MiB.
 const MIB: u64 = 1024 * 1024;
 
-/// A Mamba-2 cell: deep slate.
-const MAMBA_BG: Color = Color::Rgb(26, 50, 80);
-/// A Mamba-2 cell's letter, and the Mamba-2 state bars.
-const MAMBA_FG: Color = Color::Rgb(132, 172, 222);
-/// A mixture-of-experts cell: deep violet.
-const EXPERT_BG: Color = Color::Rgb(50, 38, 78);
-/// A mixture-of-experts cell's letter.
-const EXPERT_FG: Color = Color::Rgb(180, 158, 226);
-/// Spans the commander wrote, and the system prompt: warm sand.
-const COMMANDER: Color = Color::Rgb(216, 198, 156);
-/// The agent's own turns: cool grey.
-const AGENT: Color = Color::Rgb(146, 160, 182);
-/// Trusted tool output: sage.
-const TOOL: Color = Color::Rgb(112, 178, 140);
-
 /// How the stacks fit the rows there are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Fit {
@@ -171,7 +156,7 @@ pub(super) fn render(
     view: &View,
     now: Timestamp,
 ) {
-    let theme = &Theme::CLEANROOM;
+    let theme = view.palette();
     let board = &state.memory;
     let clock = Clock {
         now,
@@ -279,8 +264,8 @@ fn layer_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
 /// The symbol and style of a cell for `layer`.
 const fn cell_look(layer: Layer, theme: &Theme) -> (&'static str, Style) {
     match layer {
-        Layer::Mamba => ("M", Style::new().fg(MAMBA_FG).bg(MAMBA_BG)),
-        Layer::Experts => ("E", Style::new().fg(EXPERT_FG).bg(EXPERT_BG)),
+        Layer::Mamba => ("M", Style::new().fg(theme.mamba).bg(theme.mamba_bg)),
+        Layer::Experts => ("E", Style::new().fg(theme.expert).bg(theme.expert_bg)),
         Layer::Attention => (
             "✱",
             Style::new()
@@ -616,9 +601,9 @@ impl TrackRows {
 /// The color of a span from `source`: the attacker's evidence in red.
 const fn source_color(source: SpanSource, theme: &Theme) -> Color {
     match source {
-        SpanSource::Commander => COMMANDER,
-        SpanSource::Agent => AGENT,
-        SpanSource::Tool => TOOL,
+        SpanSource::Commander => theme.commander,
+        SpanSource::Agent => theme.agent,
+        SpanSource::Tool => theme.tool,
         SpanSource::Evidence => theme.red,
     }
 }
@@ -660,9 +645,9 @@ fn move_figure(last: Option<&Move>, theme: &Theme, clock: Clock) -> Span<'static
 /// Who wrote what, and the shapes a span takes, as many as fit in `width` columns.
 fn source_legend(theme: &Theme, width: usize) -> Line<'static> {
     let entries = [
-        ("█", COMMANDER, "commander"),
-        ("█", AGENT, "agent"),
-        ("█", TOOL, "tool"),
+        ("█", theme.commander, "commander"),
+        ("█", theme.agent, "agent"),
+        ("█", theme.tool, "tool"),
         ("▓", theme.red, "evidence (attacker)"),
         ("╱", theme.muted, "compressed handle"),
         ("┄", saved_color(theme), "saved"),
@@ -782,7 +767,7 @@ fn cache_panel(board: &MemoryBoard, theme: &Theme, area: Rect, fit: Fit) -> Para
             let state = scaled(MAMBA_STATE_BYTES, bar, most);
             lines.push(Line::from(vec![
                 Span::raw("SSM ").fg(theme.muted),
-                Span::raw("▰".repeat(state)).fg(MAMBA_FG),
+                Span::raw("▰".repeat(state)).fg(theme.mamba),
                 Span::raw(" ".repeat(bar.saturating_sub(state) + 1)),
                 Span::raw(right(&mib(MAMBA_STATE_BYTES), 8)).fg(theme.text),
                 Span::raw("  flat").fg(theme.dim),
@@ -1150,7 +1135,7 @@ mod tests {
     use super::{Clock, Scale, allocate, mib, short_age, track, tween};
     use crate::memory::{MAMBA_STATE_BYTES, MemoryBoard};
     use crate::state::State;
-    use crate::theme::Theme;
+    use crate::theme::Name;
     use crate::ui::{Tab, View, render};
 
     /// `seconds` after the start of the script.
@@ -1443,7 +1428,7 @@ mod tests {
         let accent: Vec<u16> = (0..buffer.area.width)
             .filter(|column| {
                 let cell = &buffer[(*column, u16::try_from(cells).expect("small screen"))];
-                cell.symbol() == "✱" && cell.bg == Theme::CLEANROOM.accent
+                cell.symbol() == "✱" && cell.bg == Name::Cleanroom.theme().accent
             })
             .collect();
         assert_eq!(accent.len(), 6, "every attention cell is lit: {row}");
@@ -1498,7 +1483,7 @@ mod tests {
             context,
             board.last_move(Role::Hunter),
             scale,
-            &Theme::CLEANROOM,
+            Name::Cleanroom.theme(),
             clock,
         );
         top.iter()

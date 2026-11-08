@@ -29,7 +29,7 @@ use crate::state::{
 };
 use crate::team::{self, SPECIALISTS, Status};
 use crate::theme::{
-    ACCENT, ACCENT_BG, AMBER, BRIGHT, DIM, INK, LINE, MUTED, RAISED, RED, TEXT, Theme, glyph, tint,
+    ACCENT, ACCENT_BG, AMBER, BRIGHT, DIM, INK, LINE, MUTED, OK, RAISED, RED, TEXT, glyph, tint,
 };
 
 /// Key and action pairs for the key bar.
@@ -167,7 +167,7 @@ fn draw_panel(
     focused: bool,
     (state, view, now): (&State, &View, Timestamp),
 ) {
-    let block = Theme::CLEANROOM.panel(&panel.title, focused);
+    let block = view.palette().panel(&panel.title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     match panel.body {
@@ -610,7 +610,7 @@ fn log_line(state: &State) -> Line<'static> {
             link("v verifies"),
         ]),
         LogStatus::Intact { entries } => Line::from(vec![
-            Span::raw("✓ ").fg(ACCENT).bold(),
+            Span::raw("✓ ").fg(OK).bold(),
             Span::raw(format!("receipt log intact: {entries} signed receipts")).fg(TEXT),
         ]),
         LogStatus::Broken { first_break, .. } => Line::from(vec![
@@ -633,7 +633,7 @@ fn incident_lines(state: &State) -> Vec<Line<'static>> {
         cleanroom_proto::IncidentStatus::Analyzing => AMBER,
         cleanroom_proto::IncidentStatus::Contained
         | cleanroom_proto::IncidentStatus::Eradicated
-        | cleanroom_proto::IncidentStatus::Recovered => ACCENT,
+        | cleanroom_proto::IncidentStatus::Recovered => OK,
         cleanroom_proto::IncidentStatus::Closed => MUTED,
     };
     let (severity, severity_color) = severity_word(incident.severity);
@@ -743,7 +743,7 @@ fn asset_line(asset: &ScopeRecord) -> Line<'static> {
         let (cells, color) = match value {
             Tri::Yes => ("██", RED),
             Tri::Unknown => ("▒▒", AMBER),
-            Tri::No => ("░░", ACCENT),
+            Tri::No => ("░░", OK),
         };
         spans.push(Span::raw(cells).fg(color));
         spans.push(Span::raw(" "));
@@ -758,12 +758,12 @@ fn asset_line(asset: &ScopeRecord) -> Line<'static> {
     ]
     .contains(&Tri::Unknown);
     let (word, color) = match hit.as_slice() {
-        [] if any_unknown => ("unknown".to_owned(), AMBER),
-        [] => ("clean".to_owned(), ACCENT),
-        [only] => ((*only).to_owned(), RED),
-        [first, rest @ ..] => (format!("{first} +{}", rest.len()), RED),
+        [] if any_unknown => ("? unknown".to_owned(), AMBER),
+        [] => ("✓ clean".to_owned(), OK),
+        [only] => (format!("✖ {only}"), RED),
+        [first, rest @ ..] => (format!("✖ {first} +{}", rest.len()), RED),
     };
-    spans.push(Span::raw(pad(&word, 13)).fg(color).bold());
+    spans.push(Span::raw(pad(&word, 15)).fg(color).bold());
     spans.push(Span::raw(format!("{:>6}", grouped(asset.record_count))).fg(MUTED));
     Line::from(spans)
 }
@@ -782,7 +782,7 @@ fn layer_lines(state: &State, linked: bool) -> Vec<Line<'static>> {
         Line::from(spans)
     };
     let guardrails = if state.guardrails {
-        Span::raw("ON  hardened prompts").fg(ACCENT).bold()
+        Span::raw("ON  hardened prompts").fg(OK).bold()
     } else {
         Span::raw("OFF  only the kernel grant stands")
             .fg(AMBER)
@@ -894,7 +894,7 @@ fn scope_card(state: &State, asset: &ScopeRecord) -> Vec<Line<'static>> {
     confidence.push(Span::raw(format!(" {}%", asset.confidence_pct)).fg(TEXT));
     let key = match asset.key_exposed {
         Tri::Yes => Span::raw("key exposed").fg(RED).bold(),
-        Tri::No => Span::raw("key not exposed").fg(ACCENT),
+        Tri::No => Span::raw("key not exposed").fg(OK),
         Tri::Unknown => Span::raw("key exposure unknown").fg(AMBER),
     };
     let evidence = if asset.evidence.is_empty() {
@@ -1072,7 +1072,7 @@ fn hero(frame: &mut Frame<'_>, area: Rect, state: &State) {
     let blocks = state.blocks();
     let big = BigText::builder()
         .pixel_size(PixelSize::Quadrant)
-        .style(Style::new().fg(if blocks > 0 { RED } else { ACCENT }))
+        .style(Style::new().fg(if blocks > 0 { RED } else { OK }))
         .lines(vec![Line::from(blocks.to_string())])
         .build();
     frame.render_widget(big, number.inner(Margin::new(1, 1)));
@@ -1172,7 +1172,7 @@ fn verdict_table(state: &State) -> Panel {
                 Cell::from(activity.at.clone()).style(Style::new().fg(DIM)),
                 Cell::from(verdict.to_owned()).style(
                     Style::new()
-                        .fg(if unsafe_verdict { RED } else { ACCENT })
+                        .fg(if unsafe_verdict { RED } else { OK })
                         .bold(),
                 ),
                 Cell::from(rest.to_owned()).style(Style::new().fg(TEXT)),

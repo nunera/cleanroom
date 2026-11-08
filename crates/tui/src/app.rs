@@ -22,6 +22,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::access::{MEMBER_ROLES, Standing};
 use crate::motion::Motion;
+use crate::prefs;
 use crate::replay;
 use crate::state::{SentRequest, State, Tone};
 use crate::team;
@@ -333,6 +334,20 @@ impl App {
         self.view.move_focus(&self.state, now, forward);
     }
 
+    /// Switch to the next theme, save it for the next launch, and say so in the toast.
+    fn cycle_theme(&mut self) {
+        let theme = self.view.theme.next();
+        self.view.theme = theme;
+        let label = theme.label();
+        match prefs::theme_path().map(|path| prefs::save_theme(&path, theme)) {
+            Some(Err(error)) => {
+                self.state
+                    .notify(Tone::Warn, format!("theme: {label} (not saved: {error})"));
+            }
+            Some(Ok(())) | None => self.state.notify(Tone::Good, format!("theme: {label}")),
+        }
+    }
+
     /// Handle a message from a background task.
     fn on_inbound(&mut self, inbound: Inbound) {
         match inbound {
@@ -567,6 +582,7 @@ impl App {
                     SentRequest::Tamper { root },
                 );
             }
+            Key::Char('T') => self.cycle_theme(),
             // Shift+A: after a rejection cleanroomd discards the tampered copy, so this admission
             // checks a clean one.
             Key::Char('A') => {

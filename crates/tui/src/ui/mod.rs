@@ -30,12 +30,12 @@ use crate::clocks::{self, Clock, ClockState, Urgency};
 use crate::state::{State, Tone, Who, compromised};
 use crate::team;
 use crate::theme::{
-    ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, Colors, DIM, INK, LINE, MUTED, RAISED, RAISED_HI,
-    RED, RED_BG, TEXT, blend, glyph, strip, tint,
+    ACCENT, ACCENT_BG, AMBER, AMBER_BG, BRIGHT, Colors, DIM, FOCUS, INK, LINE, MUTED, Name, OK,
+    RAISED, RAISED_HI, RED, RED_BG, RULE, TEXT, Theme, blend, glyph, strip, tint,
 };
 
-/// The thin rule under the tab bar.
-const RULE: Color = Color::Rgb(24, 92, 86);
+/// The key that cycles the theme, for the key bar.
+const THEME_KEY: (&str, &str) = ("T", "Theme");
 /// How long a daemon answer stays in the corner toast.
 const TOAST_FOR: SignedDuration = SignedDuration::from_secs(6);
 
@@ -321,6 +321,8 @@ pub struct View {
     pub(crate) chart: ChartView,
     /// Whether things move: the banner, pulses and fades.
     pub(crate) motion: bool,
+    /// The color theme.
+    pub(crate) theme: Name,
 }
 
 impl View {
@@ -363,6 +365,7 @@ impl View {
             panel: 0,
             chart: ChartView::All,
             motion: false,
+            theme: Name::Cleanroom,
         }
     }
 
@@ -378,6 +381,18 @@ impl View {
     pub(crate) const fn with_motion(mut self, motion: bool) -> Self {
         self.motion = motion;
         self
+    }
+
+    /// The same view in `theme`.
+    #[must_use]
+    pub(crate) const fn with_theme(mut self, theme: Name) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// The active palette.
+    pub(crate) const fn palette(&self) -> &'static Theme {
+        self.theme.theme()
     }
 
     /// Move the focus to the next panel (`forward`) or the previous one on the current tab.
@@ -459,6 +474,7 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
                 frame,
                 sky,
                 banner::Sky::of(state),
+                view.palette(),
                 view.motion.then_some(now),
             );
         }
@@ -484,6 +500,8 @@ pub fn render(frame: &mut Frame<'_>, state: &State, view: &View, now: Timestamp)
     overlays::render(frame, area, state, view);
     if view.colors == Colors::Off {
         strip(frame.buffer_mut());
+    } else {
+        view.palette().resolve(frame.buffer_mut());
     }
 }
 
@@ -552,11 +570,12 @@ pub(super) fn pulse_amber(view: &View, now: Timestamp) -> Color {
     if !view.motion {
         return AMBER;
     }
+    let theme = view.palette();
     let phase = now.as_millisecond().rem_euclid(1600);
     let depth = if phase < 800 { phase } else { 1600 - phase };
     blend(
-        AMBER,
-        AMBER_BG,
+        theme.amber,
+        theme.amber_bg,
         u16::try_from(depth * 160 / 800).unwrap_or(0),
     )
 }
@@ -593,6 +612,7 @@ const fn key_items(view: &View) -> (Hints, Hints) {
                 ("v", "Verify"),
                 ("r", "Reset"),
                 ("m", "Members"),
+                THEME_KEY,
             ],
             &[("?", "Help"), ("q", "Quit")],
         ),
@@ -618,6 +638,7 @@ const fn key_items(view: &View) -> (Hints, Hints) {
                 ("v", "Verify log"),
                 ("r", "Reset"),
                 ("m", "Members"),
+                THEME_KEY,
                 ("Tab", "Next tab"),
             ],
             &[("?", "Help"), ("q", "Quit")],
@@ -772,10 +793,10 @@ fn vitals_line(state: &State, view: &View, now: Timestamp, width: usize) -> Line
     chips.push(Chip {
         label: ("KERNEL", "KERNEL"),
         value: (format!("{blocks} {noun}"), format!("{blocks} {noun}")),
-        color: if blocks > 0 { RED } else { ACCENT },
+        color: if blocks > 0 { RED } else { OK },
     });
     let (guardrails, color) = if state.guardrails {
-        ("ON", ACCENT)
+        ("ON", OK)
     } else {
         ("OFF", AMBER)
     };
@@ -963,7 +984,7 @@ pub(super) fn heading(text: &str) -> Line<'static> {
 
 /// A rounded panel with a quiet border and `title`.
 pub(super) fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
-    let border = if focused { ACCENT } else { LINE };
+    let border = if focused { FOCUS } else { LINE };
     Block::bordered()
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::new().fg(border))
@@ -972,7 +993,7 @@ pub(super) fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
 
 /// A panel title: ` NAME ` in quiet bold, lit when the panel has focus.
 pub(super) fn title(text: &str, focused: bool) -> Line<'static> {
-    let color = if focused { ACCENT } else { MUTED };
+    let color = if focused { FOCUS } else { MUTED };
     Line::from(Span::raw(format!(" {text} ")).fg(color).bold())
 }
 
@@ -1016,7 +1037,7 @@ pub(super) const fn tone_color(tone: Tone) -> Color {
     match tone {
         Tone::Quiet => DIM,
         Tone::Plain => MUTED,
-        Tone::Good => ACCENT,
+        Tone::Good => OK,
         Tone::Warn => AMBER,
         Tone::Bad => RED,
     }
@@ -1040,7 +1061,7 @@ pub(super) const fn flag_look(value: Tri) -> (&'static str, Style) {
                 .bg(AMBER_BG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Tri::No => ("no", Style::new().fg(ACCENT).bg(ACCENT_BG)),
+        Tri::No => ("no", Style::new().fg(OK).bg(ACCENT_BG)),
     }
 }
 

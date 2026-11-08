@@ -11,7 +11,6 @@ use ratatui::layout::Rect;
 use tachyonfx::{Effect, Interpolation, Motion as Sweep, fx};
 
 use crate::state::{State, Talk};
-use crate::theme::{INK, RED_BG};
 use crate::ui::{Tab, View};
 
 /// How long a newly arrived chat message keeps the console redrawing fast, for its fade-in.
@@ -59,9 +58,14 @@ impl Motion {
     /// Queue effects for what changed since the last frame.
     pub(crate) fn observe(&mut self, state: &State, view: &View) {
         let mut fresh = Vec::new();
+        let theme = view.palette();
         if view.tab != self.tab {
             self.tab = view.tab;
-            fresh.push(fx::fade_from(INK, INK, (280, Interpolation::QuadOut)));
+            fresh.push(fx::fade_from(
+                theme.ink,
+                theme.ink,
+                (280, Interpolation::QuadOut),
+            ));
         }
         let denials = state.denials.all().len();
         if denials > self.denials {
@@ -69,7 +73,7 @@ impl Motion {
                 Sweep::LeftToRight,
                 48,
                 0,
-                RED_BG,
+                theme.red_bg,
                 (750, Interpolation::QuadOut),
             ));
         }

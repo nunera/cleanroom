@@ -15,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::state::{State, compromised};
-use crate::theme::{INK, RED};
+use crate::theme::{INK, RED, SKY_BREACH, SKY_BREACH_WAITING, SKY_WAITING, Theme};
 
 /// Banner height in rows.
 pub(super) const HEIGHT: u16 = 6;
@@ -45,41 +45,14 @@ impl Sky {
         }
     }
 
-    /// One background per row, top to bottom.
-    pub(super) const fn gradient(self) -> [Color; 6] {
+    /// One background per row, top to bottom: the theme's clean sky, or the shared amber and red
+    /// skies that mean the same thing in every theme.
+    pub(super) const fn gradient(self, theme: &Theme) -> [Color; 6] {
         match self {
-            Self::Calm => [
-                Color::Rgb(9, 17, 26),
-                Color::Rgb(10, 28, 38),
-                Color::Rgb(12, 42, 50),
-                Color::Rgb(14, 60, 64),
-                Color::Rgb(20, 84, 82),
-                Color::Rgb(30, 112, 104),
-            ],
-            Self::Waiting => [
-                Color::Rgb(26, 18, 8),
-                Color::Rgb(46, 30, 10),
-                Color::Rgb(72, 46, 12),
-                Color::Rgb(104, 66, 14),
-                Color::Rgb(140, 90, 18),
-                Color::Rgb(178, 118, 26),
-            ],
-            Self::Breach => [
-                Color::Rgb(30, 6, 10),
-                Color::Rgb(56, 9, 14),
-                Color::Rgb(86, 13, 18),
-                Color::Rgb(118, 18, 22),
-                Color::Rgb(152, 26, 26),
-                Color::Rgb(186, 40, 30),
-            ],
-            Self::BreachWaiting => [
-                Color::Rgb(30, 6, 10),
-                Color::Rgb(62, 10, 14),
-                Color::Rgb(100, 16, 18),
-                Color::Rgb(140, 34, 20),
-                Color::Rgb(176, 70, 22),
-                Color::Rgb(204, 112, 30),
-            ],
+            Self::Calm => theme.sky,
+            Self::Waiting => SKY_WAITING,
+            Self::Breach => SKY_BREACH,
+            Self::BreachWaiting => SKY_BREACH_WAITING,
         }
     }
 }
@@ -142,7 +115,13 @@ const HORIZON: [char; 12] = ['▁', '▁', '▂', '▁', '▁', '▁', '▃', '�
 
 /// Draw the banner for `sky` into `area` (six rows). With a `clock` it moves: the drones drift on
 /// patrol, the radar sweeps, and on a breach the beacon on the mast blinks red.
-pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky, clock: Option<Timestamp>) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    sky: Sky,
+    theme: &Theme,
+    clock: Option<Timestamp>,
+) {
     let width = usize::from(area.width);
     let millis = clock.map_or(0, |now| now.as_millisecond().rem_euclid(1 << 40));
     let drift = |period: i64, span: i64| {
@@ -184,7 +163,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, sky: Sky, clock: Option<
     }
     let lines: Vec<Line<'static>> = grid
         .into_iter()
-        .zip(sky.gradient())
+        .zip(sky.gradient(theme))
         .map(|(row, color)| {
             Line::from(row.into_iter().collect::<String>()).style(Style::new().fg(INK).bg(color))
         })

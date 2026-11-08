@@ -16,7 +16,8 @@ use super::{
 use crate::access::{Enrollment, MEMBER_ROLES, Standing, role_word};
 use crate::state::{Admission, State, Tone, short_key};
 use crate::theme::{
-    ACCENT, ACCENT_BG, AMBER, BRIGHT, DIM, INK, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, scrim,
+    ACCENT, ACCENT_BG, AMBER, BRIGHT, DIM, INK, MUTED, Name, OK, RAISED, RAISED_HI, RED, RED_BG,
+    TEXT, scrim,
 };
 
 /// Width of the "REJECTED"/"ADMITTED" headline at half-height pixels.
@@ -28,12 +29,12 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &State, view: &Vi
     if view.admission_visible(state)
         && let Some(admission) = &state.admission
     {
-        scrim(frame.buffer_mut());
+        scrim(frame.buffer_mut(), view.palette());
         render_admission(frame, area, admission);
         return;
     }
     if view.overlay != Overlay::None {
-        scrim(frame.buffer_mut());
+        scrim(frame.buffer_mut(), view.palette());
     }
     match view.overlay {
         Overlay::None => {}
@@ -194,6 +195,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("v", "Verify the receipt log's hash chain"),
         ("r", "Reset the demo (asks first)"),
         ("m", "Access control: members, enroll, revoke"),
+        ("T", "Cycle the theme (saved for next time)"),
         (
             "PgUp PgDn",
             "Scroll the conversation; End returns to the newest",
@@ -218,6 +220,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Span::raw(" unknown or waiting  ").fg(MUTED),
         Span::styled(" no ", flag_look(Tri::No).1),
         Span::raw(" clean").fg(MUTED),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw(" Themes  ").fg(MUTED),
+        Span::raw(Name::listed()).fg(TEXT),
+        Span::raw("  (T cycles; --theme NAME picks one)").fg(DIM),
     ]));
     lines.push(Line::from(" Esc or ? closes this help.").fg(DIM));
     modal(frame, area, ("KEYS", ACCENT), 96, lines);
@@ -483,7 +490,7 @@ fn status_line(state: &State, form: &AccessForm, width: usize) -> Line<'static> 
         |notice| {
             let (mark, color) = match notice.tone {
                 Tone::Bad => ("✕ ", RED),
-                Tone::Good => ("✓ ", ACCENT),
+                Tone::Good => ("✓ ", OK),
                 Tone::Warn => ("! ", AMBER),
                 Tone::Quiet | Tone::Plain => ("· ", MUTED),
             };

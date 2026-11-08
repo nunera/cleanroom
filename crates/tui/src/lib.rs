@@ -20,6 +20,7 @@ mod memory;
 mod motion;
 mod net;
 mod next;
+mod prefs;
 mod pulse;
 mod replay;
 pub mod state;
@@ -73,6 +74,8 @@ enum StartError {
     Replay(ReplayError),
     /// The terminal could not be set up, drawn to, or restored.
     Terminal(io::Error),
+    /// `CLEANROOM_THEME` names no theme.
+    Theme(String),
 }
 
 impl fmt::Display for StartError {
@@ -94,6 +97,11 @@ impl fmt::Display for StartError {
             ),
             Self::Replay(error) => error.fmt(f),
             Self::Terminal(error) => write!(f, "terminal error: {error}"),
+            Self::Theme(value) => write!(
+                f,
+                "CLEANROOM_THEME='{value}' is not a theme; choose one of {}",
+                theme::Name::listed()
+            ),
         }
     }
 }
@@ -107,7 +115,7 @@ impl std::error::Error for StartError {
             | Self::Connect { source, .. } => Some(source),
             Self::Key(source) => Some(source),
             Self::Replay(source) => Some(source),
-            Self::NoRuntimeDir => None,
+            Self::NoRuntimeDir | Self::Theme(_) => None,
         }
     }
 }
@@ -168,6 +176,7 @@ async fn console(args: Args) -> Result<(), StartError> {
     let state = State::new(TimeZone::system());
     let colors = Colors::from_env();
     let motion = colors == Colors::Full && !args.no_motion;
+    let theme = chosen_theme(args.theme)?;
     let (inbound, frames) = mpsc::unbounded_channel();
     let app = if let Some(path) = &args.replay {
         let recording = replay::load(path)?;
@@ -178,7 +187,8 @@ async fn console(args: Args) -> Result<(), StartError> {
         tokio::spawn(replay::play(recording, args.speed, inbound));
         let view = View::replay(args.speed)
             .with_colors(colors)
-            .with_motion(motion);
+            .with_motion(motion)
+            .with_theme(theme);
         App::replay(state, view, start, args.speed)
     } else {
         let key = keystore::load_or_create(&keystore::commander_key_path()?)?;
@@ -199,7 +209,8 @@ async fn console(args: Args) -> Result<(), StartError> {
             .map_err(|source| StartError::Connect { socket, source })?;
         let view = View::live(args.scenarios)
             .with_colors(colors)
-            .with_motion(motion);
+            .with_motion(motion)
+            .with_theme(theme);
         App::live(state, view, Session::new(key, outbound), args.tamper_root)
     };
     let mut terminal = ratatui::try_init().map_err(StartError::Terminal)?;
@@ -216,6 +227,24 @@ async fn console(args: Args) -> Result<(), StartError> {
         .and(unpasted)
         .and(restored)
         .map_err(StartError::Terminal)
+}
+
+/// The theme to start with: `--theme`, else `CLEANROOM_THEME`, else the one last chosen with `T`,
+/// else cleanroom.
+///
+/// # Errors
+/// Fails when `CLEANROOM_THEME` names no theme.
+fn chosen_theme(flag: Option<theme::Name>) -> Result<theme::Name, StartError> {
+    if let Some(name) = flag {
+        return Ok(name);
+    }
+    if let Some(value) = std::env::var_os("CLEANROOM_THEME").filter(|value| !value.is_empty()) {
+        let value = value.to_string_lossy().into_owned();
+        return theme::Name::parse(&value).ok_or(StartError::Theme(value));
+    }
+    Ok(prefs::theme_path()
+        .and_then(|path| prefs::load_theme(&path))
+        .unwrap_or_default())
 }
 
 /// `$XDG_RUNTIME_DIR/cleanroom/cleanroomd.sock`.

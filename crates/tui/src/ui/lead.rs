@@ -21,8 +21,8 @@ use crate::denials::{Denial, Kind};
 use crate::state::{Ask, Marker, QueueItem, Said, State, Talk, Tone, Who};
 use crate::team::{self, SPECIALISTS, Status};
 use crate::theme::{
-    ACCENT, AMBER, BRIGHT, DIM, INK, LINE, MUTED, RAISED, RAISED_HI, RED, RED_BG, TEXT, blend,
-    glyph, tint,
+    ACCENT, AMBER, BRIGHT, DIM, LINE, MUTED, OK, RAISED, RAISED_HI, RED, RED_BG, TEXT, Theme,
+    blend, glyph, tint,
 };
 
 /// How long a new message takes to fade in.
@@ -209,12 +209,12 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, state: &State, view: &View, no
         frame.render_stateful_widget(bar, area, &mut position);
     }
     if view.motion && back == 0 {
-        fade_in_newest(frame, area, state, now);
+        fade_in_newest(frame, area, state, view.palette(), now);
     }
 }
 
 /// Fade the newest message in over its first moments: its rows start near the background.
-fn fade_in_newest(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timestamp) {
+fn fade_in_newest(frame: &mut Frame<'_>, area: Rect, state: &State, theme: &Theme, now: Timestamp) {
     let Some(Talk::Said(said)) = state.talk.back() else {
         return;
     };
@@ -233,7 +233,7 @@ fn fade_in_newest(frame: &mut Frame<'_>, area: Rect, state: &State, now: Timesta
     for y in area.bottom().saturating_sub(height)..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buffer.cell_mut((x, y)) {
-                let faded = blend(cell.fg, INK, amount);
+                let faded = blend(theme.rgb(cell.fg), theme.ink, amount);
                 cell.set_fg(faded);
             }
         }
@@ -306,7 +306,7 @@ const fn said_class(said: &Said) -> Class {
 fn marker_line(marker: &Marker, width: usize) -> Line<'static> {
     let color = match marker.tone {
         Tone::Quiet | Tone::Plain => DIM,
-        Tone::Good => ACCENT,
+        Tone::Good => OK,
         Tone::Warn => AMBER,
         Tone::Bad => RED,
     };
