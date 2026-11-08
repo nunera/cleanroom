@@ -3,7 +3,9 @@
 //!
 //! Seeding hashes every share file. After the ransomware runs, comparing the share with those
 //! hashes is cleanroomd's own detection: it flips `locked` and `modified` for the assets it saw
-//! change and leaves `exfiltrated` unknown for the agents to establish.
+//! change. A drop-box file with the same bytes as a seeded file is a staged copy, which makes
+//! its asset `accessed`. `exfiltrated` stays unknown for the agents to establish: a copy on the
+//! host is not proof that it left.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -416,6 +418,8 @@ pub(crate) struct Integrity {
     changes: BTreeMap<String, Change>,
     /// Files that were not seeded (ransom note, `.locked` copies).
     new_files: Vec<String>,
+    /// Seeded files with a byte-for-byte copy in the drop box, and that copy's drop-relative path.
+    staged: BTreeMap<String, String>,
 }
 
 impl Integrity {
@@ -434,13 +438,29 @@ impl Integrity {
             .map(String::as_str)
             .filter(|file| !file.ends_with(".locked"))
     }
+
+    /// `"N seeded files copied byte for byte into the drop box: a, b"`, or `None`.
+    fn staging(&self) -> Option<String> {
+        (!self.staged.is_empty()).then(|| {
+            let files: Vec<&str> = self.staged.keys().map(String::as_str).collect();
+            format!(
+                "{} seeded files copied byte for byte into the drop box: {}",
+                files.len(),
+                files.join(", ")
+            )
+        })
+    }
 }
 
-/// Compare the share with the seeding hashes.
+/// Compare the share with the seeding hashes, and the drop box's files with them too.
 ///
 /// # Errors
-/// Fails if the share cannot be read.
-pub(crate) fn check(share: &Path, baseline: &BTreeMap<String, Digest>) -> Result<Integrity> {
+/// Fails if the share or the drop box cannot be read.
+pub(crate) fn check(
+    share: &Path,
+    drop_box: &Path,
+    baseline: &BTreeMap<String, Digest>,
+) -> Result<Integrity> {
     let current = fingerprint(share)?;
     let changes = baseline
         .iter()
@@ -458,10 +478,20 @@ pub(crate) fn check(share: &Path, baseline: &BTreeMap<String, Digest>) -> Result
         .into_keys()
         .filter(|file| !baseline.contains_key(file))
         .collect();
-    Ok(Integrity { changes, new_files })
+    let mut staged = BTreeMap::new();
+    for (copy, digest) in fingerprint(drop_box)? {
+        for (file, _) in baseline.iter().filter(|(_, seeded)| **seeded == digest) {
+            staged.entry(file.clone()).or_insert_with(|| copy.clone());
+        }
+    }
+    Ok(Integrity {
+        changes,
+        new_files,
+        staged,
+    })
 }
 
-/// Scope records for the assets the integrity check saw change.
+/// Scope records for the assets the integrity check saw change or staged.
 pub(crate) fn affected(assets: &[Asset], integrity: &Integrity, at: &str) -> Vec<ScopeRecord> {
     assets
         .iter()
@@ -472,15 +502,29 @@ pub(crate) fn affected(assets: &[Asset], integrity: &Integrity, at: &str) -> Vec
                 .filter(|(file, change)| asset.holds(file) && **change != Change::Intact)
                 .map(|(file, change)| (file.as_str(), *change))
                 .collect();
-            (!changed.is_empty()).then(|| affected_scope(asset, &changed, at))
+            let staged: Vec<(&str, &str)> = integrity
+                .staged
+                .iter()
+                .filter(|(file, _)| asset.holds(file))
+                .map(|(file, copy)| (file.as_str(), copy.as_str()))
+                .collect();
+            (!changed.is_empty() || !staged.is_empty())
+                .then(|| affected_scope(asset, &changed, &staged, at))
         })
         .collect()
 }
 
-/// One asset's record after the integrity check found `changed` files.
-fn affected_scope(asset: &Asset, changed: &[(&str, Change)], at: &str) -> ScopeRecord {
+/// One asset's record after the integrity check found `changed` files and `staged` copies
+/// (seeded file, drop-relative copy).
+fn affected_scope(
+    asset: &Asset,
+    changed: &[(&str, Change)],
+    staged: &[(&str, &str)],
+    at: &str,
+) -> ScopeRecord {
     let any = |kind: Change| changed.iter().any(|(_, change)| *change == kind);
     let locked = any(Change::Locked);
+    let measured = |yes: bool| if yes { Tri::Yes } else { Tri::Unknown };
     let mut evidence: Vec<String> = changed
         .iter()
         .take(EVIDENCE_LIMIT)
@@ -497,19 +541,28 @@ fn affected_scope(asset: &Asset, changed: &[(&str, Change)], at: &str) -> ScopeR
             changed.len() - EVIDENCE_LIMIT
         ));
     }
+    evidence.extend(staged.iter().take(EVIDENCE_LIMIT).map(|(file, copy)| {
+        format!(
+            "{}/{copy}: byte-for-byte copy of {}/{file}",
+            strata::EVIDENCE_DROP,
+            strata::EVIDENCE_SHARE
+        )
+    }));
+    if staged.len() > EVIDENCE_LIMIT {
+        evidence.push(format!(
+            "and {} more staged copies of this asset",
+            staged.len() - EVIDENCE_LIMIT
+        ));
+    }
     evidence.push("cleanroomd integrity check against the hashes taken at seeding".to_owned());
     ScopeRecord {
         flags: ScopeFlags {
-            locked: if locked { Tri::Yes } else { Tri::Unknown },
+            locked: measured(locked),
             exfiltrated: Tri::Unknown,
-            // Encrypting a file means reading it first.
-            accessed: if locked { Tri::Yes } else { Tri::Unknown },
-            destroyed: if any(Change::Deleted) {
-                Tri::Yes
-            } else {
-                Tri::Unknown
-            },
-            modified: Tri::Yes,
+            // Encrypting or copying a file means reading it first.
+            accessed: measured(locked || !staged.is_empty()),
+            destroyed: measured(any(Change::Deleted)),
+            modified: measured(!changed.is_empty()),
         },
         key_exposed: if asset.encrypted_at_rest {
             Tri::Unknown
@@ -536,12 +589,15 @@ pub(crate) fn incident(id: &str, at: &str, integrity: &Integrity, receipt: u64) 
     let notes: Vec<&str> = integrity.notes().collect();
     let summary = format!(
         "cleanroomd's integrity check found {damaged} of {seeded} seeded files on the acme-fs share \
-         replaced or changed after the ransomware scenario ran in the acme-fs stratum{}.",
+         replaced or changed after the ransomware scenario ran in the acme-fs stratum{}{}.",
         if notes.is_empty() {
             String::new()
         } else {
             format!("; new files: {}", notes.join(", "))
-        }
+        },
+        integrity
+            .staging()
+            .map_or_else(String::new, |staging| format!("; {staging}"))
     );
     IncidentRecord {
         id: id.to_owned(),
@@ -572,7 +628,7 @@ pub(crate) fn brief(at: &str, integrity: &Integrity) -> String {
     let notes: Vec<&str> = integrity.notes().collect();
     format!(
         "Ransomware hit the acme-fs file share. At {at} cleanroomd's integrity check found {} \
-         seeded files replaced or changed{}. Evidence, read-only in your stratum: the share at \
+         seeded files replaced or changed{}{}. Evidence, read-only in your stratum: the share at \
          {}, the host's logs at {}, and {}, a directory found on the host. YARA rules are under \
          {}. Establish how the attacker got in, what ran, and which data assets were locked, \
          accessed or copied out, with evidence for each.",
@@ -582,6 +638,9 @@ pub(crate) fn brief(at: &str, integrity: &Integrity) -> String {
         } else {
             format!(" and new files: {}", notes.join(", "))
         },
+        integrity
+            .staging()
+            .map_or_else(String::new, |staging| format!(", and {staging}")),
         strata::EVIDENCE_SHARE,
         strata::EVIDENCE_LOGS,
         strata::EVIDENCE_DROP,
@@ -670,5 +729,159 @@ mod tests {
             None,
             "assets cleanroomd measured nothing for stay the agents' call"
         );
+    }
+
+    /// A share and drop box under the system temp directory, removed when dropped.
+    struct Victim {
+        root: PathBuf,
+    }
+
+    impl Victim {
+        fn new(test: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("cleanroomd-scenario-{test}-{}", std::process::id()));
+            drop(fs::remove_dir_all(&root));
+            for (file, text) in [
+                ("share/payroll.csv", "id,ssn\n1,900-11-2222\n"),
+                ("share/vpn-credentials.txt", "vpn-admin:hunter2\n"),
+                ("share/contracts/acme-c-001.md", "Contract 001\n"),
+            ] {
+                let path = root.join(file);
+                fs::create_dir_all(path.parent().expect("parent")).expect("seed dir");
+                fs::write(&path, text).expect("seed file");
+            }
+            fs::create_dir_all(root.join("drop")).expect("drop box");
+            Self { root }
+        }
+
+        fn share(&self) -> PathBuf {
+            self.root.join("share")
+        }
+
+        fn drop_box(&self) -> PathBuf {
+            self.root.join("drop")
+        }
+    }
+
+    impl Drop for Victim {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.root));
+        }
+    }
+
+    fn asset(id: &str, path: &str) -> Asset {
+        Asset {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: path.to_owned(),
+            data_classes: vec![DataClass::Pii],
+            record_count: 1,
+            texas_residents: 1,
+            encrypted_at_rest: false,
+        }
+    }
+
+    /// The ransomware copies payroll and the VPN credentials into the drop box, then locks
+    /// payroll. Matching the copies' bytes against the seeding hashes is a measurement, so a
+    /// fooled agent cannot leave the copies out of the record; whether they left the host stays
+    /// unknown.
+    #[test]
+    fn a_byte_for_byte_copy_in_the_drop_box_is_measured_as_accessed() {
+        let victim = Victim::new("staged");
+        let baseline = fingerprint(&victim.share()).expect("seed hashes");
+        for file in ["payroll.csv", "vpn-credentials.txt"] {
+            fs::copy(victim.share().join(file), victim.drop_box().join(file)).expect("stage");
+        }
+        fs::write(victim.drop_box().join("notes.txt"), "not a seeded file\n").expect("noise");
+        fs::write(victim.share().join("payroll.csv.locked"), "ciphertext").expect("lock");
+        fs::remove_file(victim.share().join("payroll.csv")).expect("lock");
+
+        let integrity = check(&victim.share(), &victim.drop_box(), &baseline).expect("check");
+        let assets = [
+            asset("payroll", "payroll.csv"),
+            asset("vpn-credentials", "vpn-credentials.txt"),
+            asset("client-contracts", "contracts/"),
+        ];
+        let records = affected(&assets, &integrity, "2026-11-08T07:00:00Z");
+        let record = |id: &str| records.iter().find(|record| record.asset_id == id);
+
+        let payroll = record("payroll").expect("payroll is affected");
+        assert_eq!(payroll.flags.locked, Tri::Yes);
+        assert_eq!(payroll.flags.accessed, Tri::Yes);
+        assert_eq!(
+            payroll.flags.exfiltrated,
+            Tri::Unknown,
+            "staging is not exfiltration"
+        );
+        assert!(
+            payroll
+                .evidence
+                .iter()
+                .any(|line| line.contains("/evidence/dropbox/payroll.csv")),
+            "{:?}",
+            payroll.evidence
+        );
+
+        let vpn = record("vpn-credentials").expect("a staged-only asset is affected too");
+        assert_eq!(
+            vpn.flags.accessed,
+            Tri::Yes,
+            "copying a file means reading it"
+        );
+        assert_eq!(vpn.flags.locked, Tri::Unknown);
+        assert_eq!(vpn.flags.modified, Tri::Unknown, "its share copy is intact");
+        assert_eq!(vpn.flags.exfiltrated, Tri::Unknown);
+        assert!(
+            vpn.evidence
+                .iter()
+                .any(|line| line.contains("/evidence/dropbox/vpn-credentials.txt")),
+            "{:?}",
+            vpn.evidence
+        );
+
+        assert!(
+            record("client-contracts").is_none(),
+            "untouched and not staged"
+        );
+    }
+
+    #[test]
+    fn the_incident_and_the_brief_name_the_staged_copies() {
+        let victim = Victim::new("summary");
+        let baseline = fingerprint(&victim.share()).expect("seed hashes");
+        fs::copy(
+            victim.share().join("payroll.csv"),
+            victim.drop_box().join("payroll.csv"),
+        )
+        .expect("stage");
+
+        let integrity = check(&victim.share(), &victim.drop_box(), &baseline).expect("check");
+        let record = incident("INC-1", "2026-11-08T07:00:00Z", &integrity, 4);
+        let brief = brief("2026-11-08T07:00:00Z", &integrity);
+
+        for text in [&record.summary, &brief] {
+            assert!(text.contains("payroll.csv"), "{text}");
+            assert!(text.contains("drop box"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_drop_box_without_seeded_bytes_proves_nothing() {
+        let victim = Victim::new("noise");
+        let baseline = fingerprint(&victim.share()).expect("seed hashes");
+        fs::write(
+            victim.drop_box().join("payroll.csv"),
+            "same name, other bytes",
+        )
+        .expect("noise");
+
+        let integrity = check(&victim.share(), &victim.drop_box(), &baseline).expect("check");
+        let records = affected(
+            &[asset("payroll", "payroll.csv")],
+            &integrity,
+            "2026-11-08T07:00:00Z",
+        );
+
+        assert!(records.is_empty(), "{records:?}");
     }
 }
