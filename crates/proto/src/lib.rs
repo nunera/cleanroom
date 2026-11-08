@@ -197,15 +197,44 @@ pub struct ExecResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
-    AdmitRoot { name: String, manifest: Digest },
-    Exec { stratum: String, argv: Vec<String> },
-    Write { stratum: String, path: String },
-    ToolGrant { request_id: String, tool: String },
-    Approval { subject_id: String },
-    Enroll { member: KeyId },
-    Revoke { member: KeyId },
-    RecordUpdate { incident_id: String, field: String },
-    Detonate { scenario: String },
+    AdmitRoot {
+        name: String,
+        manifest: Digest,
+    },
+    Exec {
+        stratum: String,
+        argv: Vec<String>,
+    },
+    Write {
+        stratum: String,
+        path: String,
+    },
+    ToolGrant {
+        request_id: String,
+        tool: String,
+    },
+    Approval {
+        subject_id: String,
+    },
+    Enroll {
+        member: KeyId,
+    },
+    Revoke {
+        member: KeyId,
+    },
+    RecordUpdate {
+        incident_id: String,
+        field: String,
+    },
+    Detonate {
+        scenario: String,
+    },
+    /// cleanroomd hashed every evidence file (share, drop box, logs): at detection, and again
+    /// whenever an agent command left the evidence different from the last seal.
+    EvidenceSeal {
+        digest: Digest,
+        files: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

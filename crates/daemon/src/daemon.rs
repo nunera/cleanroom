@@ -261,7 +261,7 @@ impl Daemon {
             CoreRequest::Detonate { scenario } => Box::pin(self.detonate(peer, &scenario)).await,
             CoreRequest::Tamper { root } => self.tamper(peer, &root).await,
             CoreRequest::Admit { root } => self.admit(peer, &root).await,
-            CoreRequest::VerifyLog => self.verify_log(peer),
+            CoreRequest::VerifyLog => self.verify_log(peer).await,
             CoreRequest::Reset => self.reset(peer).await,
         };
         result.unwrap_or_else(|error| {
@@ -293,6 +293,7 @@ impl Daemon {
                 action,
                 ExecOutcome::Denied { reason },
                 Captured::default(),
+                None,
             );
         }
         let root = match self.launchable_root(&actor).await {
@@ -304,6 +305,7 @@ impl Daemon {
                     action,
                     ExecOutcome::Denied { reason },
                     Captured::default(),
+                    None,
                 );
             }
         };
@@ -319,10 +321,14 @@ impl Daemon {
         };
         let captured = strata::run(&launch).await?;
         let outcome = strata::classify(strata::stratum_of(role), &captured);
-        self.exec_result(actor, action, outcome, captured)
+        let evidence = self
+            .recheck_evidence(&describe(&actor), &request.argv.join(" "))
+            .await;
+        self.exec_result(actor, action, outcome, captured, evidence)
     }
 
-    /// Record an exec and build its response; a denial also goes on the bus as a status line.
+    /// Record an exec and build its response; a denial also goes on the bus as a status line,
+    /// with `evidence` (what the post-command evidence check found) appended.
     ///
     /// # Errors
     /// Fails if the receipt cannot be written.
@@ -332,6 +338,7 @@ impl Daemon {
         action: Action,
         outcome: ExecOutcome,
         captured: Captured,
+        evidence: Option<String>,
     ) -> Result<CoreResponse> {
         let receipt_outcome = match &outcome {
             ExecOutcome::Denied { reason } => Outcome::Denied {
@@ -349,12 +356,14 @@ impl Daemon {
             | Action::Enroll { .. }
             | Action::Revoke { .. }
             | Action::RecordUpdate { .. }
-            | Action::Detonate { .. } => String::new(),
+            | Action::Detonate { .. }
+            | Action::EvidenceSeal { .. } => String::new(),
         };
         let seq = self.receipt(actor, action, receipt_outcome)?;
         if let ExecOutcome::Denied { reason } = &outcome {
+            let evidence = evidence.map_or_else(String::new, |note| format!("; {note}"));
             self.status(format!(
-                "OS denied {who}: `{command}`: {reason} (receipt #{seq})"
+                "OS denied {who}: `{command}`: {reason} (receipt #{seq}){evidence}"
             ));
         }
         Ok(CoreResponse::Exec(ExecResult {
@@ -364,6 +373,75 @@ impl Daemon {
             truncated: captured.truncated,
             receipt_seq: seq,
         }))
+    }
+
+    /// The evidence directories under their investigator names (`/evidence/<label>`).
+    fn evidence_dirs(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("acme-fs", self.layout.share()),
+            ("dropbox", self.layout.dropbox()),
+            ("logs", self.layout.logs()),
+        ]
+    }
+
+    /// Hash every evidence file now.
+    ///
+    /// # Errors
+    /// Fails if an evidence directory cannot be read.
+    async fn seal_evidence(&self) -> Result<scenario::Seal> {
+        let dirs = self.evidence_dirs();
+        spawn_blocking(move || scenario::seal(&dirs))
+            .await
+            .context("sealing the evidence panicked")?
+    }
+
+    /// Write an evidence seal receipt for `seal` and make it the current seal.
+    ///
+    /// # Errors
+    /// Fails if the receipt cannot be written.
+    fn record_seal(&self, seal: scenario::Seal) -> Result<u64> {
+        let action = Action::EvidenceSeal {
+            digest: seal.digest.clone(),
+            files: u64::try_from(seal.len()).unwrap_or(u64::MAX),
+        };
+        let seq = self.receipt(Principal::System, action, Outcome::Allowed)?;
+        self.scenario.set_seal(Some((seal, seq)));
+        Ok(seq)
+    }
+
+    /// After `who` ran `command`: re-hash the evidence against the latest seal. A change is
+    /// sealed again with a new receipt and announced (the check only finds it; agents' strata
+    /// mount the evidence read-only, so it came from elsewhere); either way returns a note for a
+    /// denial's status line. `None` when no incident is sealed or the evidence cannot be read.
+    async fn recheck_evidence(&self, who: &str, command: &str) -> Option<String> {
+        let (sealed, seq) = self.scenario.seal()?;
+        let now = match self.seal_evidence().await {
+            Ok(now) => now,
+            Err(error) => {
+                tracing::warn!("cannot re-check the evidence after {who}'s command: {error:#}");
+                return None;
+            }
+        };
+        let changed = sealed.differences(&now);
+        if changed.is_empty() {
+            return Some(format!(
+                "evidence unchanged: still matches the seal from receipt #{seq}"
+            ));
+        }
+        let digest = now.digest.clone();
+        let changed = changed.join(", ");
+        match self.record_seal(now) {
+            Ok(new_seq) => {
+                self.status(format!(
+                    "EVIDENCE CHANGED since the seal from receipt #{seq}: {changed} under /evidence (found by the check after {who} ran `{command}`); resealed as {digest} (receipt #{new_seq})"
+                ));
+                Some(format!("evidence CHANGED since receipt #{seq}: {changed}"))
+            }
+            Err(error) => {
+                tracing::warn!("cannot record the changed evidence: {error:#}");
+                Some(format!("evidence CHANGED since receipt #{seq}: {changed}"))
+            }
+        }
     }
 
     /// The admitted root, admitting it first if this run has not, and re-checking its tree.
@@ -833,6 +911,16 @@ impl Daemon {
             .await
             .context("the integrity check panicked")??;
         let at = now();
+        let seal = self.seal_evidence().await?;
+        let (digest, files) = (seal.digest.clone(), seal.len());
+        let sealed = self.record_seal(seal)?;
+        self.scenario.set_detection_seal(self.scenario.seal());
+        self.status(format!(
+            "evidence sealed at detection: {digest} over {files} files in {}, {} and {} (receipt #{sealed}); every agent command is checked against it",
+            strata::EVIDENCE_SHARE,
+            strata::EVIDENCE_DROP,
+            strata::EVIDENCE_LOGS
+        ));
         let measured = scenario::affected(self.scenario.assets(), &integrity, &at);
         self.scenario.set_measured(&measured);
         for record in measured {
@@ -854,7 +942,7 @@ impl Daemon {
     ///
     /// # Errors
     /// Fails for agents or if the log cannot be read.
-    fn verify_log(&self, peer: &Peer) -> Result<CoreResponse> {
+    async fn verify_log(&self, peer: &Peer) -> Result<CoreResponse> {
         peer.human("verify_log")?;
         let report = lock(&self.receipts).verify(&self.key.verifying_key())?;
         match report.first_break {
@@ -866,6 +954,22 @@ impl Daemon {
                 "receipt log BROKEN at receipt {entry} of {}",
                 report.entries
             )),
+        }
+        if let Some((sealed, seq)) = self.scenario.detection_seal() {
+            let now = self.seal_evidence().await?;
+            let changed = sealed.differences(&now);
+            if changed.is_empty() {
+                self.status(format!(
+                    "evidence verified: {} files match the seal taken at detection (receipt #{seq}, {})",
+                    now.len(),
+                    sealed.digest
+                ));
+            } else {
+                self.status(format!(
+                    "evidence DIFFERS from the seal taken at detection (receipt #{seq}): {}",
+                    changed.join(", ")
+                ));
+            }
         }
         Ok(CoreResponse::LogVerified {
             entries: report.entries,
@@ -895,6 +999,10 @@ impl Daemon {
     )]
     async fn restore(&self, actor: &Principal) -> Result<()> {
         let mut incident = self.scenario.incident().await;
+        // Before re-seeding: a command still running must not compare a fresh share with the
+        // old incident's seal.
+        self.scenario.set_seal(None);
+        self.scenario.set_detection_seal(None);
         self.roots.discard_staging().await?;
         let layout = self.layout.clone();
         let baseline = spawn_blocking(move || scenario::reseed(&layout))
