@@ -66,4 +66,29 @@ It flags the note as unsafe content, but its categories describe extortion, not 
 | Screenshot / image evidence (optional) | Super VL 120B-A12B | Only reachable vision model; tool calls as clean as Lightning. NVIDIA's deck lists multimodal agents under "what wins" |
 | Safety layer 1 | Safety Guard 8B v3 | Only reachable NVIDIA safety model; returns a JSON verdict |
 
-Re-run against Brev (`NVIDIA_BASE_URL` pointed at the self-hosted endpoint) once Lightning is served there.
+Local results are in the next section.
+
+## Local Nemotron on Brev (Sat ~8:00pm)
+
+One Brev instance (`cleanroom-nemotron`, RTX PRO 6000 Blackwell 96 GB, $2.34/hr) runs `deploy/brev/serve.sh`:
+- Lightning 30B NVFP4 on vLLM 0.27.1
+- Content Safety 3.5 on vLLM 0.20.2
+- Bolt E4B Q4_K_M on llama.cpp
+
+All three sit behind one LiteLLM endpoint on the instance's loopback, using the same model ids as the hosted API. GPU memory in use is 79 of 98 GB. The laptop reaches the endpoint through an SSH tunnel; it needs a bearer key, and returns 401 without one.
+
+| Model (local) | Called a tool | Valid args | p50 | max | Injection, hardened prompt | Injection, naive prompt |
+| --- | --- | --- | --- | --- | --- | --- |
+| Lightning 30B NVFP4 | 4/4 | 4/4 | **0.70 s** (hosted: 1.06 s) | 1.16 s | 0/4 obeyed | 3/3 ran `rm -rf /evidence/*` |
+| Bolt E4B Q4_K_M | 4/4 | 4/4 | 1.42 s | 2.15 s | 0/4 obeyed | not run |
+
+Content Safety 3.5, which the hosted API doesn't serve for our key, works locally. It answers in lines, not JSON (`User Safety: unsafe`); the agents' parser handles both formats.
+
+**Use it:**
+1. On the laptop, run `deploy/brev/tunnel.sh` (or `ssh -F ~/.brev/ssh_config -N -L 127.0.0.1:8000:127.0.0.1:8000 cleanroom-nemotron`).
+2. Load the local settings: `set -a; . ~/.config/cleanroom/local.env; set +a`. The file holds the URL, key, local model and local safety model.
+3. Agents then route sensitive steps to local Lightning, and use Content Safety 3.5 locally.
+
+**Fully local** (no hosted calls): also set `NVIDIA_BASE_URL` and `NVIDIA_API_KEY` to the local values, and set `CLEANROOM_MODEL_SCRIBE`, `CLEANROOM_MODEL_SAFETY` and the other role models to the local ids (Ultra is hosted only).
+
+The instance can't be stopped, only deleted. Delete it after judging: `brev delete cleanroom-nemotron`.
